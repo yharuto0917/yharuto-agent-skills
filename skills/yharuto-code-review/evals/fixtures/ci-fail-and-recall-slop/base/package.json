@@ -1,0 +1,11 @@
+{
+  "name": "talk-portal-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "node --no-warnings tools/lint.mjs",
+    "typecheck": "node tools/typecheck.mjs",
+    "test": "node --test tests/*.test.ts"
+  }
+}

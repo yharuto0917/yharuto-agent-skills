@@ -1,0 +1,82 @@
+[
+  {
+    "query": "PR #142 の決済返金ロジック変更、マージする前にしっかりコードレビューしてもらえる？上限チェックまわりのテストがちゃんと書けてるかも合わせて確認してほしい。",
+    "should_trigger": true
+  },
+  {
+    "query": "手元で `src/components/VideoPlayer.tsx` と `src/player.ts` を編集したんだけど、コミット前にローカルの git diff を確認して実ブラウザで壊れる箇所や見落としがないか診断して。",
+    "should_trigger": true
+  },
+  {
+    "query": "`main..feat/theme-bootstrap` の変更どう思う？コーディングエージェントに書かせた実装なんだけど、二重実装とか不要な防御分岐が混ざってないか厳しめに見てほしい。",
+    "should_trigger": true
+  },
+  {
+    "query": "来週のリリース前に `src/admin/` 配下のエンドポイント群と `src/bus/messageBus.ts` の認可・通信境界に抜け漏れがないかセキュリティと設計を監査してください。",
+    "should_trigger": true
+  },
+  {
+    "query": "`/yharuto-code-review` で現在のブランチの変更を `origin/main` と比較してマージ可否を判定して。",
+    "should_trigger": true
+  },
+  {
+    "query": "外部コントリビュータのフォークから来ている PR #412（埋め込みプレビュー同期とMDX対応）、安全にマージできる状態かレビュー結果をまとめて。",
+    "should_trigger": true
+  },
+  {
+    "query": "Can you do a thorough code review on `main..feat/account-billing-sync` before I request approval from my team? Especially worried about API rate limits and iterator handling.",
+    "should_trigger": true
+  },
+  {
+    "query": "hey could you run a pre-merge check on my uncommitted diff in `packages/storefront/src/checkout/`? unit tests pass locally, just want a second pair of eyes for DOM edge cases or AI slop",
+    "should_trigger": true
+  },
+  {
+    "query": "Please audit `src/services/webhookHandler.ts` and `tests/webhookHandler.test.ts` — are the mocks hiding schema mismatches or missing boundary validations?",
+    "should_trigger": true
+  },
+  {
+    "query": "review the diff on PR #204 in our repository and give me a structured verdict on whether we should approve, comment, or request changes",
+    "should_trigger": true
+  },
+  {
+    "query": "さっきのコードレビューで指摘された `src/player.ts` の `toggleFullscreen` が `#talk-player-stage` だけを指定していて操作バーが消えるバグ、今すぐコードを書き換えて修正して！",
+    "should_trigger": false
+  },
+  {
+    "query": "`src/refund.ts` の返金上限チェック（50,000円超過や負数・境界値）に対する単体テストがまだ無いので、`tests/refund.test.ts` に異常系テストケースを新しく実装して追加してください。",
+    "should_trigger": false
+  },
+  {
+    "query": "PRの説明文と設計メモを `docs/checkout-release-note.md` に書いたんだけど、AIっぽい不自然な言い回しや冗長な表現を `yomiyasu` で推敲して自然な日本語に整えてほしい。",
+    "should_trigger": false
+  },
+  {
+    "query": "`src/admin/exportAuditCsv.ts` に管理者ロール確認つきの監査ログCSVダウンロードエンドポイントを新規実装して、ルーターにも登録してほしい。",
+    "should_trigger": false
+  },
+  {
+    "query": "いまステージングしている `git diff --cached` の変更内容を読んで、Conventional Commits 形式のコミットメッセージと GitHub PR 用の概要文を作成して。",
+    "should_trigger": false
+  },
+  {
+    "query": "このブランチの diff に入っている不要なコメントや過剰な `typeof` 防御分岐を `deslop` で直接削ってソースコードをスリムに書き換えておいて。",
+    "should_trigger": false
+  },
+  {
+    "query": "The unit test in `tests/header-prefs.test.ts` is failing with an AssertionError after I renamed `THEME_STORAGE_KEY`. Please fix the broken test file so `npm test` passes.",
+    "should_trigger": false
+  },
+  {
+    "query": "Implement a new `postMessage` listener in `src/preview/bridge.ts` that checks `event.origin` against `ALLOWED_EMBED_ORIGINS` and write unit tests for valid and untrusted origins.",
+    "should_trigger": false
+  },
+  {
+    "query": "I'm preparing a Slidev presentation in `slides/q4-review.md` for tomorrow's architecture review meeting — can you add an animated mermaid flowchart slide for our CI pipeline?",
+    "should_trigger": false
+  },
+  {
+    "query": "Could you proofread the Japanese and English release notes in `CHANGELOG.md` for typos and awkward phrasing before we cut the v2.4.0 tag?",
+    "should_trigger": false
+  }
+]

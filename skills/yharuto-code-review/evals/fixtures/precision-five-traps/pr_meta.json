@@ -1,0 +1,15 @@
+{
+  "pr_number": 307,
+  "title": "feat(accounts): 請求データ直列同期・利用量ストリーム集計・スナップショット読込を実装",
+  "body": "TODO: PR概要と変更ファイル一覧は後で記載します（暫定作成）",
+  "author": "backend-lead",
+  "is_fork_pr": false,
+  "base_branch": "main",
+  "head_branch": "pr-branch",
+  "head_repo": "org/account-sync",
+  "checks": [
+    {"name": "ci/lint", "status": "completed", "conclusion": "success"},
+    {"name": "ci/typecheck", "status": "completed", "conclusion": "success"},
+    {"name": "ci/unit-test", "status": "completed", "conclusion": "success"}
+  ]
+}
