@@ -1,0 +1,83 @@
+{
+  "skill_name": "human-first-pr",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "evals/files/setup_case1_size_s.sh を一時ディレクトリに対して実行してテスト用 Git リポジトリを用意し、fix/null-date-format ブランチの変更内容とユニットテスト実行結果から GitHub にそのまま貼れる PR 本文を作成して outputs/pr_body.md に保存してください。",
+      "expected_output": "2ファイル14行の単一レイヤー修正を Size S と判定し、TL;DR（3行以内）と実実行した unittest の検証結果のみで構成した最小 PR 本文を outputs/pr_body.md に出力する（Mermaid図・Scopeバナー・表・<details> を一切出力しない）。",
+      "files": [
+        "evals/files/setup_case1_size_s.sh"
+      ],
+      "expectations": [
+        "pr_diff_triage.py を用いて fix/null-date-format を Size S と判定している",
+        "pr_body_lint.py --size S --fail-on fail が終了コード 0 で通過する",
+        "outputs/pr_body.md に mermaid コードブロック、Markdown 表、<details> タグ、Scope バナーが含まれない",
+        "## TL;DR が非空 3 行以内かつ行番号や関数列挙の What 実況ではなく Why と振る舞い変化を記述している",
+        "実実行して成功した python3 -m unittest discover -s tests のみを - [x] として結果根拠付きで記載している"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "evals/files/setup_case2_slop_and_gen.sh を一時ディレクトリに対して実行して Git リポジトリを用意し、feat/order-validation の PR 提出前整理と PR 本文作成を行って outputs/pr_body.md に保存してください。無断での git commit や git push はしないでください。",
+      "expected_output": "src/services/order_service.py の AI スロップ整理とテスト再通過後にコミット確認を求め（自動コミットなし）、無関係変更 README.md の確認を提示し、src/api/client.gen.py の手動改変警告・uv.lock の折りたたみ・pydantic 導入理由1行を含む Size M の PR 本文を outputs/pr_body.md に出力する（削減量アピールなし）。",
+      "files": [
+        "evals/files/setup_case2_slop_and_gen.sh"
+      ],
+      "expectations": [
+        "ユーザー確認なしに自動 git commit / git push / gh pr create を実行していない",
+        "src/services/order_service.py の重複ヘルパー・薄いラッパー・空 try/except・3段ネスト・What コメントを整理し、python3 -m unittest discover -s tests を再実行して全件通過させている",
+        "無関係変更の README.md を無断で git restore せず、ユーザーへ確認事項として提示している",
+        "Gate 1 で削った行数やコード削減グラフを PR 本文に一切記載していない（PR006 Pass）",
+        "src/api/client.gen.py が Safe-to-Skip ではなく Must-Read に昇格され、自動生成ファイルへの手動改変警告がある",
+        "uv.lock が <details> に折りたたまれ、Scope バナーで総差分と熟読対象の実質コードが分離されている",
+        "pyproject.toml に追加された pydantic のパッケージ名と導入理由が 1 行で明記されている",
+        "pr_body_lint.py --size M --triage-json <path> --fail-on fail が終了コード 0 で通過する（PR014/PR018 含む FAIL 0）"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "evals/files/setup_case3_async_template.sh を一時ディレクトリに対して実行し、リポジトリ内の .github/pull_request_template.md に沿って feat/async-outbox ブランチ（関連 Issue #412）の PR 本文を作成して outputs/pr_body.md に保存してください。",
+      "expected_output": ".github/pull_request_template.md の必須メタ情報（Closes #412、破壊的変更・DBマイグレーション項目・チェックリスト）を欠落なく引き継ぎつつ、12ファイル351行変更の Size L としてアーキテクチャ比較図と振る舞い図、理解順の読むべきファイル表、◎/○/△/× 設計判断表を含む PR 本文を outputs/pr_body.md に出力する。",
+      "files": [
+        "evals/files/setup_case3_async_template.sh"
+      ],
+      "expectations": [
+        ".github/pull_request_template.md の Closes #412、破壊的変更・DBマイグレーション関連項目、確認チェックリストが保持されている",
+        "flowchart LR に加え、sequenceDiagram / stateDiagram-v2 / erDiagram のいずれかを 1 図 10 ノード以下・color:#000 準拠で出力している",
+        "読むべきファイル表の並び順がアルファベット順（api/ 先頭、value_objects/・workers/ 末尾）ではなく理解順（db/migrations/・value_objects/ 上位、domain/・workers/ 中位、api/・routes/ 次点、tests/ 最下位）になっている",
+        "◎ / ○ / △ / × を用いた設計判断の比較表が含まれている",
+        "pr_body_lint.py --size L --triage-json <path> --template <repo>/.github/pull_request_template.md --fail-on fail が終了コード 0 で通過する"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "evals/files/setup_case4_readonly.sh を一時ディレクトリに対して実行してテスト用リポジトリを用意してください。コード編集やコミットは一切行わず（Read-Only）、evals/files/bad_pr_body.md を実ブランチ main...feat/session-ttl の差分と実測結果だけに基づいて書き直し、outputs/pr_body.md に保存してください。DB 環境変数がないためテスト結果の推測や捏造はしないでください。",
+      "expected_output": "リポジトリのコードを一切変更・コミットせず（Mode B）、bad_pr_body.md の AI クリシェ・What 実況・分類ラベル箇条書き・虚偽のテスト全パス記載を取り除き、SESSION_DB_DSN 未設定で失敗/未検証のテストを [ ] として分離記載した PR 本文を outputs/pr_body.md に出力する。",
+      "files": [
+        "evals/files/setup_case4_readonly.sh",
+        "evals/files/bad_pr_body.md"
+      ],
+      "expectations": [
+        "リポジトリ内のソースコード変更（git status --porcelain が空）および git commit を一切行っていない",
+        "bad_pr_body.md の AI クリシェ（堅牢性を向上、包括的なエラーハンドリング、シームレスに統合、クリーンで保守性の高い設計等）と行番号付きの What 実況が除去されている",
+        "- **改善点**: ... のような分類ラベル箇条書きが含まれない（PR018 Pass）",
+        "元ドラフトの「テストは全てパス」を鵜呑みにせず、未検証または SESSION_DB_DSN 未設定で失敗したテストを [x] にせず [ ] へ分離し理由を明記している（PR013 Pass）",
+        "git diff に根拠のない数値や機能を追加せず、pr_body_lint.py --size M --triage-json <path> --fail-on fail が終了コード 0 で通過する"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "evals/files/setup_case5_docs_ci.sh を一時ディレクトリに対して実行してテスト用リポジトリを用意し、docs/ci-and-arch-overview ブランチの PR 本文を outputs/pr_body.md に作成してください。絵文字禁止規約に従い [SCOPE] / [MUST] / [SKIM] / [SKIP] のテキスト表記で出力してください。",
+      "expected_output": "CLAUDE.md およびユーザー指示の絵文字禁止ルールに従って --badge-mode text 相当で絵文字を一切使わず、.github/workflows/ci.yml と docs/architecture.md の変更を過剰に Size XL 判定しない簡潔な PR 本文を outputs/pr_body.md に出力する。",
+      "files": [
+        "evals/files/setup_case5_docs_ci.sh"
+      ],
+      "expectations": [
+        ".github/workflows/ci.yml と docs/architecture.md のみの変更を過剰に Size XL 判定せず、簡潔な構成（Size M または Size S 相当）で出力している",
+        ".github/workflows/ci.yml を Safe-to-Skip に入れず [MUST]（または [SKIM]）として読解対象に含めている",
+        "outputs/pr_body.md 内に絵文字（🎯, 🧠, 👀, ⏭️, 🚀 等）が 0 件であり、[SCOPE] / [MUST] / [SKIM] 等のテキスト表記で統一されている",
+        "pr_body_lint.py --badge-mode text --triage-json <path> --fail-on fail が終了コード 0 で通過する"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+[
+  {
+    "query": "feat/oauth-pkce ブランチの実装とユニットテストが終わった。GitHub に PR を出す前に、レビュアーが3秒で全体像と読む順番を把握できる PR 説明文を作ってほしい。",
+    "should_trigger": true
+  },
+  {
+    "query": "Prepare a PR description for my branch against origin/main. There is a huge pnpm-lock.yaml diff and generated GraphQL files mixed in, so I want reviewers focused only on the core billing changes.",
+    "should_trigger": true
+  },
+  {
+    "query": "別AIに実装させた feat/cart-discount ブランチなんだけど、防衛的な null チェックや長い lockfile が混ざって読みにくい。PR 提出前に余計なコード整理をしてからわかりやすい PR 本文に仕立てて。",
+    "should_trigger": true
+  },
+  {
+    "query": "このリファクタリングブランチ、18ファイルくらい変わっててレビュー負荷が高そう。PR を分割すべきかの判断も含めて、読むべき優先順位がわかる PR 概要を書いて。",
+    "should_trigger": true
+  },
+  {
+    "query": "fix/tz-offset でタイムゾーン計算の2行バグを直しただけなんだけど、過剰な装飾は省いて手短な PR 概要と実行できたテスト結果だけまとめてほしい。",
+    "should_trigger": true
+  },
+  {
+    "query": "下書き中の pr_draft.md がファイル変更実況と「堅牢性を向上」みたいな定型句だらけで不評だった。コード自体は触らずに git diff main...HEAD に合わせて図解入りの PR 本文へ書き直して。",
+    "should_trigger": true
+  },
+  {
+    "query": "すでに上げている PR #234 の本文がスカスカなので、今のブランチ差分から Mermaid 構成図とトリアージ表つきのわかりやすい説明に更新したい。",
+    "should_trigger": true
+  },
+  {
+    "query": ".github/pull_request_template.md があるこのリポジトリで feat/webhook-retry の PR 本文を作りたい。必須見出しは残しつつシーケンス図で非同期リトライを図解して。",
+    "should_trigger": true
+  },
+  {
+    "query": "社内規程で PR 本文に絵文字が禁止なんだけど、この DB マイグレーションを含む API 変更 PR の重要箇所とスキップしてよい変更を整理した PR 概要を作って。",
+    "should_trigger": true
+  },
+  {
+    "query": "pyproject.toml と uv.lock に pydantic を追加して入力検証を入れたブランチです。依存追加の理由も含めてレビュアー向けの PR サマリーをドラフトして。",
+    "should_trigger": true
+  },
+  {
+    "query": "いま git diff --staged にある変更から、Conventional Commits 形式で日本語のコミットメッセージを3案作って。",
+    "should_trigger": false
+  },
+  {
+    "query": "手元の変更を3つのコミットに分けたいので、それぞれのコミットタイトルと本文案だけ考えてもらえますか？",
+    "should_trigger": false
+  },
+  {
+    "query": "PR #189 のブランチをチェックアウトしたから、設計の抜けやセキュリティ脆弱性がないか厳しめにコードレビューして指摘事項を出して。",
+    "should_trigger": false
+  },
+  {
+    "query": "この git diff origin/main...HEAD を見て、N+1 クエリや競合状態のバグが潜んでいないか診断してレビューコメントを書いてもらえる？",
+    "should_trigger": false
+  },
+  {
+    "query": "まだ開発途中で PR は出さないんだけど、src/services/cart.ts に溜まった冗長な try-catch や深いネストを今のうちにリファクタして掃除して。",
+    "should_trigger": false
+  },
+  {
+    "query": "さっき書いた tests/user.test.ts の自明なコメントと重複ヘルパーだけ削って、既存コードに合わせておいて（まだコミットも PR も作らない）。",
+    "should_trigger": false
+  },
+  {
+    "query": "障害ポストモーテム docs/postmortem-2026-11.md を書いたんだけど、AI っぽい比喩や回りくどい日本語を自然な文章に推敲して。",
+    "should_trigger": false
+  },
+  {
+    "query": "次期リリースのユーザー向けお知らせメール文面を、yomiyasu を使って読みやすく整えてほしい。",
+    "should_trigger": false
+  },
+  {
+    "query": "まだコードは1行も書いていない新規マイクロサービスの設計書 docs/auth-rfc.md に貼る Mermaid のシーケンス図とアーキテクチャ図を作って。",
+    "should_trigger": false
+  },
+  {
+    "query": "PR をレビュー後に squash merge したいんだけど、コンフリクトが出たときの git コマンド手順を教えて。",
+    "should_trigger": false
+  }
+]
