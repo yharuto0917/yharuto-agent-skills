@@ -48,6 +48,9 @@ IGNORED_DIRS: frozenset[str] = frozenset(
     {
         ".git",
         ".gemini",
+        ".claude",
+        ".codex",
+        ".agents",
         "node_modules",
         ".venv",
         "venv",
@@ -167,8 +170,12 @@ MOCK_GUARD_RE = re.compile(
 SSR_GLOBAL_GUARD_RE = re.compile(r"typeof\s+(?:window|document|navigator|globalThis)\s*[!=]==")
 
 # Rule 4: TYPE_BYPASS_OR_SILENT_FALLBACK
-TYPE_BYPASS_RE = re.compile(
-    r"(?:\bas\s+any\b|:\s*any\b|@ts-ignore\b|@ts-nocheck\b|#\s*type:\s*ignore(?!\[)|\.forEach\s*\(\s*async\b)"
+TYPE_BYPASS_JS_RE = re.compile(
+    r"(?:\bas\s+any\b|:\s*any\b(?!\s*\()|@ts-ignore\b|@ts-nocheck\b|\.forEach\s*\(\s*async\b)"
+)
+TYPE_BYPASS_PY_RE = re.compile(r"#\s*type:\s*ignore\b(?!\s*\[)")
+COMPILER_DIRECTIVE_BYPASS_RE = re.compile(
+    r"^(?://\s*@ts-(?:ignore|nocheck)\b|#\s*type:\s*ignore\b(?!\s*\[))"
 )
 
 # Rule 5: EMPTY_OR_BROAD_CATCH
@@ -181,8 +188,11 @@ PY_BROAD_EXCEPT_RE = re.compile(r"^\s*except(?:\s+(?:Exception|BaseException)(?:
 
 # Rule 6: DEEP_NESTING_OR_COMPLEX_FLOW
 CONTROL_FLOW_KEYWORD_RE = re.compile(r"^\s*(?:if|else\s+if|elif|for|while|switch|match|try)\b")
-NESTED_TERNARY_RE = re.compile(r"\?[^:?;\n\"'`]+\?[^:\n\"'`]+:")
-QUADRATIC_REDUCE_RE = re.compile(r"\.reduce\s*\([^)]*=>\s*\(?[\{\[]\s*\.\.\.")
+STRING_LITERAL_MASK_RE = re.compile(r"""(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|`(?:\\.|[^`\\])*`)""")
+STANDALONE_TERNARY_Q_RE = re.compile(r"(?<!\?)\?(?![?.:])")
+QUADRATIC_REDUCE_RE = re.compile(
+    r"\.reduce\s*\(\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\(?[\{\[]\s*\.\.\."
+)
 
 # Rule 7: MISLEADING_OR_PASS_THROUGH
 PURE_NAMED_FUNC_RE = re.compile(
@@ -191,13 +201,46 @@ PURE_NAMED_FUNC_RE = re.compile(
     r"|^\s*(?:async\s+)?def\s+((?:get|is|has|can|should|validate|check)_[a-z0-9_]+)\s*\()"
 )
 SIDE_EFFECT_CALL_RE = re.compile(
-    r"(?:\bfetch\s*\(|\baxios\.(?:post|put|patch|delete)\b|\.(?:insert|update|delete|save|destroy| bulkCreate)\s*\("
+    r"(?:\bfetch\s*\(|\baxios\.(?:post|put|patch|delete)\b|\.(?:insert|update|delete|save|destroy|bulkCreate)\s*\("
     r"|\b(?:localStorage|sessionStorage)\.(?:setItem|removeItem|clear)\s*\("
     r"|\b(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO)\b)"
 )
 PASS_THROUGH_FN_RE = re.compile(
-    r"^\s*(?:export\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)\s*\{\s*return\s+([A-Za-z_$][\w$.]*)\s*\(\2\)\s*;?\s*\}\s*$"
+    r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(([^)]*)\)"
+    r"(?:\s*:\s*[^{]+)?\s*\{\s*return\s+(?:await\s+)?([A-Za-z_$][\w$.]*)\s*\(([^)]*)\)\s*;?\s*\}\s*$"
 )
+IDENT_TOKEN_RE = re.compile(r"^[A-Za-z_$][\w$]*$")
+
+
+def is_nested_ternary_line(raw_line: str) -> bool:
+    if "extends " in raw_line:
+        return False
+    code_only = STRING_LITERAL_MASK_RE.sub('""', raw_line.split("//", 1)[0])
+    return len(STANDALONE_TERNARY_Q_RE.findall(code_only)) >= 2 and code_only.count(":") >= 2
+
+
+def is_pass_through_wrapper_line(raw_line: str) -> bool:
+    m = PASS_THROUGH_FN_RE.match(raw_line)
+    if m is None:
+        return False
+    fn_name = m.group(1).strip()
+    params_raw = m.group(2).strip()
+    callee_name = m.group(3).strip()
+    args_raw = m.group(4).strip()
+    if not params_raw and not args_raw:
+        return fn_name != callee_name
+    if not params_raw or not args_raw:
+        return False
+    param_names: list[str] = []
+    for p in params_raw.split(","):
+        pname = p.split(":", 1)[0].strip()
+        if pname.endswith("?"):
+            pname = pname[:-1].strip()
+        if not IDENT_TOKEN_RE.match(pname):
+            return False
+        param_names.append(pname)
+    arg_names = [a.strip() for a in args_raw.split(",")]
+    return param_names == arg_names
 
 
 def run_git(cmd: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str] | None:
@@ -365,9 +408,59 @@ def is_empty_catch_multiline(lines: Sequence[str], idx_zero: int, is_python: boo
     return False
 
 
-def has_side_effect_in_window(lines: Sequence[str], idx_zero: int) -> bool:
-    window = "\n".join(lines[idx_zero : min(idx_zero + 16, len(lines))])
-    return SIDE_EFFECT_CALL_RE.search(window) is not None
+def has_side_effect_in_window(lines: Sequence[str], idx_zero: int, is_python: bool = False) -> bool:
+    collected: list[str] = []
+    end_idx = min(idx_zero + 16, len(lines))
+
+    if is_python:
+        expanded_first = lines[idx_zero].expandtabs(4)
+        base_indent = len(expanded_first) - len(expanded_first.lstrip(" "))
+        in_signature = not lines[idx_zero].rstrip().endswith(":")
+        collected.append(lines[idx_zero])
+        for look in range(idx_zero + 1, end_idx):
+            ln = lines[look]
+            stripped = ln.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if in_signature:
+                collected.append(ln)
+                if stripped.endswith(":"):
+                    in_signature = False
+                continue
+            exp_ln = ln.expandtabs(4)
+            indent = len(exp_ln) - len(exp_ln.lstrip(" "))
+            if indent <= base_indent:
+                break
+            collected.append(ln)
+    else:
+        brace_depth = 0
+        paren_depth = 0
+        saw_open_brace = False
+        for look in range(idx_zero, end_idx):
+            ln = lines[look]
+            collected.append(ln)
+            code_part = ln.split("//", 1)[0]
+            for ch in code_part:
+                if ch == "(":
+                    paren_depth += 1
+                elif ch == ")" and paren_depth > 0:
+                    paren_depth -= 1
+                elif ch == "{" and paren_depth == 0:
+                    brace_depth += 1
+                    saw_open_brace = True
+                elif ch == "}" and paren_depth == 0 and saw_open_brace:
+                    brace_depth -= 1
+            if saw_open_brace and brace_depth <= 0:
+                break
+            if (
+                not saw_open_brace
+                and paren_depth == 0
+                and "=>" in "\n".join(collected)
+                and code_part.rstrip().endswith(";")
+            ):
+                break
+
+    return SIDE_EFFECT_CALL_RE.search("\n".join(collected)) is not None
 
 
 def scan_single_file(
@@ -414,7 +507,18 @@ def scan_single_file(
             continue
 
         stripped = raw_line.strip()
-        if not stripped or stripped.startswith("//") or stripped.startswith("#"):
+        if not stripped:
+            continue
+        if stripped.startswith("//") or stripped.startswith("#"):
+            if COMPILER_DIRECTIVE_BYPASS_RE.match(stripped):
+                add_finding(
+                    line_no,
+                    "TYPE_BYPASS_OR_SILENT_FALLBACK",
+                    ["type_safety", "silent_bypass"],
+                    raw_line,
+                )
+                if len(findings) >= max_remaining:
+                    break
             continue
 
         # 1. STRINGIFIED_CODE_OR_EVAL
@@ -455,7 +559,12 @@ def scan_single_file(
                 break
 
         # 4. TYPE_BYPASS_OR_SILENT_FALLBACK
-        if TYPE_BYPASS_RE.search(raw_line):
+        has_type_bypass = (
+            TYPE_BYPASS_PY_RE.search(raw_line) is not None
+            if is_python
+            else (TYPE_BYPASS_JS_RE.search(raw_line) is not None or TYPE_BYPASS_PY_RE.search(raw_line) is not None)
+        )
+        if has_type_bypass:
             add_finding(
                 line_no,
                 "TYPE_BYPASS_OR_SILENT_FALLBACK",
@@ -478,10 +587,7 @@ def scan_single_file(
 
         # 6. DEEP_NESTING_OR_COMPLEX_FLOW
         is_deep = CONTROL_FLOW_KEYWORD_RE.match(raw_line) is not None and indentation_depth(raw_line) >= 5
-        has_nested_ternary = (
-            "extends " not in raw_line
-            and NESTED_TERNARY_RE.search(raw_line) is not None
-        )
+        has_nested_ternary = is_nested_ternary_line(raw_line)
         has_quad_reduce = QUADRATIC_REDUCE_RE.search(raw_line) is not None
         if is_deep or has_nested_ternary or has_quad_reduce:
             add_finding(
@@ -495,14 +601,14 @@ def scan_single_file(
 
         # 7. MISLEADING_OR_PASS_THROUGH
         pure_match = PURE_NAMED_FUNC_RE.search(raw_line)
-        if pure_match is not None and has_side_effect_in_window(lines, idx_zero):
+        if pure_match is not None and has_side_effect_in_window(lines, idx_zero, is_python):
             add_finding(
                 line_no,
                 "MISLEADING_OR_PASS_THROUGH",
                 ["naming_contract", "hidden_side_effect"],
                 raw_line,
             )
-        elif PASS_THROUGH_FN_RE.match(raw_line) is not None:
+        elif is_pass_through_wrapper_line(raw_line):
             add_finding(
                 line_no,
                 "MISLEADING_OR_PASS_THROUGH",

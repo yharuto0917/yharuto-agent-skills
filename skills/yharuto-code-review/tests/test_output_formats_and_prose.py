@@ -157,7 +157,12 @@ class TestOutputFormatsAndProse(unittest.TestCase):
             sdir = Path(str(prep["session_dir"]))
             head_sha = str(prep["head_sha"])
 
-            run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            rc_imp, imp_out, _, _ = run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            self.assertEqual(rc_imp, 0)
+            self.assertEqual(
+                imp_out.get("related_tests_and_mocks"),
+                [{"file": "tests/test_discount_calc.py", "kind": "test", "reason": "matches_module_stem:discountcalc"}],
+            )
             run_script(
                 "prepare_worktree.py",
                 ["gate-stage1", "--session", str(sdir), "--verdict", "OK", "--verified-tests", "tests/test_discount_calc.py"],

@@ -223,7 +223,13 @@ class TestSessionAndIsolation(unittest.TestCase):
             self.assertIn("v = 2", (workdir / "src" / "index.mjs").read_text(encoding="utf-8"))
             self.assertTrue((workdir / "src" / "untracked_helper.mjs").is_file())
 
-            run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            rc_imp_local, imp_local, _, _ = run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            self.assertEqual(rc_imp_local, 0)
+            self.assertEqual(imp_local.get("related_tests_and_mocks"), [])
+            self.assertEqual(
+                imp_local.get("build_hash_configs"),
+                [{"file": "build.mjs", "line": 1, "reason": "build_or_bundler_config"}],
+            )
             run_script(
                 "prepare_worktree.py",
                 ["gate-stage1", "--session", str(sdir), "--verdict", "OK", "--verified-tests", "tests/basic.test.mjs"],
@@ -311,7 +317,13 @@ class TestSessionAndIsolation(unittest.TestCase):
             self.assertEqual(rc, 0)
             sdir = Path(str(prep["session_dir"]))
 
-            run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            rc_imp_range, imp_range, _, _ = run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            self.assertEqual(rc_imp_range, 0)
+            self.assertEqual(
+                imp_range.get("related_tests_and_mocks"),
+                [{"file": "tests/test_discount_calc.py", "kind": "test", "reason": "matches_module_stem:discountcalc"}],
+            )
+            self.assertEqual(imp_range.get("build_hash_configs"), [])
             run_script(
                 "prepare_worktree.py",
                 ["gate-stage1", "--session", str(sdir), "--verdict", "OK", "--verified-tests", "tests/test_discount_calc.py"],

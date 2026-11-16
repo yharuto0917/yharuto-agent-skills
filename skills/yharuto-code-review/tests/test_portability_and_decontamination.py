@@ -16,7 +16,7 @@ _TESTS_DIR = Path(__file__).resolve().parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
-from _helpers import FIXTURES_DIR, REPO_ROOT, SCRIPTS_DIR, SKILL_ROOT, TESTS_DIR  # noqa: E402
+from _helpers import EVALS_DIR, FIXTURES_DIR, REPO_ROOT, SCRIPTS_DIR, SKILL_ROOT, TESTS_DIR  # noqa: E402
 
 GENERIC_FIXTURE_STEMS: frozenset[str] = frozenset(
     {
@@ -105,8 +105,13 @@ class TestPortabilityAndDecontamination(unittest.TestCase):
                 junk.append(path.relative_to(SKILL_ROOT).as_posix())
         self.assertEqual(junk, [], f"Bytecode or OS junk found: {junk}")
 
-        py_files = sorted(list(SCRIPTS_DIR.glob("*.py")) + list(TESTS_DIR.glob("*.py")))
-        self.assertTrue(len(py_files) >= 10)
+        eval_py_files = sorted(EVALS_DIR.glob("*.py"))
+        self.assertEqual(
+            [p.name for p in eval_py_files],
+            ["grade_review_output.py", "materialize_fixture.py"],
+        )
+        py_files = sorted(list(SCRIPTS_DIR.glob("*.py")) + list(TESTS_DIR.glob("*.py")) + eval_py_files)
+        self.assertTrue(len(py_files) >= 12)
 
         for py_file in py_files:
             src = py_file.read_text(encoding="utf-8")

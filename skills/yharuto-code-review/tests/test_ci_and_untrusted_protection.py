@@ -84,7 +84,27 @@ class TestCiAndUntrustedProtection(unittest.TestCase):
             test_files = sorted(p.relative_to(workdir).as_posix() for p in (workdir / "tests").rglob("*") if p.is_file())
             self.assertTrue(len(test_files) >= 1)
 
-            run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            rc_imp, imp_out, _, _ = run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            self.assertEqual(rc_imp, 0)
+            self.assertEqual(
+                imp_out.get("related_tests_and_mocks"),
+                [{"file": "tests/portal.test.ts", "kind": "test", "reason": "modified_in_diff"}],
+            )
+            self.assertEqual(
+                imp_out.get("comparative_files"),
+                [
+                    {"file": "src/admin/auditEndpoint.ts", "reason": "sibling_in_directory:src/admin"},
+                    {"file": "src/admin/authGuard.ts", "reason": "sibling_in_directory:src/admin"},
+                    {"file": "src/admin/usersEndpoint.ts", "reason": "sibling_in_directory:src/admin"},
+                    {"file": "src/bus/messageBus.ts", "reason": "matching_architectural_role"},
+                ],
+            )
+            self.assertEqual(
+                imp_out.get("build_hash_configs"),
+                [
+                    {"file": "scripts/compute-build-hash.ts", "line": 8, "reason": "hash_or_cache_logic:createHash("},
+                ],
+            )
             run_script(
                 "prepare_worktree.py",
                 ["gate-stage1", "--session", str(sdir), "--verdict", "OK", "--verified-tests", test_files[0]],
@@ -186,7 +206,12 @@ class TestCiAndUntrustedProtection(unittest.TestCase):
                 env=env,
             )
             sdir_pre = Path(str(prep_pre["session_dir"]))
-            run_script("impact_scan.py", ["--session", str(sdir_pre)], env=env)
+            rc_imp_pre, imp_pre, _, _ = run_script("impact_scan.py", ["--session", str(sdir_pre)], env=env)
+            self.assertEqual(rc_imp_pre, 0)
+            self.assertEqual(
+                imp_pre.get("related_tests_and_mocks"),
+                [{"file": "tests/test_discount_calc.py", "kind": "test", "reason": "matches_module_stem:discountcalc"}],
+            )
             run_script(
                 "prepare_worktree.py",
                 ["gate-stage1", "--session", str(sdir_pre), "--verdict", "OK", "--verified-tests", "tests/test_discount_calc.py"],
@@ -267,7 +292,12 @@ class TestCiAndUntrustedProtection(unittest.TestCase):
                 env=env,
             )
             sdir_reg = Path(str(prep_reg["session_dir"]))
-            run_script("impact_scan.py", ["--session", str(sdir_reg)], env=env)
+            rc_imp_reg, imp_reg, _, _ = run_script("impact_scan.py", ["--session", str(sdir_reg)], env=env)
+            self.assertEqual(rc_imp_reg, 0)
+            self.assertEqual(
+                imp_reg.get("related_tests_and_mocks"),
+                [{"file": "tests/test_discount_calc.py", "kind": "test", "reason": "matches_module_stem:discountcalc"}],
+            )
             run_script(
                 "prepare_worktree.py",
                 ["gate-stage1", "--session", str(sdir_reg), "--verdict", "OK", "--verified-tests", "tests/test_discount_calc.py"],
@@ -356,7 +386,9 @@ class TestCiAndUntrustedProtection(unittest.TestCase):
                 env=env,
             )
             sdir1 = Path(str(prep1["session_dir"]))
-            run_script("impact_scan.py", ["--session", str(sdir1)], env=env)
+            rc_imp1, imp_out1, _, _ = run_script("impact_scan.py", ["--session", str(sdir1)], env=env)
+            self.assertEqual(rc_imp1, 0)
+            self.assertEqual(imp_out1.get("related_tests_and_mocks"), [])
             run_script(
                 "prepare_worktree.py",
                 ["gate-stage1", "--session", str(sdir1), "--verdict", "OK", "--verified-tests", "tests/test_slow.py"],
@@ -427,7 +459,12 @@ class TestCiAndUntrustedProtection(unittest.TestCase):
                 env=env_live,
             )
             sdir2 = Path(str(prep2["session_dir"]))
-            run_script("impact_scan.py", ["--session", str(sdir2)], env=env_live)
+            rc_imp2, imp_out2, _, _ = run_script("impact_scan.py", ["--session", str(sdir2)], env=env_live)
+            self.assertEqual(rc_imp2, 0)
+            self.assertEqual(
+                imp_out2.get("related_tests_and_mocks"),
+                [{"file": "tests/test_slow.py", "kind": "test", "reason": "modified_in_diff"}],
+            )
             run_script(
                 "prepare_worktree.py",
                 ["gate-stage1", "--session", str(sdir2), "--verdict", "OK", "--verified-tests", "tests/test_slow.py"],

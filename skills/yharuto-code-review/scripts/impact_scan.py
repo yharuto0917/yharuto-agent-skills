@@ -38,6 +38,9 @@ IGNORED_DIRS: frozenset[str] = frozenset(
     {
         ".git",
         ".gemini",
+        ".claude",
+        ".codex",
+        ".agents",
         "node_modules",
         ".venv",
         "venv",
@@ -195,20 +198,102 @@ SYMBOL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("rust_item", re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:fn|struct|enum|trait)\s+([A-Za-z_][\w]{2,})\b")),
 )
 
-TEST_OR_MOCK_RE = re.compile(
-    r"(?:^|/)(?:__tests__|__mocks__|tests?|specs?|mocks?|fixtures?|testing|test-utils|test_helpers)/"
-    r"|(?:\.(?:test|spec|mock)\.[A-Za-z0-9]+$)"
-    r"|(?:^|/)(?:test_[^/]+\.py|[^/]+_test\.(?:py|go|rs))$"
-    r"|(?:^|/)(?:conftest\.py|setupTests\.[A-Za-z0-9]+|vitest\.setup\.[A-Za-z0-9]+|jest\.setup\.[A-Za-z0-9]+|"
-    r"[^/]*(?:mock|helper|fixture)[^/]*\.[A-Za-z0-9]+)$",
+EXPLICIT_TEST_FILENAME_RE = re.compile(
+    r"(?:\.(?:test|spec)\.[A-Za-z0-9]+$)"
+    r"|^(?:test_[^/]+\.py|[^/]+_test\.(?:py|go|rs))$",
     re.IGNORECASE,
 )
 
+EXPLICIT_MOCK_OR_SETUP_FILENAME_RE = re.compile(
+    r"(?:\.mock\.[A-Za-z0-9]+$)"
+    r"|^(?:conftest\.py|(?:setupTests|vitest\.setup|jest\.setup)\.[A-Za-z0-9]+)$",
+    re.IGNORECASE,
+)
+
+TEST_OR_MOCK_DIR_NAMES: frozenset[str] = frozenset(
+    {
+        "__tests__",
+        "__mocks__",
+        "test",
+        "tests",
+        "spec",
+        "specs",
+        "mock",
+        "mocks",
+        "testing",
+        "test-utils",
+        "test_helpers",
+    }
+)
+
+FIXTURE_DIR_NAMES: frozenset[str] = frozenset({"fixture", "fixtures"})
+MONOREPO_CONTAINER_DIR_NAMES: frozenset[str] = frozenset({"packages", "apps", "services"})
+
 MOCK_HINT_RE = re.compile(r"(?:__mocks__|/mocks?/|mock|fixture|helper|setup|stub|fake)", re.IGNORECASE)
+
+
+def _find_fixture_dir_index(dir_parts: Sequence[str]) -> int | None:
+    for idx, seg in enumerate(dir_parts):
+        if seg not in FIXTURE_DIR_NAMES:
+            continue
+        # Do not treat a monorepo workspace package named `packages/fixtures/...` as a static fixture tree
+        if idx == 1 and dir_parts[0] in MONOREPO_CONTAINER_DIR_NAMES:
+            continue
+        return idx
+    return None
+
+
+def is_test_or_mock_file(rel_path: str) -> bool:
+    """Return True iff `rel_path` is an executable test or code mock/helper (excluding non-code and fixture snapshots)."""
+    norm = rel_path.replace("\\", "/").lstrip("./")
+    p = Path(norm)
+    if p.suffix.lower() not in CODE_EXTENSIONS:
+        return False
+
+    dir_parts = [seg.lower() for seg in p.parts[:-1]]
+    fixture_idx = _find_fixture_dir_index(dir_parts)
+    test_dir_idx = next((i for i, seg in enumerate(dir_parts) if seg in TEST_OR_MOCK_DIR_NAMES), None)
+
+    if fixture_idx is not None:
+        if test_dir_idx is None or fixture_idx < test_dir_idx:
+            return False
+        return bool(
+            EXPLICIT_TEST_FILENAME_RE.search(p.name)
+            or EXPLICIT_MOCK_OR_SETUP_FILENAME_RE.search(p.name)
+            or re.search(r"(?:mock|stub|fake)", p.stem, re.IGNORECASE)
+        )
+
+    if EXPLICIT_TEST_FILENAME_RE.search(p.name) or EXPLICIT_MOCK_OR_SETUP_FILENAME_RE.search(p.name):
+        return True
+    return test_dir_idx is not None
+
+
+def classify_test_or_mock_kind(rel_path: str) -> str:
+    norm = rel_path.replace("\\", "/").lstrip("./")
+    name = Path(norm).name
+    if EXPLICIT_TEST_FILENAME_RE.search(name):
+        return "test"
+    if EXPLICIT_MOCK_OR_SETUP_FILENAME_RE.search(name) or MOCK_HINT_RE.search(norm):
+        return "mock_or_helper"
+    return "test"
+
+
+def is_non_production_path(rel_path: str) -> bool:
+    """Return True if `rel_path` belongs to tests, mocks, or static fixture trees rather than production code."""
+    norm = rel_path.replace("\\", "/").lstrip("./")
+    p = Path(norm)
+    dir_parts = [seg.lower() for seg in p.parts[:-1]]
+    if _find_fixture_dir_index(dir_parts) is not None or any(seg in TEST_OR_MOCK_DIR_NAMES for seg in dir_parts):
+        return True
+    return bool(
+        EXPLICIT_TEST_FILENAME_RE.search(p.name)
+        or EXPLICIT_MOCK_OR_SETUP_FILENAME_RE.search(p.name)
+    )
+
 
 BUILD_CONFIG_FILENAME_RE = re.compile(
     r"(?:^(?:vite|webpack|rollup|astro|next|nuxt|rspack|esbuild|tsup)\.config\.[A-Za-z0-9]+$"
-    r"|(?:build|bundle|hash|cache|manifest|fingerprint)[^/]*\.(?:ts|js|mjs|cjs|py|sh|go|rs)$"
+    r"|(?:^|[-_.])(?:build|bundle|hash|manifest|fingerprint)[^/]*\.(?:ts|js|mjs|cjs|py|sh|go|rs)$"
     r"|^Makefile$)",
     re.IGNORECASE,
 )
@@ -327,7 +412,7 @@ def extract_changed_symbols(diff_text: str) -> list[tuple[str, str]]:
         if line.startswith("+++ b/"):
             current_file = line[6:].strip()
             continue
-        if current_file and TEST_OR_MOCK_RE.search(current_file):
+        if current_file and is_non_production_path(current_file):
             continue
         if not ((line.startswith("+") and not line.startswith("+++")) or (line.startswith("-") and not line.startswith("---"))):
             continue
@@ -395,6 +480,8 @@ def search_symbol_refs(
             "--glob",
             "!.gemini/**",
             "--glob",
+            "!.claude/**",
+            "--glob",
             "!.venv/**",
             "--glob",
             "!dist/**",
@@ -431,7 +518,8 @@ def search_symbol_refs(
 
 
 def stem_without_compound_ext(rel_path: str) -> str:
-    name = Path(rel_path).name
+    norm = rel_path.replace("\\", "/").lstrip("./")
+    name = Path(norm).name
     for suffix in (".test", ".spec", ".mock", ".d"):
         idx = name.lower().find(suffix + ".")
         if idx > 0:
@@ -450,14 +538,14 @@ def find_related_tests_and_mocks(
     def record(rel_file: str, reason: str) -> None:
         if rel_file in found:
             return
-        kind = "mock_or_helper" if MOCK_HINT_RE.search(rel_file) else "test"
+        kind = classify_test_or_mock_kind(rel_file)
         found[rel_file] = {"file": rel_file, "kind": kind, "reason": reason}
 
     changed_stems: set[str] = set()
     for ch in changed_files:
-        if TEST_OR_MOCK_RE.search(ch) and (workdir / ch).is_file():
+        if is_test_or_mock_file(ch) and (workdir / ch).is_file():
             record(ch, "modified_in_diff")
-        else:
+        elif Path(ch).suffix.lower() in CODE_EXTENSIONS and not is_non_production_path(ch):
             st = stem_without_compound_ext(ch)
             if len(st) >= 2 and st.lower() not in {"index", "main", "utils", "types"}:
                 changed_stems.add(st.lower())
@@ -465,33 +553,53 @@ def find_related_tests_and_mocks(
     for sym_entry in symbol_results:
         sym_name = str(sym_entry.get("name") or "")
         refs = sym_entry.get("refs")
-        if isinstance(refs, list):
-            for ref in refs:
-                if isinstance(ref, dict):
-                    rfile = str(ref.get("file") or "")
-                    if rfile and TEST_OR_MOCK_RE.search(rfile) and (workdir / rfile).is_file():
-                        record(rfile, f"references_symbol:{sym_name}")
+        if not isinstance(refs, list):
+            continue
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            rfile = str(ref.get("file") or "")
+            if rfile and is_test_or_mock_file(rfile) and (workdir / rfile).is_file():
+                record(rfile, f"references_symbol:{sym_name}")
 
-    candidate_test_files = [f for f in all_files if TEST_OR_MOCK_RE.search(f)]
+    candidate_test_files = [f for f in all_files if is_test_or_mock_file(f)]
+    stem_patterns: list[tuple[str, str, re.Pattern[str]]] = [
+        (
+            c_stem,
+            re.sub(r"[_-]+", "", c_stem),
+            re.compile(
+                rf"(?<![a-z0-9_]){re.escape(c_stem)}(?![a-z0-9_])"
+                if len(c_stem) >= 4
+                else rf"[/'\".\\]{re.escape(c_stem)}(?![a-z0-9_])"
+            ),
+        )
+        for c_stem in sorted(changed_stems)
+    ]
     for tf in candidate_test_files:
         tf_stem = stem_without_compound_ext(tf).lower()
-        for c_stem in changed_stems:
-            if tf_stem == c_stem or tf_stem == f"test_{c_stem}" or tf_stem == f"{c_stem}_test":
+        tf_core = tf_stem[5:] if tf_stem.startswith("test_") else tf_stem[:-5] if tf_stem.endswith("_test") else tf_stem
+        tf_norm = re.sub(r"[_-]+", "", tf_core)
+        for c_stem, c_norm, _ in stem_patterns:
+            if tf_stem == c_stem or tf_stem == f"test_{c_stem}" or tf_stem == f"{c_stem}_test" or (c_norm and tf_norm == c_norm):
                 record(tf, f"matches_module_stem:{c_stem}")
                 break
-        if tf in found:
+        if tf in found or not stem_patterns:
             continue
         try:
             content = (workdir / tf).read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
         content_lower = content.lower()
-        for c_stem in changed_stems:
-            if c_stem in content_lower:
+        for c_stem, _, pat in stem_patterns:
+            if pat.search(content_lower):
                 record(tf, f"mentions_module:{c_stem}")
                 break
-        if tf not in found and MOCK_HINT_RE.search(tf) and len(candidate_test_files) <= 25:
-            record(tf, "shared_test_mock_or_helper")
+
+    has_related_test = any(entry["kind"] == "test" for entry in found.values())
+    if has_related_test and len(candidate_test_files) <= 25:
+        for tf in candidate_test_files:
+            if tf not in found and classify_test_or_mock_kind(tf) == "mock_or_helper":
+                record(tf, "shared_test_mock_or_helper")
 
     return [found[k] for k in sorted(found)]
 
@@ -504,13 +612,13 @@ def find_comparative_files(
     changed_code = [
         f
         for f in changed_files
-        if Path(f).suffix.lower() in CODE_EXTENSIONS and not TEST_OR_MOCK_RE.search(f)
+        if Path(f).suffix.lower() in CODE_EXTENSIONS and not is_non_production_path(f)
     ]
     changed_dirs = {str(Path(f).parent) for f in changed_code}
 
     comparative: dict[str, dict[str, str]] = {}
     for candidate in all_files:
-        if candidate in changed_set or TEST_OR_MOCK_RE.search(candidate):
+        if candidate in changed_set or is_non_production_path(candidate):
             continue
         if Path(candidate).suffix.lower() not in CODE_EXTENSIONS:
             continue
@@ -528,12 +636,34 @@ def find_comparative_files(
         changed_has_role = any(role_re.search(f) for f in changed_code)
         if changed_has_role:
             for candidate in all_files:
-                if candidate in changed_set or candidate in comparative or TEST_OR_MOCK_RE.search(candidate):
+                if candidate in changed_set or candidate in comparative or is_non_production_path(candidate):
                     continue
                 if Path(candidate).suffix.lower() in CODE_EXTENSIONS and role_re.search(candidate):
                     comparative[candidate] = {"file": candidate, "reason": "matching_architectural_role"}
                     if len(comparative) >= 20:
                         break
+
+    changed_leaf_pairs = (
+        {
+            (Path(f).parent.name.lower(), Path(f).suffix.lower())
+            for f in changed_code
+            if len(Path(f).parts) >= 3 and Path(f).parent.name.lower() not in {"src", "lib", "app", "pkg"}
+        }
+        if not comparative
+        else set()
+    )
+    for candidate in all_files if changed_leaf_pairs else ():
+        if candidate in changed_set or is_non_production_path(candidate):
+            continue
+        cand_path = Path(candidate)
+        pair = (cand_path.parent.name.lower(), cand_path.suffix.lower())
+        if len(cand_path.parts) >= 3 and pair in changed_leaf_pairs:
+            comparative[candidate] = {
+                "file": candidate,
+                "reason": f"parallel_directory:{cand_path.parent.name}",
+            }
+            if len(comparative) >= 20:
+                break
 
     return [comparative[k] for k in sorted(comparative)]
 
@@ -543,7 +673,7 @@ def find_build_hash_configs(workdir: Path, all_files: Sequence[str]) -> list[dic
     seen: set[str] = set()
 
     for rel in all_files:
-        if TEST_OR_MOCK_RE.search(rel):
+        if is_non_production_path(rel):
             continue
         fname = Path(rel).name
         is_build_name = BUILD_CONFIG_FILENAME_RE.search(fname) is not None or rel.startswith(".github/workflows/")

@@ -172,9 +172,13 @@ class TestHmacAndEvidenceLocks(unittest.TestCase):
             self.assertEqual(rc_s1_skip, 2)
             self.assertIn("impact_scan.py", str(out_s1_skip.get("error", "")))
 
-            # Execute impact_scan.py
-            rc_imp, _, _, _ = run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            # Execute impact_scan.py and verify extracted payload (body-only edits have 0 changed symbol headers)
+            rc_imp, imp_out, _, _ = run_script("impact_scan.py", ["--session", str(sdir)], env=env)
             self.assertEqual(rc_imp, 0)
+            self.assertEqual(imp_out.get("symbols"), [])
+            self.assertEqual(imp_out.get("related_tests_and_mocks"), [])
+            self.assertEqual(imp_out.get("comparative_files"), [])
+            self.assertEqual(imp_out.get("build_hash_configs"), [])
 
             # 2. Passing production file instead of test file to --verified-tests -> rejected!
             rc_prod_test, out_prod_test, _, _ = run_script(
@@ -220,11 +224,22 @@ class TestHmacAndEvidenceLocks(unittest.TestCase):
             self.assertEqual(rc_p4_skip, 2)
             self.assertIn("scan_diff_smells.py", str(out_p4_skip.get("error", "")))
 
-            # Run Stage 3 scan_diff_smells -> finds smells in src/discountCalc.ts
+            # Run Stage 3 scan_diff_smells -> finds exact rule_id and line numbers in src/discountCalc.ts
             rc_s3, smells_out, _, _ = run_script("scan_diff_smells.py", ["--session", str(sdir)], env=env)
             self.assertEqual(rc_s3, 0)
             smell_items = smells_out.get("findings", [])
-            self.assertTrue(isinstance(smell_items, list) and len(smell_items) >= 2)
+            self.assertIsInstance(smell_items, list)
+            self.assertEqual(
+                [
+                    (str(item.get("file")), int(item.get("line", 0)), str(item.get("rule_id")))
+                    for item in smell_items
+                    if isinstance(item, dict)
+                ],
+                [
+                    ("src/discountCalc.ts", 3, "TYPE_BYPASS_OR_SILENT_FALLBACK"),
+                    ("src/discountCalc.ts", 5, "EMPTY_OR_BROAD_CATCH"),
+                ],
+            )
 
             # 6. Empty draft [] when smell_count > 0 -> rejected!
             rc_p4_empty, out_p4_empty, _, _ = run_script(
