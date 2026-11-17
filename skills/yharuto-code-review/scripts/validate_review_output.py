@@ -89,6 +89,12 @@ GREEN_VERDICTS: frozenset[str] = frozenset(
         "🟢 健全（重大な懸念なし）",
     }
 )
+YELLOW_VERDICTS: frozenset[str] = frozenset(
+    {
+        "🟡 Comment",
+        "🟡 要確認（構造・保守上の懸念あり）",
+    }
+)
 
 PR_OVERVIEW_HEADER_TUPLES: tuple[tuple[str, str, str], ...] = (
     ("ファイル", "変更種別", "役割と主な変更内容"),
@@ -475,14 +481,17 @@ def validate_gate_state(
     # 4. Verify Stage 1 Test Sufficiency Gate
     stage1 = state.get("stage1")
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+    skip_test = bool(state.get("skip_test", False))
 
     if s1_status == "NG":
         gaps = stage1.get("gaps_count", 0) if isinstance(stage1, dict) else 0
         if not isinstance(gaps, int) or gaps < 1:
             gate_errors.append("Stage 1 status is NG, but gaps_count >= 1 was not recorded via gate-stage1.")
-        return "stage1_ng", state, gate_errors, False, hmac_ok
-
-    if s1_status not in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+        if not skip_test:
+            return "stage1_ng", state, gate_errors, False, hmac_ok
+    elif skip_test and s1_status == "SKIPPED_BY_FLAG":
+        pass
+    elif s1_status not in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
         gate_errors.append(
             f"Stage 1 Test Sufficiency Gate was not passed (current status: '{s1_status}')."
         )
@@ -1184,16 +1193,34 @@ def main(argv: Sequence[str] | None = None) -> int:
                 gate_errors.append(
                     f"Verdict cannot be '{parsed_verdict}' when Stage 2 CI has regression checks with status == 'failed'."
                 )
-            if bug_count == 0 and risk_count == 0 and not has_stage2_failure and parsed_verdict not in GREEN_VERDICTS:
-                expected_green = (
-                    "'🟢 健全（重大な懸念なし）' or '🟢 Approve'"
-                    if expected_mode == "audit"
-                    else "'🟢 Approve'"
-                )
-                structural_errors.append(
-                    f"Verdict must be {expected_green} when Bug=0, Risk=0, and Stage 2 has no failed checks "
-                    f"(got '{parsed_verdict}'; 🔵 Nit={nit_count} and ❓ Question={question_count} do not affect verdict)."
-                )
+            s1_dict = state.get("stage1")
+            s1_status_val = s1_dict.get("status") if isinstance(s1_dict, dict) else None
+            skip_test_bypassed = bool(state.get("skip_test", False)) and s1_status_val in {
+                "NG",
+                "SKIPPED_BY_FLAG",
+            }
+            if bug_count == 0 and risk_count == 0 and not has_stage2_failure:
+                if skip_test_bypassed:
+                    if parsed_verdict not in (GREEN_VERDICTS | YELLOW_VERDICTS):
+                        expected_allowed = (
+                            "'🟢 健全（重大な懸念なし）', '🟢 Approve', '🟡 要確認（構造・保守上の懸念あり）', or '🟡 Comment'"
+                            if expected_mode == "audit"
+                            else "'🟢 Approve' or '🟡 Comment'"
+                        )
+                        structural_errors.append(
+                            f"Verdict must be {expected_allowed} when Bug=0, Risk=0, and Stage 2 has no failed checks "
+                            f"with --skip-test (got '{parsed_verdict}')."
+                        )
+                elif parsed_verdict not in GREEN_VERDICTS:
+                    expected_green = (
+                        "'🟢 健全（重大な懸念なし）' or '🟢 Approve'"
+                        if expected_mode == "audit"
+                        else "'🟢 Approve'"
+                    )
+                    structural_errors.append(
+                        f"Verdict must be {expected_green} when Bug=0, Risk=0, and Stage 2 has no failed checks "
+                        f"(got '{parsed_verdict}'; 🔵 Nit={nit_count} and ❓ Question={question_count} do not affect verdict)."
+                    )
 
     # 4. Run portable built-in + optional yomiyasu Japanese prose & emoji lint
     try:

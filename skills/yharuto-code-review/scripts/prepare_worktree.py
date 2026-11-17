@@ -36,6 +36,8 @@ from _lib import (  # noqa: E402
     fail_with_code,
     init_session_hmac_key,
     is_safe_session_dir,
+    is_stage1_passed_or_skipped,
+    normalize_rel_path,
     parse_fenced_blocks,
     prune_created_project_dirs,
     read_json_object,
@@ -46,6 +48,7 @@ from _lib import (  # noqa: E402
     sanitize_slug,
     sha256_bytes,
     sha256_file,
+    split_nul_paths,
     unlink_symlinks_under,
     utc_now_iso,
     verify_state_hmac,
@@ -193,10 +196,10 @@ ALLOWED_FINDING_SEVERITIES: tuple[str, str, str, str] = ("Bug", "Risk", "Nit", "
 
 
 def is_testable_code_file(rel_path: str) -> bool:
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     p = Path(norm)
     name = p.name
-    if not name or name.startswith("."):
+    if not name or name.startswith(".") or any(part.startswith(".") for part in p.parts[:-1]):
         return False
     if name in LOCKFILE_NAMES or name in MANIFEST_NAMES or name in {"LICENSE", "Dockerfile", "Makefile"}:
         return False
@@ -484,11 +487,14 @@ def _copy_snapshot_files(src_root: Path, dst_root: Path, rel_paths: Sequence[str
     dst_root.mkdir(parents=True, exist_ok=True)
     if rel_paths is not None:
         for rel in rel_paths:
-            norm = rel.replace("\\", "/").lstrip("./")
-            if not norm or norm.startswith(".gemini/") or norm == ".gemini":
+            norm = normalize_rel_path(rel)
+            if not norm or norm == "." or norm.startswith(".gemini/") or norm == ".gemini":
                 continue
-            src_file = src_root / norm
-            dst_file = dst_root / norm
+            rel_obj = Path(norm)
+            if rel_obj.is_absolute() or ".." in rel_obj.parts:
+                continue
+            src_file = src_root / rel_obj
+            dst_file = dst_root / rel_obj
             if src_file.is_symlink() or not src_file.is_file():
                 continue
             dst_file.parent.mkdir(parents=True, exist_ok=True)
@@ -553,17 +559,17 @@ def _overlay_uncommitted_changes(repo_dir: Path, worktree_path: Path) -> None:
                         dst_f.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(src_f, dst_f)
 
-    untracked_proc = subprocess.run(
+    untracked_res = run_subproc(
         ["git", "ls-files", "--others", "--exclude-standard", "-z"],
-        cwd=str(repo_dir),
-        shell=False,
-        capture_output=True,
+        cwd=repo_dir,
         timeout=CMD_TIMEOUT_SECONDS,
-        check=False,
     )
-    if untracked_proc.returncode == 0 and untracked_proc.stdout:
-        raw_items = untracked_proc.stdout.decode("utf-8", errors="replace").split("\x00")
-        untracked_paths = [p for p in raw_items if p and not p.startswith(".gemini/")]
+    if untracked_res is not None and untracked_res.returncode == 0 and untracked_res.stdout:
+        untracked_paths = [
+            p
+            for p in split_nul_paths(untracked_res.stdout)
+            if p != ".gemini" and not p.startswith(".gemini/")
+        ]
         _copy_snapshot_files(repo_dir, worktree_path, untracked_paths)
 
 
@@ -597,16 +603,17 @@ def create_isolated_worktree(
 
     # Git repo without HEAD commit yet, or non-git directory in audit mode
     if is_git_repo:
-        ls_proc = subprocess.run(
+        ls_res = run_subproc(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-            cwd=str(repo_dir),
-            shell=False,
-            capture_output=True,
+            cwd=repo_dir,
             timeout=CMD_TIMEOUT_SECONDS,
-            check=False,
         )
-        if ls_proc.returncode == 0:
-            rels = [p for p in ls_proc.stdout.decode("utf-8", errors="replace").split("\x00") if p and not p.startswith(".gemini/")]
+        if ls_res is not None and ls_res.returncode == 0:
+            rels = [
+                p
+                for p in split_nul_paths(ls_res.stdout)
+                if p != ".gemini" and not p.startswith(".gemini/")
+            ]
             _copy_snapshot_files(repo_dir, worktree_path, rels)
             return worktree_path.resolve(), False
 
@@ -661,34 +668,30 @@ def collect_diff_stats(
     diff_text = ""
 
     if mode in ("pr", "range"):
-        all_res = run_cmd(["git", "diff", "--name-only", merge_base_sha, head_sha], cwd=repo_dir)
+        all_res = run_cmd(["git", "diff", "--name-only", "-z", merge_base_sha, head_sha], cwd=repo_dir)
         acmr_res = run_cmd(
-            ["git", "diff", "--name-only", "--diff-filter=ACMR", merge_base_sha, head_sha],
+            ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", merge_base_sha, head_sha],
             cwd=repo_dir,
         )
         patch_res = run_cmd(["git", "diff", "-U0", merge_base_sha, head_sha], cwd=repo_dir)
-        changed_files = [ln.strip() for ln in all_res.stdout.splitlines() if ln.strip()]
-        active_files = [ln.strip() for ln in acmr_res.stdout.splitlines() if ln.strip()]
+        changed_files = split_nul_paths(all_res.stdout)
+        active_files = split_nul_paths(acmr_res.stdout)
         diff_text = patch_res.stdout
     elif mode == "local":
         has_head = bool(merge_base_sha)
         if has_head:
-            tracked_res = run_cmd(["git", "diff", "--name-only", "HEAD"], cwd=repo_dir)
-            acmr_res = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "HEAD"], cwd=repo_dir)
+            tracked_res = run_cmd(["git", "diff", "--name-only", "-z", "HEAD"], cwd=repo_dir)
+            acmr_res = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", "HEAD"], cwd=repo_dir)
             patch_res = run_cmd(["git", "diff", "-U0", "HEAD"], cwd=repo_dir)
         else:
-            tracked_res = run_cmd(["git", "diff", "--cached", "--name-only"], cwd=repo_dir)
-            acmr_res = run_cmd(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd=repo_dir)
+            tracked_res = run_cmd(["git", "diff", "--cached", "--name-only", "-z"], cwd=repo_dir)
+            acmr_res = run_cmd(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], cwd=repo_dir)
             patch_res = run_cmd(["git", "diff", "--cached", "-U0"], cwd=repo_dir)
 
-        untracked_res = run_cmd(["git", "ls-files", "--others", "--exclude-standard"], cwd=repo_dir)
-        untracked = [
-            ln.strip()
-            for ln in untracked_res.stdout.splitlines()
-            if ln.strip() and not ln.strip().startswith(".gemini/")
-        ]
-        tracked = [ln.strip() for ln in tracked_res.stdout.splitlines() if ln.strip() and not ln.strip().startswith(".gemini/")]
-        acmr = [ln.strip() for ln in acmr_res.stdout.splitlines() if ln.strip() and not ln.strip().startswith(".gemini/")]
+        untracked_res = run_cmd(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=repo_dir)
+        untracked = [p for p in split_nul_paths(untracked_res.stdout) if not p.startswith(".gemini/")]
+        tracked = [p for p in split_nul_paths(tracked_res.stdout) if not p.startswith(".gemini/")]
+        acmr = [p for p in split_nul_paths(acmr_res.stdout) if not p.startswith(".gemini/")]
 
         changed_files = list(dict.fromkeys(tracked + untracked))
         active_files = list(dict.fromkeys(acmr + untracked))
@@ -707,17 +710,13 @@ def collect_diff_stats(
     elif mode == "audit":
         files: list[str] = []
         if is_git_repo:
-            cmd = ["git", "ls-files", "--cached", "--others", "--exclude-standard"]
+            cmd = ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
             if audit_paths:
                 cmd.append("--")
                 cmd.extend(audit_paths)
             ls_res = run_cmd(cmd, cwd=repo_dir)
             if ls_res.returncode == 0:
-                files = [
-                    ln.strip()
-                    for ln in ls_res.stdout.splitlines()
-                    if ln.strip() and not ln.strip().startswith(".gemini/")
-                ]
+                files = [p for p in split_nul_paths(ls_res.stdout) if not p.startswith(".gemini/")]
         if not files:
             targets = [workdir / p for p in audit_paths] if audit_paths else [workdir]
             for target in targets:
@@ -863,6 +862,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     initial_porcelain = collect_repo_porcelain(repo_dir, ignore_project_session=False) if is_git_repo else None
 
     offline_meta = load_pr_meta(args.pr_meta)
+    skip_test = bool(args.skip_test)
     is_fork_pr = bool(args.untrusted)
     untrusted_reason: str | None = "cli_untrusted_flag" if is_fork_pr else None
     untrusted_pr_meta: dict[str, object] | None = None
@@ -998,6 +998,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "adversarial_response_path": adversarial_response_path,
         "review_output_path": review_output_path,
         "mode": mode,
+        "skip_test": skip_test,
         "pr_number": pr_number,
         "audit_paths": audit_paths,
         "base_sha": base_sha,
@@ -1027,6 +1028,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "gaps_count": 0,
             "summary": "",
             "reason": "",
+            "bypassed_by_skip_test": False,
             "updated_at": None,
         },
         "stage2": {
@@ -1084,6 +1086,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "adversarial_response_path": adversarial_response_path,
         "review_output_path": review_output_path,
         "mode": mode,
+        "skip_test": skip_test,
         "base_sha": base_sha,
         "head_sha": head_sha,
         "merge_base_sha": merge_base_sha,
@@ -1155,10 +1158,15 @@ def cmd_gate_stage1(args: argparse.Namespace) -> int:
     mode = str(state.get("mode") or "")
     testable_raw = state.get("testable_code_files")
     testable_files = [str(x) for x in testable_raw] if isinstance(testable_raw, list) else []
+    skip_test = bool(state.get("skip_test", False)) or bool(args.skip_test)
+    if bool(args.skip_test):
+        state["skip_test"] = True
 
     verdict = str(args.verdict).strip().upper()
-    if verdict not in {"OK", "NG", "EXEMPT"}:
-        fail_with_code(f"Invalid --verdict '{args.verdict}': expected OK, NG, or EXEMPT.", 2)
+    if verdict not in {"OK", "NG", "EXEMPT", "SKIP"}:
+        fail_with_code(f"Invalid --verdict '{args.verdict}': expected OK, NG, EXEMPT, or SKIP.", 2)
+    if verdict == "SKIP" and not skip_test:
+        fail_with_code("verdict SKIP requires --skip-test.", 2)
 
     if verdict == "OK":
         raw_csv = str(args.verified_tests or "").strip()
@@ -1189,44 +1197,80 @@ def cmd_gate_stage1(args: argparse.Namespace) -> int:
             "gaps_count": 0,
             "summary": str(args.summary or "").strip(),
             "reason": str(args.reason or "").strip(),
+            "bypassed_by_skip_test": False,
             "updated_at": utc_now_iso(),
         }
     elif verdict == "EXEMPT":
-        if mode in {"pr", "range", "local"} and len(testable_files) >= 1:
+        has_testable_in_diff = mode in {"pr", "range", "local"} and len(testable_files) >= 1
+        if has_testable_in_diff and not skip_test:
             fail_with_code(
                 "EXEMPT is forbidden when testable_code_files is non-empty in pr/range/local mode. "
                 "Verify real tests (OK) or reject with NG.",
                 2,
                 extra={"mode": mode, "testable_code_files": testable_files},
             )
-        reason_str = str(args.reason or args.summary or "No testable code files in scope").strip()
+        bypassed_exempt = has_testable_in_diff and skip_test
+        default_reason = (
+            "Skipped Stage 1 stop via --skip-test" if bypassed_exempt else "No testable code files in scope"
+        )
+        reason_str = str(args.reason or args.summary or default_reason).strip()
         stage1_obj = {
-            "status": "EXEMPT_NO_TESTABLE_CODE",
+            "status": "SKIPPED_BY_FLAG" if bypassed_exempt else "EXEMPT_NO_TESTABLE_CODE",
             "verified_tests": [],
             "gaps_count": 0,
             "summary": str(args.summary or "").strip(),
             "reason": reason_str,
+            "bypassed_by_skip_test": bypassed_exempt,
+            "updated_at": utc_now_iso(),
+        }
+    elif verdict == "SKIP":
+        reason_str = str(args.reason or args.summary or "Skipped Stage 1 stop via --skip-test").strip()
+        stage1_obj = {
+            "status": "SKIPPED_BY_FLAG",
+            "verified_tests": [],
+            "gaps_count": 0,
+            "summary": str(args.summary or "").strip(),
+            "reason": reason_str,
+            "bypassed_by_skip_test": True,
             "updated_at": utc_now_iso(),
         }
     else:
         gaps_count = args.gaps_count
-        if not isinstance(gaps_count, int) or gaps_count < 1:
-            fail_with_code("verdict NG requires --gaps-count <N> with N >= 1.", 2)
-        summary_str = str(args.summary or args.reason or "").strip()
-        if not summary_str:
-            fail_with_code("verdict NG requires non-empty --summary <txt>.", 2)
-        stage1_obj = {
-            "status": "NG",
-            "verified_tests": [],
-            "gaps_count": gaps_count,
-            "summary": summary_str,
-            "reason": str(args.reason or "").strip(),
-            "updated_at": utc_now_iso(),
-        }
+        if skip_test:
+            if gaps_count is not None and (not isinstance(gaps_count, int) or gaps_count < 1):
+                fail_with_code("verdict NG requires --gaps-count <N> with N >= 1.", 2)
+            effective_gaps = gaps_count if isinstance(gaps_count, int) else 1
+            summary_str = str(
+                args.summary or args.reason or "Stage 1 test gate NG continued via --skip-test"
+            ).strip()
+            stage1_obj = {
+                "status": "NG",
+                "verified_tests": [],
+                "gaps_count": effective_gaps,
+                "summary": summary_str,
+                "reason": str(args.reason or "").strip(),
+                "bypassed_by_skip_test": True,
+                "updated_at": utc_now_iso(),
+            }
+        else:
+            if not isinstance(gaps_count, int) or gaps_count < 1:
+                fail_with_code("verdict NG requires --gaps-count <N> with N >= 1.", 2)
+            summary_str = str(args.summary or args.reason or "").strip()
+            if not summary_str:
+                fail_with_code("verdict NG requires non-empty --summary <txt>.", 2)
+            stage1_obj = {
+                "status": "NG",
+                "verified_tests": [],
+                "gaps_count": gaps_count,
+                "summary": summary_str,
+                "reason": str(args.reason or "").strip(),
+                "bypassed_by_skip_test": False,
+                "updated_at": utc_now_iso(),
+            }
 
     state["stage1"] = stage1_obj
     write_sealed_gate_state(session_dir, state)
-    emit_json({"status": "ok", "session_dir": str(session_dir), "stage1": stage1_obj})
+    emit_json({"status": "ok", "session_dir": str(session_dir), "skip_test": skip_test, "stage1": stage1_obj})
     return 0
 
 
@@ -1419,7 +1463,7 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
 
     stage1 = state.get("stage1")
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-    if s1_status not in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+    if not is_stage1_passed_or_skipped(state):
         fail_with_code(f"Cannot prepare Stage 4: Stage 1 status is '{s1_status}'.", 2)
 
     stage2 = state.get("stage2")
@@ -1506,6 +1550,7 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
         f"- Head SHA: `{state.get('head_sha')}`",
         f"- Fork PR: `{state.get('is_fork_pr')}`",
         f"- CI Script Hazard: `{state.get('ci_script_hazard')}`",
+        f"- Stage 1 Status: `{s1_status}` (skip_test=`{bool(state.get('skip_test', False))}`)",
         "",
         "### Changed Files",
     ]
@@ -1994,14 +2039,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat target branch/code as untrusted (blocks dynamic CI script execution).",
     )
+    p_prep.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Continue full review through Stage 2-5 even when Stage 1 Test Gate verdict is NG.",
+    )
 
     p_s1 = sub.add_parser("gate-stage1", help="Record Stage 1 Test Sufficiency Gate verdict.")
     p_s1.add_argument("--session", required=True, help="Session directory path.")
-    p_s1.add_argument("--verdict", required=True, help="OK | NG | EXEMPT")
+    p_s1.add_argument("--verdict", required=True, help="OK | NG | EXEMPT | SKIP (--skip-test only)")
     p_s1.add_argument("--verified-tests", default="", help="Comma-separated workdir-relative test file paths (for OK).")
     p_s1.add_argument("--gaps-count", type=int, default=None, help="Number of test/mock gaps >= 1 (for NG).")
     p_s1.add_argument("--summary", default="", help="Short summary of Stage 1 assessment.")
-    p_s1.add_argument("--reason", default="", help="Exemption reason (for EXEMPT).")
+    p_s1.add_argument("--reason", default="", help="Exemption or skip reason (for EXEMPT/SKIP).")
+    p_s1.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Continue full review through Stage 2-5 regardless of Stage 1 test verdict.",
+    )
 
     p_p4 = sub.add_parser("prepare-stage4", help="Generate reasoning-stripped adversarial_input.md with challenge_nonce.")
     p_p4.add_argument("--session", required=True, help="Session directory path.")

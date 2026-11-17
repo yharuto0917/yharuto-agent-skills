@@ -57,13 +57,15 @@ CI_CONFIG_FILENAMES: frozenset[str] = frozenset(
 )
 
 CI_SCRIPT_HAZARD_RE = re.compile(
-    r"(?:\bnode\b[^\n]*(?:\s-e\b|\s--eval\b|--input-type\b)"
-    r"|\bpython3?\b[^\n]*\s-c\b"
-    r"|\b(?:sh|bash|zsh|dash|ksh)\b[^\n]*\s-c\b"
+    r"(?:\bnode\b[^\n]*(?:[\s\"']-(?:e\b|-eval\b)|--input-type\b)"
+    r"|\bpython3?\b[^\n]*[\s\"']-c\b"
+    r"|\b(?:sh|bash|zsh|dash|ksh)\b[^\n]*[\s\"']-c\b"
     r"|\b(?:curl|wget|nc|ncat|netcat|socat)\s"
     r"|\beval\s*(?:\(|[\"'`$])"
     r"|\b(?:writeFileSync|appendFileSync|child_process|execSync|spawnSync|execFileSync)\b"
     r"|\b(?:os\.system|subprocess\.(?:Popen|run|call|check_output|check_call)|urllib\.request|http\.client|socket\.connect)\b"
+    r"|(?:^|\n)\s*(?:script-shell|onload-script|node-options|rustc-wrapper|rustc-workspace-wrapper|runner)\s*="
+    r"|\b(?:RUSTC_WRAPPER|LD_PRELOAD|DYLD_INSERT_LIBRARIES)\b"
     r"|(?:/dev/tcp/|base64\s+-d|\|\s*(?:sh|bash)\b))"
 )
 
@@ -146,15 +148,39 @@ def _child_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     return merged
 
 
+def normalize_rel_path(rel_path: str) -> str:
+    """Normalize path separators to '/' and strip only leading './' prefixes (preserving leading dotfile '.')."""
+    norm = rel_path.replace("\\", "/")
+    was_abs = norm.startswith("/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+        if not was_abs:
+            norm = norm.lstrip("/")
+    return norm
+
+
+def split_nul_paths(raw_stdout: str) -> list[str]:
+    """Parse NUL-delimited (`-z`) git path output without losing non-ASCII or space-containing paths."""
+    return [item for item in raw_stdout.split("\x00") if item]
+
+
+def _prepare_exec_argv(cmd: Sequence[str]) -> list[str]:
+    argv = list(cmd)
+    if argv and argv[0] == "git" and "core.quotepath=false" not in argv[:4]:
+        return ["git", "-c", "core.quotepath=false", *argv[1:]]
+    return argv
+
+
 def run_cmd(
     cmd: Sequence[str],
     cwd: Path,
     timeout: int = CMD_TIMEOUT_SECONDS,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    argv = _prepare_exec_argv(cmd)
     try:
         return subprocess.run(
-            list(cmd),
+            argv,
             cwd=str(cwd),
             env=_child_env(env),
             shell=False,
@@ -177,9 +203,10 @@ def run_subproc(
     timeout: int = 20,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
+    argv = _prepare_exec_argv(cmd)
     try:
         return subprocess.run(
-            list(cmd),
+            argv,
             cwd=str(cwd),
             env=_child_env(env),
             shell=False,
@@ -714,11 +741,11 @@ def collect_repo_porcelain(repo_dir: Path, ignore_project_session: bool = False)
 
 
 def is_ci_config_path(rel_path: str) -> bool:
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     p = Path(norm)
     if p.name in CI_CONFIG_FILENAMES:
         return True
-    if norm.endswith(".cargo/config.toml") or norm.endswith(".cargo/config"):
+    if p.parts[-2:] in {(".cargo", "config.toml"), (".cargo", "config")}:
         return True
     return False
 
@@ -769,7 +796,20 @@ def detect_ci_script_hazard_in_files(workdir: Path) -> tuple[bool, list[str]]:
         except (OSError, json.JSONDecodeError):
             pass
 
-    for rel_cand in ("Makefile", "GNUmakefile", "pyproject.toml", "setup.py", "build.rs", ".cargo/config.toml"):
+    for rel_cand in (
+        "Makefile",
+        "GNUmakefile",
+        "makefile",
+        "pyproject.toml",
+        "setup.py",
+        "build.rs",
+        "justfile",
+        "Taskfile.yml",
+        "Taskfile.yaml",
+        ".npmrc",
+        ".cargo/config.toml",
+        ".cargo/config",
+    ):
         cpath = workdir / rel_cand
         if cpath.is_file():
             try:
@@ -781,3 +821,17 @@ def detect_ci_script_hazard_in_files(workdir: Path) -> tuple[bool, list[str]]:
                 reasons.append(f"{rel_cand}: hazardous payload '{m.group(0).strip()[:60]}'")
 
     return len(reasons) > 0, reasons
+
+
+ALLOWED_STAGE1_SKIP_STATUSES: frozenset[str] = frozenset({"NG", "SKIPPED_BY_FLAG"})
+
+
+def is_stage1_passed_or_skipped(state: Mapping[str, object]) -> bool:
+    """Return True when Stage 1 passed normally or is allowed to continue via --skip-test."""
+    stage1 = state.get("stage1")
+    s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+    if s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+        return True
+    if bool(state.get("skip_test", False)) and s1_status in ALLOWED_STAGE1_SKIP_STATUSES:
+        return True
+    return False

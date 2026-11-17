@@ -22,9 +22,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from _lib import (  # noqa: E402
     emit_json,
     fail_with_code,
+    normalize_rel_path,
     read_verified_gate_state,
     run_subproc,
     sha256_file,
+    split_nul_paths,
     utc_now_iso,
     write_json_atomic,
     write_sealed_gate_state,
@@ -248,7 +250,7 @@ def run_git(cmd: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str] |
 
 
 def should_skip_file(rel_path: str) -> str | None:
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     p = Path(norm)
     if any(seg in IGNORED_DIRS for seg in p.parts):
         return "ignored_directory"
@@ -349,12 +351,9 @@ def collect_target_lines(
             else:
                 targets[rel] = line_set
 
-        untracked_res = run_git(["git", "ls-files", "--others", "--exclude-standard"], cwd=workdir)
+        untracked_res = run_git(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=workdir)
         if untracked_res and untracked_res.returncode == 0:
-            for ln in untracked_res.stdout.splitlines():
-                rel = ln.strip()
-                if not rel:
-                    continue
+            for rel in split_nul_paths(untracked_res.stdout):
                 reason = should_skip_file(rel)
                 if reason is not None:
                     skipped.append({"file": rel, "reason": reason})
@@ -363,7 +362,13 @@ def collect_target_lines(
         return targets, skipped
 
     # audit mode
-    norm_prefixes = [p.strip("/").replace("\\", "/") for p in audit_paths if p.strip()]
+    norm_prefixes = [
+        cleaned
+        for p in audit_paths
+        if p.strip()
+        for cleaned in (normalize_rel_path(p.strip()).strip("/"),)
+        if cleaned and cleaned != "."
+    ]
     for root, dirs, files in os.walk(workdir, topdown=True, followlinks=False):
         dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and not (Path(root) / d).is_symlink())
         rel_root = Path(root).relative_to(workdir)

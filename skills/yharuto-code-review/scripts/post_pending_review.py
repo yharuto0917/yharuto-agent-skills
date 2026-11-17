@@ -25,7 +25,10 @@ from _lib import (  # noqa: E402
     emit_json,
     fail_with_code,
     find_fenced_lines,
+    is_stage1_passed_or_skipped,
+    normalize_rel_path,
     read_verified_gate_state,
+    run_subproc,
     sha256_file,
     split_markdown_table_row,
     write_json_atomic,
@@ -50,10 +53,7 @@ class SectionRange:
 
 
 def strip_dot_slash(raw_path: str) -> str:
-    cleaned = raw_path.replace("\\", "/")
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    return cleaned
+    return normalize_rel_path(raw_path)
 
 
 def convert_relative_links_to_blob(
@@ -216,24 +216,12 @@ def extract_primary_location(subsection_lines: Sequence[str]) -> tuple[str, int 
 def compute_diff_hunks(repo_dir: Path, merge_base_sha: str, head_sha: str) -> dict[str, list[set[int]]]:
     if not merge_base_sha or not head_sha:
         return {}
-    env = dict(os.environ)
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    try:
-        proc = subprocess.run(
-            ["git", "diff", "-U3", merge_base_sha, head_sha],
-            cwd=str(repo_dir),
-            env=env,
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if proc.returncode != 0:
+    proc = run_subproc(
+        ["git", "diff", "-U3", merge_base_sha, head_sha],
+        cwd=repo_dir,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if proc is None or proc.returncode != 0:
         return {}
 
     hunks_by_file: dict[str, list[set[int]]] = {}
@@ -549,9 +537,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stage1 = raw_state.get("stage1")
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-    if s1_status == "NG":
+    skip_test = bool(raw_state.get("skip_test", False))
+    if s1_status == "NG" and not skip_test:
         review_mode = "stage1_ng"
-    elif s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+    elif is_stage1_passed_or_skipped(raw_state):
         stage2 = raw_state.get("stage2")
         stage3 = raw_state.get("stage3")
         stage4 = raw_state.get("stage4")

@@ -26,6 +26,7 @@ from _lib import (  # noqa: E402
     detect_ci_script_hazard_in_files,
     emit_json,
     fail_with_code,
+    is_stage1_passed_or_skipped,
     prune_created_project_dirs,
     read_verified_gate_state,
     resolve_session_root,
@@ -465,6 +466,205 @@ def run_static_syntax_checks(workdir: Path, changed_files: Sequence[str]) -> tup
     )
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+UNITTEST_FAIL_ID_RE = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
+PYTEST_SUMMARY_FAIL_ID_RE = re.compile(
+    r"^(?:FAILED|ERROR)\s+([^\r\n]+?::[^\r\n]+?)(?:\s+-\s+.*)?$",
+    re.MULTILINE,
+)
+PYTEST_COLLECT_ERR_ID_RE = re.compile(r"^ERROR\s+(\S+\.py)\b", re.MULTILINE)
+PYTEST_INLINE_FAIL_ID_RE = re.compile(r"^(\S+\.py::\S+)\s+(?:FAILED|ERROR)\b", re.MULTILINE)
+TAP_FAIL_ID_RE = re.compile(r"^\s*not ok\s+\d+(?:\s+-\s+|\s+)([^\r\n]+?)\s*$", re.MULTILINE)
+TAP_SKIP_TODO_RE = re.compile(r"#\s*(?:SKIP|TODO)\b", re.IGNORECASE)
+TAP_TIME_COMMENT_RE = re.compile(r"\s*#\s*time=[0-9.]+m?s.*$", re.IGNORECASE)
+JEST_FAIL_ID_RE = re.compile(r"^\s*●\s+(.+?)\s*$", re.MULTILINE)
+SPEC_CROSS_FAIL_ID_RE = re.compile(
+    r"^\s*[✖✕×]\s+(.+?)(?:\s+\(?[0-9.]+\s*m?s\)?)?\s*$",
+    re.MULTILINE,
+)
+VITEST_FAIL_ID_RE = re.compile(r"^\s*FAIL\s+(\S+\s+>\s+.+?)(?:\s+\[[^\]]*\])?\s*$", re.MULTILINE)
+GO_FAIL_ID_RE = re.compile(r"^\s*---\s*FAIL:\s+(\S+)", re.MULTILINE)
+CARGO_FAIL_ID_RE = re.compile(r"^test\s+(.+?)\s+\.\.\.\s+FAILED\s*$", re.MULTILINE)
+
+UNITTEST_SUMMARY_COUNT_RE = re.compile(r"^FAILED\s*\(([^)]+)\)\s*$", re.MULTILINE)
+PYTEST_SUMMARY_LINE_RE = re.compile(
+    r"(?:^|=+\s*)([^\n=]*\b\d+\s+(?:failed|errors?)\b[^\n=]*)\s+in\s+[0-9.]+s",
+    re.MULTILINE,
+)
+TAP_SUMMARY_COUNT_RE = re.compile(r"^(?:#|ℹ)\s*(?:fail|failed)\s+(\d+)\b", re.MULTILINE)
+JEST_SUMMARY_COUNT_RE = re.compile(r"Tests:?\s+(?:[^\n]*?,\s*)?(\d+)\s+failed\b")
+MOCHA_SUMMARY_COUNT_RE = re.compile(r"^\s*(\d+)\s+failing\b", re.MULTILINE)
+CARGO_SUMMARY_COUNT_RE = re.compile(r"test result:\s*FAILED\.\s*\d+\s+passed;\s*(\d+)\s+failed\b")
+DIAGNOSTIC_ERROR_LINE_RE = re.compile(
+    r"^(?:(?:Assertion)?Error:|error(?:\[[A-Z0-9]+\])?:|FAIL\b|[✗✘]\s+|"
+    r"\S+:\d+(?::\d+)?:\s*(?:[A-Z]\d+\s+|error\b)|.*\berror\s+TS\d+:)",
+    re.MULTILINE,
+)
+
+
+def extract_failure_signature(raw_output: str, workdir: Path) -> tuple[list[str], int | None]:
+    """Extract normalized failed test/check identifiers and total failure count from runner output."""
+    cleaned = ANSI_ESCAPE_RE.sub("", raw_output)
+    for prefix in dict.fromkeys((str(workdir.resolve()), str(workdir))):
+        if prefix:
+            cleaned = cleaned.replace(prefix, "<WORKDIR>")
+
+    failed_ids: set[str] = set()
+    for m in UNITTEST_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"unittest:{m.group(1).strip()}")
+    for m in PYTEST_SUMMARY_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"pytest:{m.group(1).strip()}")
+    for m in PYTEST_COLLECT_ERR_ID_RE.finditer(cleaned):
+        failed_ids.add(f"pytest_collect:{m.group(1).strip()}")
+    for m in PYTEST_INLINE_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"pytest:{m.group(1).strip()}")
+    for m in TAP_FAIL_ID_RE.finditer(cleaned):
+        raw_label = m.group(1).strip()
+        if raw_label and not TAP_SKIP_TODO_RE.search(raw_label):
+            label = TAP_TIME_COMMENT_RE.sub("", raw_label).strip()
+            if label:
+                failed_ids.add(f"tap:{label}")
+    for m in JEST_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"jest:{m.group(1).strip()}")
+    for m in SPEC_CROSS_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"spec:{m.group(1).strip()}")
+    for m in VITEST_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"vitest:{m.group(1).strip()}")
+    for m in GO_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"go:{m.group(1).strip()}")
+    for m in CARGO_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"cargo:{m.group(1).strip()}")
+
+    failure_count: int | None = None
+    ut_matches = list(UNITTEST_SUMMARY_COUNT_RE.finditer(cleaned))
+    pt_matches = list(PYTEST_SUMMARY_LINE_RE.finditer(cleaned))
+    tap_matches = list(TAP_SUMMARY_COUNT_RE.finditer(cleaned))
+    jest_matches = list(JEST_SUMMARY_COUNT_RE.finditer(cleaned))
+    mocha_matches = list(MOCHA_SUMMARY_COUNT_RE.finditer(cleaned))
+    cargo_matches = list(CARGO_SUMMARY_COUNT_RE.finditer(cleaned))
+
+    if ut_matches:
+        failure_count = sum(
+            int(x)
+            for m_ut in ut_matches
+            for x in re.findall(r"\b(?:failures|errors)=(\d+)\b", m_ut.group(1))
+        )
+    elif pt_matches:
+        failure_count = sum(
+            int(x)
+            for m_pt in pt_matches
+            for x in re.findall(r"\b(\d+)\s+(?:failed|errors?)\b", m_pt.group(1))
+        )
+    elif tap_matches:
+        failure_count = sum(int(m_t.group(1)) for m_t in tap_matches)
+    elif jest_matches:
+        failure_count = sum(int(m_j.group(1)) for m_j in jest_matches)
+    elif mocha_matches:
+        failure_count = sum(int(m_m.group(1)) for m_m in mocha_matches)
+    elif cargo_matches:
+        failure_count = sum(int(m_c.group(1)) for m_c in cargo_matches)
+    elif failed_ids:
+        failure_count = len(failed_ids)
+    else:
+        diag_hits = DIAGNOSTIC_ERROR_LINE_RE.findall(cleaned)
+        if diag_hits:
+            failure_count = len(diag_hits)
+
+    return sorted(failed_ids), failure_count
+
+
+def _as_optional_int(val: object) -> int | None:
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    return None
+
+
+def _compare_head_and_base_failures(
+    head_chk: Mapping[str, object],
+    base_chk: Mapping[str, object],
+) -> tuple[bool, list[str]]:
+    """Return (is_regression, newly_failed_ids) comparing head vs merge_base failure details."""
+    raw_head_ids = head_chk.get("failed_tests")
+    raw_base_ids = base_chk.get("failed_tests")
+    head_ids = {str(x) for x in raw_head_ids} if isinstance(raw_head_ids, list) else set()
+    base_ids = {str(x) for x in raw_base_ids} if isinstance(raw_base_ids, list) else set()
+
+    head_count = _as_optional_int(head_chk.get("failure_count"))
+    base_count = _as_optional_int(base_chk.get("failure_count"))
+
+    if head_ids:
+        new_ids = sorted(head_ids - base_ids)
+        if new_ids:
+            return True, new_ids
+        if head_count is not None and base_count is not None and head_count > base_count:
+            return True, []
+        return False, []
+
+    if base_ids:
+        # Base executed identifiable tests while head collapsed before test execution (e.g. import/collection crash)
+        return True, []
+
+    if head_count is not None and base_count is not None:
+        return head_count > base_count, []
+    if head_count is not None and head_count > 0 and base_count is None:
+        return True, []
+
+    head_lines = head_chk.get("summary_lines")
+    base_lines = base_chk.get("summary_lines")
+    if isinstance(head_lines, list) and isinstance(base_lines, list):
+        return head_lines != base_lines, []
+    return False, []
+
+
+def _apply_base_comparison_result(
+    chk: dict[str, object],
+    base_chk: Mapping[str, object],
+    tool_name: str,
+    merge_base_sha: str,
+    log_chunks: list[str],
+) -> None:
+    base_st = str(base_chk.get("status") or "")
+    if base_st in {"passed", "timed_out"}:
+        chk["status"] = "failed"
+        chk["failure_origin"] = "regression"
+        log_chunks.append(
+            f"[base_worktree:{tool_name}] Status '{base_st}' on merge_base_sha -> regression ('failed').\n"
+        )
+        return
+    if base_st != "failed":
+        chk["failure_origin"] = "unknown"
+        return
+
+    is_reg, new_failed_ids = _compare_head_and_base_failures(chk, base_chk)
+    summary_existing = chk.get("summary_lines")
+    if is_reg:
+        chk["status"] = "failed"
+        chk["failure_origin"] = "regression"
+        if new_failed_ids:
+            chk["new_failed_tests"] = new_failed_ids[:50]
+        detail = (
+            f"new failed tests {new_failed_ids[:5]}"
+            if new_failed_ids
+            else f"failure count increased ({base_chk.get('failure_count')} -> {chk.get('failure_count')})"
+        )
+        note = f"Note: '{tool_name}' introduced regression on top of preexisting base failures ({detail})."
+        if isinstance(summary_existing, list):
+            summary_existing.append(note)
+        log_chunks.append(
+            f"[base_worktree:{tool_name}] {detail} compared to merge_base_sha -> regression ('failed').\n"
+        )
+        return
+
+    chk["status"] = "failed_preexisting"
+    chk["failure_origin"] = "preexisting"
+    note = f"Note: '{tool_name}' failed identically on merge_base_sha ({merge_base_sha[:12]}) -> failed_preexisting."
+    if isinstance(summary_existing, list):
+        summary_existing.append(note)
+    log_chunks.append(
+        f"[base_worktree:{tool_name}] Identical failures ({base_st}) on merge_base_sha -> 'failed_preexisting'.\n"
+    )
+
+
 def execute_single_command(
     tool: str,
     cmd: Sequence[str],
@@ -522,20 +722,25 @@ def execute_single_command(
     else:
         status = "failed"
 
+    entry: dict[str, object] = {
+        "tool": tool,
+        "cmd": list(cmd),
+        "status": status,
+        "exit_code": proc.returncode,
+        "summary_lines": lines[-SUMMARY_TAIL_LINES:] if lines else [f"Exited with code {proc.returncode}"],
+    }
+    if status == "failed":
+        failed_ids, failure_count = extract_failure_signature(combined, workdir)
+        if failed_ids:
+            entry["failed_tests"] = failed_ids[:200]
+        if failure_count is not None:
+            entry["failure_count"] = failure_count
+
     log_section = (
         f"=== [{tool}] cmd={' '.join(cmd)} exit={proc.returncode} status={status} ===\n"
         f"{combined}\n\n"
     )
-    return (
-        {
-            "tool": tool,
-            "cmd": list(cmd),
-            "status": status,
-            "exit_code": proc.returncode,
-            "summary_lines": lines[-SUMMARY_TAIL_LINES:] if lines else [f"Exited with code {proc.returncode}"],
-        },
-        log_section,
-    )
+    return entry, log_section
 
 
 def reverify_failures_against_base(
@@ -620,25 +825,7 @@ def reverify_failures_against_base(
                 timeout_seconds=timeout_seconds,
             )
             log_chunks.append(base_log)
-            base_st = str(base_chk.get("status") or "")
-            if base_st == "passed":
-                chk["status"] = "failed"
-                chk["failure_origin"] = "regression"
-                log_chunks.append(
-                    f"[base_worktree:{tool_name}] Passed on merge_base_sha -> regression ('failed').\n"
-                )
-            elif base_st in {"failed", "timed_out"}:
-                chk["status"] = "failed_preexisting"
-                chk["failure_origin"] = "preexisting"
-                summary_existing = chk.get("summary_lines")
-                note = f"Note: '{tool_name}' also failed on merge_base_sha ({merge_base_sha[:12]}) -> failed_preexisting."
-                if isinstance(summary_existing, list):
-                    summary_existing.append(note)
-                log_chunks.append(
-                    f"[base_worktree:{tool_name}] Also {base_st} on merge_base_sha -> 'failed_preexisting'.\n"
-                )
-            else:
-                chk["failure_origin"] = "unknown"
+            _apply_base_comparison_result(chk, base_chk, tool_name, merge_base_sha, log_chunks)
     finally:
         for link_p in base_links:
             try:
@@ -724,11 +911,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         stage1 = state.get("stage1")
         s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-        if s1_status not in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+        if not is_stage1_passed_or_skipped(state):
             fail_with_code(
-                f"Stage 2 blocked: Stage 1 gate status must be OK or EXEMPT_NO_TESTABLE_CODE (current: '{s1_status}').",
+                f"Stage 2 blocked: Stage 1 gate status must be OK or EXEMPT_NO_TESTABLE_CODE "
+                f"(or NG/SKIPPED_BY_FLAG with --skip-test; current: '{s1_status}').",
                 2,
-                extra={"stage1_status": s1_status},
+                extra={"stage1_status": s1_status, "skip_test": bool(state.get("skip_test", False))},
             )
 
         mode = str(state.get("mode") or "")

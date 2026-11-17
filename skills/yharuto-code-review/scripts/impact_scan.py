@@ -21,9 +21,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from _lib import (  # noqa: E402
     emit_json,
     fail_with_code,
+    normalize_rel_path,
     read_verified_gate_state,
     run_subproc,
     sha256_file,
+    split_nul_paths,
     utc_now_iso,
     write_json_atomic,
     write_sealed_gate_state,
@@ -245,7 +247,7 @@ def _find_fixture_dir_index(dir_parts: Sequence[str]) -> int | None:
 
 def is_test_or_mock_file(rel_path: str) -> bool:
     """Return True iff `rel_path` is an executable test or code mock/helper (excluding non-code and fixture snapshots)."""
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     p = Path(norm)
     if p.suffix.lower() not in CODE_EXTENSIONS:
         return False
@@ -269,7 +271,7 @@ def is_test_or_mock_file(rel_path: str) -> bool:
 
 
 def classify_test_or_mock_kind(rel_path: str) -> str:
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     name = Path(norm).name
     if EXPLICIT_TEST_FILENAME_RE.search(name):
         return "test"
@@ -280,7 +282,7 @@ def classify_test_or_mock_kind(rel_path: str) -> str:
 
 def is_non_production_path(rel_path: str) -> bool:
     """Return True if `rel_path` belongs to tests, mocks, or static fixture trees rather than production code."""
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     p = Path(norm)
     dir_parts = [seg.lower() for seg in p.parts[:-1]]
     if _find_fixture_dir_index(dir_parts) is not None or any(seg in TEST_OR_MOCK_DIR_NAMES for seg in dir_parts):
@@ -338,8 +340,8 @@ def get_diff_and_changed_files(
         diff_text = diff_res.stdout if diff_res and diff_res.returncode == 0 else ""
         if preset_changed is not None:
             return list(preset_changed), diff_text
-        names_res = run_subproc(["git", "diff", "--name-only", merge_base_sha, head_sha], cwd=repo_dir, timeout=GIT_TIMEOUT_SECONDS)
-        changed = [ln.strip() for ln in (names_res.stdout.splitlines() if names_res else []) if ln.strip()]
+        names_res = run_subproc(["git", "diff", "--name-only", "-z", merge_base_sha, head_sha], cwd=repo_dir, timeout=GIT_TIMEOUT_SECONDS)
+        changed = split_nul_paths(names_res.stdout) if names_res else []
         return changed, diff_text
 
     if mode == "local":
@@ -360,16 +362,16 @@ def get_diff_and_changed_files(
         head_chk = run_subproc(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         has_head = head_chk is not None and head_chk.returncode == 0
         diff_cmd = ["git", "diff", "-U0", "HEAD"] if has_head else ["git", "diff", "--cached", "-U0"]
-        names_cmd = ["git", "diff", "--name-only", "HEAD"] if has_head else ["git", "diff", "--cached", "--name-only"]
+        names_cmd = ["git", "diff", "--name-only", "-z", "HEAD"] if has_head else ["git", "diff", "--cached", "--name-only", "-z"]
         diff_res = run_subproc(diff_cmd, cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         names_res = run_subproc(names_cmd, cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         untracked_res = run_subproc(
-            ["git", "ls-files", "--others", "--exclude-standard"],
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
             cwd=workdir,
             timeout=GIT_TIMEOUT_SECONDS,
         )
-        tracked = [ln.strip() for ln in (names_res.stdout.splitlines() if names_res else []) if ln.strip()]
-        untracked = [ln.strip() for ln in (untracked_res.stdout.splitlines() if untracked_res else []) if ln.strip()]
+        tracked = split_nul_paths(names_res.stdout) if names_res else []
+        untracked = split_nul_paths(untracked_res.stdout) if untracked_res else []
         changed = list(preset_changed) if preset_changed is not None else list(dict.fromkeys(tracked + untracked))
         extra_lines: list[str] = []
         for rel in untracked:
@@ -384,8 +386,14 @@ def get_diff_and_changed_files(
         return changed, diff_text
 
     # audit mode
-    if audit_paths:
-        norm_prefixes = [p.strip("/").replace("\\", "/") for p in audit_paths if p.strip()]
+    norm_prefixes = [
+        cleaned
+        for p in audit_paths
+        if p.strip()
+        for cleaned in (normalize_rel_path(p.strip()).strip("/"),)
+        if cleaned and cleaned != "."
+    ]
+    if norm_prefixes:
         filtered = [
             f for f in all_files if any(f == pref or f.startswith(pref + "/") for pref in norm_prefixes)
         ]
@@ -444,7 +452,7 @@ def parse_grep_lines(raw_stdout: str) -> list[dict[str, object]]:
         parts = line.split(":", 2)
         if len(parts) < 3:
             continue
-        rel_file = parts[0].lstrip("./")
+        rel_file = normalize_rel_path(parts[0])
         if any(seg in IGNORED_DIRS for seg in Path(rel_file).parts) or Path(rel_file).name in IGNORED_FILENAMES:
             continue
         if not parts[1].isdigit():
@@ -518,7 +526,7 @@ def search_symbol_refs(
 
 
 def stem_without_compound_ext(rel_path: str) -> str:
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     name = Path(norm).name
     for suffix in (".test", ".spec", ".mock", ".d"):
         idx = name.lower().find(suffix + ".")
@@ -569,7 +577,7 @@ def find_related_tests_and_mocks(
             re.sub(r"[_-]+", "", c_stem),
             re.compile(
                 rf"(?<![a-z0-9_]){re.escape(c_stem)}(?![a-z0-9_])"
-                if len(c_stem) >= 4
+                if (len(c_stem) >= 4 or not c_stem.isascii())
                 else rf"[/'\".\\]{re.escape(c_stem)}(?![a-z0-9_])"
             ),
         )
