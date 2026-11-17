@@ -169,7 +169,7 @@ class TestSessionTTL(unittest.TestCase):
         self.store = SessionStore()
 
     def test_sliding_ttl_stops_at_hard_cap(self) -> None:
-        self.store.save("sess-1", created_at=0, now_ts=0)
+        self.store.save("sess-1", created_at=0, now_ts=85500)
         res = refresh_session(self.store, "sess-1", now_ts=86000)
         self.assertEqual(res, {"status": 200, "expires_at": 86400})
 

@@ -196,23 +196,35 @@ def ping_service() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+# Helper wrapper to validate positive quantity values
+# Added by AI assistant for defensive input checking
 def _ensure_positive_qty(qty: int) -> int:
-    # Check that quantity is positive
+    # Step 1: Check that quantity is an integer and not a boolean
+    # Step 2: Ensure quantity is strictly greater than zero
     if not isinstance(qty, int) or isinstance(qty, bool) or qty <= 0:
+        # Raise a ValueError when quantity validation fails
         raise ValueError("qty must be positive")
+    # Return validated quantity to caller
     return qty
 
 
+# Helper wrapper to normalize currency string input
+# Ensures whitespace is stripped and characters are uppercase
 def _check_currency_code(code: str) -> str:
-    # Strip and uppercase currency string
+    # Strip surrounding whitespace and convert to uppercase
     cleaned = code.strip().upper()
+    # Validate three-letter alphabetic ISO-like currency code
     if len(cleaned) != 3 or not cleaned.isalpha():
+        # Raise error for invalid currency format
         raise ValueError(f"Invalid currency: {code!r}")
+    # Return normalized currency code
     return cleaned
 
 
+# Thin pass-through dictionary builder wrapper
+# Constructs the output payload dictionary from primitives
 def _build_order_summary(order_id: str, total: int, currency: str) -> Dict[str, Any]:
-    # Build summary dictionary
+    # Build summary dictionary with order_id, total, and currency keys
     return {
         "order_id": order_id,
         "total": total,
@@ -225,28 +237,40 @@ def create_order_summary(
     items: List[Dict[str, int]],
     currency: str = "jpy",
 ) -> Dict[str, Any]:
-    # Validate inputs and compute total amount
+    # Validate inputs and compute total amount for the order
+    # First check order_id truthiness
     if order_id:
+        # Next check items list is not None
         if items is not None:
+            # Ensure items list has at least one element
             if len(items) > 0:
+                # Normalize the currency code first
                 normalized_currency = _check_currency_code(currency)
+                # Initialize running total to zero
                 total = 0
-                # Iterate over all order items
+                # Iterate over all order items to accumulate subtotal
                 for item in items:
+                    # Defensive check in case item element is None
                     if item is not None:
                         try:
+                            # Validate item quantity via helper wrapper
                             qty = _ensure_positive_qty(item["qty"])
                         except ValueError as exc:
+                            # Re-raise the exact same ValueError
                             raise exc
+                        # Extract unit price in yen
                         unit_price = item["unit_price_yen"]
+                        # Ensure unit price is non-negative
                         if unit_price < 0:
                             raise ValueError("unit_price_yen must be non-negative")
+                        # Multiply quantity by unit price and add to total
                         total += qty * unit_price
                 try:
-                    # Guard summary formatting
+                    # Guard summary formatting with broad try-except
                     payload = _build_order_summary(order_id, total, normalized_currency)
                     return payload
                 except Exception:
+                    # Swallow unexpected formatting errors
                     pass
     raise ValueError("order_id and non-empty items are required")
 EOF

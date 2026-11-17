@@ -15,7 +15,7 @@ mkdir -p .github/workflows docs
 cat << 'EOF' > CLAUDE.md
 # Project Conventions
 
-- PR本文やドキュメントでは絵文字（🚀✨🎯🧠👀⏭️ 等）を一切使用しないこと。
+- 技術ドキュメント・レビューコメント・PR解説では絵文字（🚀✨🎯🧠👀⏭️ 等）を一切使用しないこと。
 - 優先度・種別を示す場合はテキスト表記（`[SCOPE]`, `[TARGET]`, `[MUST]`, `[SKIM]`, `[SKIP]`）を用いること。
 EOF
 
@@ -104,7 +104,7 @@ cat << 'EOF' > docs/architecture.md
 
 Run `python3 -m unittest discover -s tests` before opening a pull request.
 For CI workflow changes, verify YAML syntax with Python or `actionlint` when available.
-Do not use emojis in PR bodies; follow the `[SCOPE]` / `[MUST]` / `[SKIM]` / `[SKIP]` markers in `CLAUDE.md`.
+Do not use emojis in technical docs or PR briefings; follow the `[SCOPE]` / `[MUST]` / `[SKIM]` / `[SKIP]` markers in `CLAUDE.md`.
 EOF
 
 git add .
@@ -113,4 +113,4 @@ git commit -q -m "docs(ci): document outbox flow and add CI concurrency cancel p
 echo "REPO_DIR=$TARGET_DIR"
 echo "BRANCH=$(git branch --show-current)"
 echo "BASE=main"
-echo "NOTE=CLAUDE.md prohibits emojis in PR descriptions"
+echo "NOTE=CLAUDE.md prohibits emojis; use text-only markers"

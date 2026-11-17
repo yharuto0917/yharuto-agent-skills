@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pr_diff_triage.py - Gate 2 支援用の純ローカル Git 差分トリアージ CLI。
+pr_diff_triage.py - PR 差分トリアージ CLI（ローカル Git / GitHub PR / unified diff パッチ対応）。
 
-ベースブランチとの差分を解析し、Must-Read / Skim / Safe-to-Skip の初期分類、
-自動生成ファイルの手動改変疑い・非依存マニフェスト改変・テストスキップ等の警告、
+ローカル Git 差分、`--pr <number|url>`（読み取り専用 `gh pr view` / `gh pr diff`）、
+または `--patch-file <path|->` の unified diff を解析し、
+Must-Read / Skim / Safe-to-Skip の初期分類、自動生成ファイルの手動改変疑い・
+非依存マニフェスト改変・テストスキップ・ボイラープレート過多 (`boilerplate_heavy`) の検出、
 依存パッケージ変更抽出、仮サイズ (S/M/L/XL) と推定レビュー時間を JSON/Text で出力する。
 Python 3.9+ 標準ライブラリのみで動作する。
 """
@@ -25,14 +27,14 @@ import posixpath
 import re
 import subprocess
 import traceback
-from typing import Any, Dict, Iterable, List, NoReturn, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, Set, Tuple
 
 try:
     import tomllib  # Python 3.11+
 except ModuleNotFoundError:
     tomllib = None  # type: ignore[assignment]
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 SCHEMA_VERSION = 1
 
 BASE_CANDIDATES: Tuple[str, ...] = (
@@ -180,9 +182,52 @@ CODE_EXTENSIONS_FOR_IMPORT_ONLY: Set[str] = {
     ".rs",
 }
 
+HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+
+BOILERPLATE_COMMENT_RE = re.compile(r"^(?://|#(?!\[|!)|/\*|\*(?:/|\s|$)|--\s)")
+DEFENSIVE_GUARD_RE = re.compile(
+    r"(?:"
+    r"\bis\s+(?:not\s+)?None\b"
+    r"|(?:===?|!==?)\s*(?:null|undefined)\b"
+    r"|\b(?:isinstance|typeof)\s*\("
+    r"|\btypeof\s+[A-Za-z_$][A-Za-z0-9_$.]*\s*[!=]==?"
+    r"|^\s*if\s*\(\s*!?\s*[A-Za-z_$][A-Za-z0-9_$.]*\s*(?:\)\s*\{?|:\s*$)"
+    r"|^\s*if\s+(?:not\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*:\s*$"
+    r"|^\s*if\s+(?:len|Array\.isArray)\([^)]+\)\s*(?:===\s*0|==\s*0|>\s*0)"
+    r"|^\s*(?:try|finally)\s*[:{]"
+    r"|^\s*(?:except\b.*:|catch\b.*\{)"
+    r")"
+)
+EXCEPT_HEADER_RE = re.compile(r"^\s*except\b([^:]*):\s*(.*)$")
+CATCH_HEADER_RE = re.compile(r"^\s*\}\s*catch\b|\bcatch\s*(?:\(([^)]*)\))?\s*\{(.*)$")
+
+NON_DEP_PACKAGE_JSON_KEYS: Set[str] = {
+    "name",
+    "version",
+    "description",
+    "license",
+    "type",
+    "main",
+    "module",
+    "types",
+    "typings",
+    "packageManager",
+    "private",
+    "homepage",
+    "author",
+    "sideEffects",
+}
+
+VERSION_SPEC_RE = re.compile(
+    r"^(?:\^|~|>=|<=|>|<|=|\*|workspace:|npm:|file:|git\+|https?://|v?\d+\.\d+|\d+\.x|latest$)",
+    re.IGNORECASE,
+)
+
+BOILERPLATE_GUIDANCE_TEXT = "ボイラープレート箇所は流し読み対象として注記案内すること"
+
 
 class GitError(Exception):
-    """Git コマンドまたはリポジトリ状態のエラー（終了コード 2）。"""
+    """Git コマンド、gh CLI、パッチ入力、または引数状態のエラー（終了コード 2）。"""
 
 
 def _use_utf8(stream: object, **options: str) -> None:
@@ -240,18 +285,24 @@ class _ArgumentParser(argparse.ArgumentParser):
 def _build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(
         prog="pr_diff_triage.py",
-        description="純ローカル Git 差分を解析し、Must-Read / Skim / Safe-to-Skip と規模仮判定を出力する。",
+        description="Git 差分・GitHub PR・unified diff パッチを解析し、Must-Read / Skim / Safe-to-Skip と規模仮判定を出力する。",
         allow_abbrev=False,
     )
-    parser.add_argument("--base", help="比較ベースブランチまたはコミット参照")
-    parser.add_argument("--head", default="HEAD", help="比較対象 ref（既定: HEAD）")
+    parser.add_argument("--base", default=None, help="比較ベースブランチまたはコミット参照")
+    parser.add_argument("--head", default=None, help="比較対象 ref（既定: HEAD）")
     parser.add_argument(
         "--mode",
         choices=("committed", "working", "all"),
-        default="committed",
-        help="解析対象モード（committed / working / all）",
+        default=None,
+        help="解析対象モード（committed / working / all、既定: committed）",
     )
-    parser.add_argument("--repo", default=".", help="対象 Git リポジトリパス（既定: .）")
+    parser.add_argument("--repo", default=None, help="対象 Git リポジトリパス（既定: .）")
+    parser.add_argument("--pr", default=None, help="読み取り専用で解析する GitHub PR 番号または URL")
+    parser.add_argument(
+        "--patch-file",
+        default=None,
+        help="unified diff ファイルパス（'-' で標準入力、Git リポジトリ外でも実行可）",
+    )
     parser.add_argument(
         "--format",
         choices=("json", "text"),
@@ -304,6 +355,24 @@ def _resolve_repo_root(repo_path: str) -> str:
     return proc.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
 
 
+def _try_resolve_repo_root(repo_path: Optional[str]) -> Optional[str]:
+    if repo_path is None:
+        return None
+    if not os.path.isdir(repo_path):
+        raise GitError(f"指定された --repo パスが存在しないかディレクトリではありません: {repo_path}")
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_path, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return os.path.abspath(repo_path)
+    if proc.returncode == 0:
+        return proc.stdout.decode("utf-8", errors="surrogateescape").rstrip("\r\n")
+    return os.path.abspath(repo_path)
+
+
 def _verify_commit(repo_root: str, ref: str) -> Optional[str]:
     proc = _run_git_bytes(repo_root, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], check=False)
     if proc.returncode != 0:
@@ -332,7 +401,6 @@ def _resolve_base_ref(
             raise GitError(f"指定された --base ref が見つかりません: {explicit_base}")
         return explicit_base, base_sha
 
-    # 1. refs/remotes/origin/HEAD
     sym = _run_git_bytes(
         repo_root, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], check=False
     )
@@ -344,7 +412,6 @@ def _resolve_base_ref(
             if cand_sha is not None:
                 return cand, cand_sha
 
-    # 2. 候補列から現在ブランチ同名ローカルを除外し、merge-base..head のコミット数最小を選択
     current = _current_branch(repo_root)
     best: Optional[Tuple[int, int, str, str]] = None
     for idx, cand in enumerate(BASE_CANDIDATES):
@@ -372,7 +439,6 @@ def _resolve_base_ref(
     if best is not None:
         return best[2], best[3]
 
-    # デフォルトブランチ上等で他に候補がない場合の working/all フォールバック
     if mode in ("working", "all"):
         return "HEAD", head_sha
 
@@ -731,7 +797,8 @@ def _get_file_patch(
         text = _read_working_text(repo_root, path, max_patch_bytes)
         if text is None:
             return None
-        return "\n".join("+" + line for line in text.splitlines())
+        lines = text.splitlines()
+        return f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + line for line in lines)
 
     args = ["diff", "--no-ext-diff", "-M"]
     if mode == "committed":
@@ -750,23 +817,47 @@ def _get_file_patch(
 
 
 def _iter_patch_changes(patch: str) -> Tuple[List[str], List[str]]:
-    """パッチ本文から (追加行リスト, 削除行リスト) をヘッダ除外で返す。"""
+    """パッチ本文から (追加行リスト, 削除行リスト) をハンク行数ベースで正確に返す。"""
     added_lines: List[str] = []
     deleted_lines: List[str] = []
     in_hunk = False
+    old_rem = 0
+    new_rem = 0
+    has_counts = False
+
     for line in patch.splitlines():
-        if line.startswith("@@ "):
+        hm = HUNK_HEADER_RE.match(line)
+        if hm and (not in_hunk or (has_counts and old_rem <= 0 and new_rem <= 0)):
             in_hunk = True
+            old_rem = int(hm.group(2)) if hm.group(2) is not None else 1
+            new_rem = int(hm.group(4)) if hm.group(4) is not None else 1
+            has_counts = True
             continue
-        if line.startswith("diff --git "):
+        if line.startswith("diff --git ") and (not in_hunk or (has_counts and old_rem <= 0 and new_rem <= 0)):
             in_hunk = False
             continue
         if not in_hunk:
             continue
-        if line.startswith("+") and not line.startswith("+++ "):
+        if has_counts and old_rem <= 0 and new_rem <= 0:
+            in_hunk = False
+            continue
+        if line.startswith("\\"):
+            continue
+        if line.startswith("+"):
+            if not has_counts and line.startswith("+++ "):
+                continue
             added_lines.append(line[1:])
-        elif line.startswith("-") and not line.startswith("--- "):
+            new_rem -= 1
+        elif line.startswith("-"):
+            if not has_counts and line.startswith("--- "):
+                continue
             deleted_lines.append(line[1:])
+            old_rem -= 1
+        elif line.startswith(" ") or line == "":
+            old_rem -= 1
+            new_rem -= 1
+        else:
+            in_hunk = False
     return added_lines, deleted_lines
 
 
@@ -794,6 +885,8 @@ def _check_manual_gen_edit(
     status: str,
     before_text: Optional[str],
     after_text: Optional[str],
+    had_header_override: Optional[bool] = None,
+    has_header_override: Optional[bool] = None,
     patch: Optional[str],
     any_schema_changed: bool,
 ) -> Optional[str]:
@@ -801,8 +894,8 @@ def _check_manual_gen_edit(
     if status == "D":
         return None
     is_gen_path = _is_codegen_path(path)
-    had_header = _has_gen_header(before_text)
-    has_header = _has_gen_header(after_text)
+    had_header = _has_gen_header(before_text) if had_header_override is None else had_header_override
+    has_header = _has_gen_header(after_text) if has_header_override is None else has_header_override
 
     exempt_from_gen_scan = (
         _is_lockfile(path)
@@ -813,8 +906,6 @@ def _check_manual_gen_edit(
         or _is_orm_generated_metadata(path)
     )
     if exempt_from_gen_scan and not is_gen_path:
-        # 例外: もし ORM メタデータや他のファイルで生成ヘッダ削除や明示的手動マーカーがあれば別途考慮するが
-        # Cargo.lock / yarn.lock / poetry.lock などの生成ヘッダを codegen と誤認しないように除外する。
         return None
 
     if not (is_gen_path or had_header or has_header):
@@ -835,6 +926,127 @@ def _check_manual_gen_edit(
     if not reasons:
         return None
     return " / ".join(reasons)
+
+
+def _detect_boilerplate_heavy(
+    *,
+    path: str,
+    status: str,
+    reason: str,
+    is_binary: bool,
+    flags: Sequence[str],
+    added_lines: Sequence[str],
+) -> bool:
+    """AI 由来の冗長な防衛チェック・空 catch/except・過剰コメントの比率が高いか判定する。"""
+    if is_binary or status == "D":
+        return False
+    if "whitespace_or_format_only" in flags:
+        return False
+    if reason in (
+        "lockfile",
+        "snapshot",
+        "orm_generated_metadata",
+        "dependency_manifest",
+        "build_artifact",
+        "codegen",
+        "documentation",
+        "linter_or_ide_config",
+        "stylesheet",
+        "import_path_only",
+        "pure_rename",
+        "deleted_non_risk",
+        "binary_asset",
+    ):
+        return False
+    if _is_docs_file(path):
+        return False
+
+    non_empty = [ln.strip() for ln in added_lines if ln.strip()]
+    total = len(non_empty)
+    if total < 6:
+        return False
+
+    comment_count = 0
+    defensive_count = 0
+    empty_catch_count = 0
+    empty_catch_lines = 0
+    rethrow_catch_count = 0
+    rethrow_lines = 0
+
+    in_c_block_comment = False
+    for idx, s in enumerate(non_empty):
+        if in_c_block_comment:
+            comment_count += 1
+            if "*/" in s:
+                in_c_block_comment = False
+            continue
+        if s.startswith("/*"):
+            comment_count += 1
+            if "*/" not in s[2:]:
+                in_c_block_comment = True
+            continue
+        if BOILERPLATE_COMMENT_RE.match(s):
+            comment_count += 1
+            continue
+
+        if DEFENSIVE_GUARD_RE.search(s):
+            defensive_count += 1
+
+        # Python except の空握りつぶし / 単純再送出
+        em = EXCEPT_HEADER_RE.match(s)
+        if em:
+            rest = em.group(2).strip()
+            if rest in ("pass", "...", "return", "return None") or rest.startswith(("pass #", "... #")):
+                empty_catch_count += 1
+                empty_catch_lines += 1
+            elif idx + 1 < total:
+                nxt = non_empty[idx + 1]
+                if re.match(r"^(?:pass|\.\.\.|return(?:\s+None)?)\s*(?:#.*)?$", nxt):
+                    empty_catch_count += 1
+                    empty_catch_lines += 2
+                elif re.match(r"^raise(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*(?:#.*)?$", nxt) and (
+                    idx + 2 >= total or not non_empty[idx + 2].startswith(("raise", "return"))
+                ):
+                    if " as " in em.group(1) and nxt.strip() != "raise":
+                        alias = em.group(1).split(" as ", 1)[1].strip()
+                        if nxt.strip() == f"raise {alias}":
+                            rethrow_catch_count += 1
+                            rethrow_lines += 2
+
+        # JS/TS/Java/C# catch の空握りつぶし / 単純再送出
+        cm = CATCH_HEADER_RE.search(s)
+        if cm:
+            tail = (cm.group(2) or "").strip()
+            if tail == "}" or re.match(r"^(?://.*)?\}$", tail):
+                empty_catch_count += 1
+                empty_catch_lines += 1
+            elif idx + 1 < total:
+                nxt = non_empty[idx + 1]
+                if nxt == "}" or (nxt.startswith("//") and idx + 2 < total and non_empty[idx + 2] == "}"):
+                    empty_catch_count += 1
+                    empty_catch_lines += 2
+                elif re.match(r"^return(?:\s+(?:null|undefined))?;?$", nxt) and idx + 2 < total and non_empty[idx + 2] == "}":
+                    empty_catch_count += 1
+                    empty_catch_lines += 2
+                elif cm.group(1):
+                    var_name = cm.group(1).strip().split()[0].rstrip(":")
+                    if re.match(rf"^throw\s+{re.escape(var_name)}\s*;?$", nxt):
+                        rethrow_catch_count += 1
+                        rethrow_lines += 2
+
+    comment_ratio = comment_count / total
+    if comment_count >= 3 and comment_ratio > 0.40:
+        return True
+    if empty_catch_count >= 2:
+        return True
+
+    combined_lines = comment_count + defensive_count + empty_catch_lines + rethrow_lines
+    combined_ratio = combined_lines / total
+    if empty_catch_count >= 1 and combined_ratio >= 0.25:
+        return True
+    if combined_ratio >= 0.50 and (defensive_count >= 3 or rethrow_catch_count >= 1):
+        return True
+    return False
 
 
 def _strip_toml_comment(line: str) -> str:
@@ -891,7 +1103,6 @@ def _parse_toml_simple(text: str) -> Dict[str, Any]:
         key, val_raw = line.split("=", 1)
         key = key.strip().strip('"').strip("'")
         val_str = val_raw.strip()
-        # 複数行配列・インラインテーブルの結合
         while (val_str.count("[") > val_str.count("]") or val_str.count("{") > val_str.count("}")) and i < len(lines):
             val_str += " " + _strip_toml_comment(lines[i]).strip()
             i += 1
@@ -1192,6 +1403,453 @@ def _analyze_manifest(
     return dep_obj, promotion
 
 
+def _try_reconstruct_texts_from_repo(
+    repo_root: str,
+    path: str,
+    old_path: Optional[str],
+    status: str,
+    hunks: Sequence[Dict[str, Any]],
+) -> Optional[Tuple[Optional[str], Optional[str]]]:
+    """明示指定された --repo の実ファイルへ unified diff ハンクを適用して before/after 全文を復元する。"""
+    if status == "A" or status == "D":
+        return None
+    local_text = _read_working_text(repo_root, path, 2 * 1024 * 1024)
+    if local_text is None and old_path:
+        local_text = _read_working_text(repo_root, old_path, 2 * 1024 * 1024)
+    if local_text is None or not hunks:
+        return None
+
+    local_lines = local_text.splitlines()
+
+    def apply_forward() -> Optional[str]:
+        out: List[str] = []
+        cursor = 0
+        for h in hunks:
+            start_idx = max(0, h["old_start"] - 1)
+            if start_idx < cursor or start_idx > len(local_lines):
+                return None
+            out.extend(local_lines[cursor:start_idx])
+            pos = start_idx
+            for tag, text in h["lines"]:
+                if tag in (" ", "-"):
+                    if pos >= len(local_lines) or local_lines[pos] != text:
+                        return None
+                    if tag == " ":
+                        out.append(text)
+                    pos += 1
+                elif tag == "+":
+                    out.append(text)
+            cursor = pos
+        out.extend(local_lines[cursor:])
+        return "\n".join(out)
+
+    def apply_reverse() -> Optional[str]:
+        out: List[str] = []
+        cursor = 0
+        for h in hunks:
+            start_idx = max(0, h["new_start"] - 1)
+            if start_idx < cursor or start_idx > len(local_lines):
+                return None
+            out.extend(local_lines[cursor:start_idx])
+            pos = start_idx
+            for tag, text in h["lines"]:
+                if tag in (" ", "+"):
+                    if pos >= len(local_lines) or local_lines[pos] != text:
+                        return None
+                    if tag == " ":
+                        out.append(text)
+                    pos += 1
+                elif tag == "-":
+                    out.append(text)
+            cursor = pos
+        out.extend(local_lines[cursor:])
+        return "\n".join(out)
+
+    after_reconstructed = apply_forward()
+    if after_reconstructed is not None:
+        return local_text, after_reconstructed
+    before_reconstructed = apply_reverse()
+    if before_reconstructed is not None:
+        return before_reconstructed, local_text
+    return None
+
+
+def _analyze_json_manifest_from_hunks(
+    hunks: Sequence[Dict[str, Any]],
+    dep_keys: Sequence[str],
+    crit_keys: Sequence[str],
+) -> Tuple[Dict[str, str], Dict[str, str], bool, bool]:
+    dep_key_set = set(dep_keys)
+    crit_key_set = set(crit_keys)
+    before_deps: Dict[str, str] = {}
+    after_deps: Dict[str, str] = {}
+    crit_changed = False
+    other_changed = False
+
+    kv_str_re = re.compile(r'^"([^"]+)"\s*:\s*"([^"]*)"\s*,?$')
+    kv_open_re = re.compile(r'^"([^"]+)"\s*:\s*([\{\[])')
+    kv_any_re = re.compile(r'^"([^"]+)"\s*:')
+
+    def infer_initial_section(hunk: Dict[str, Any]) -> Optional[str]:
+        ctx = hunk.get("header_ctx", "")
+        m_sec = re.search(r'"([^"]+)"\s*:\s*\{', ctx)
+        if m_sec:
+            return m_sec.group(1)
+        return None
+
+    for hunk in hunks:
+        # まずコンテキスト行にバージョン指定風の依存行が含まれるかを確認（セクションヘッダ欠落時用）
+        sibling_looks_like_deps = False
+        for tag, raw in hunk["lines"]:
+            if tag == " ":
+                ms = kv_str_re.match(raw.strip())
+                if ms and ms.group(1) not in NON_DEP_PACKAGE_JSON_KEYS and VERSION_SPEC_RE.match(ms.group(2).strip()):
+                    sibling_looks_like_deps = True
+                    break
+
+        for side in ("before", "after"):
+            section = infer_initial_section(hunk)
+            section_depth = 1 if section else 0
+            target_deps = before_deps if side == "before" else after_deps
+            active_tag = "-" if side == "before" else "+"
+
+            for tag, raw in hunk["lines"]:
+                if tag not in (" ", active_tag):
+                    continue
+                s = raw.strip()
+                if not s:
+                    continue
+
+                is_changed = tag == active_tag
+                open_m = kv_open_re.match(s)
+                if open_m:
+                    kname = open_m.group(1)
+                    opener = open_m.group(2)
+                    closer = "}" if opener == "{" else "]"
+                    if opener in s and closer not in s[open_m.end() :]:
+                        if section is None:
+                            section = kname
+                            section_depth = 1
+                        else:
+                            section_depth += 1
+                    if is_changed:
+                        if kname in crit_key_set or section in crit_key_set:
+                            crit_changed = True
+                        elif kname not in dep_key_set:
+                            other_changed = True
+                    continue
+
+                if section is not None:
+                    opens = s.count("{") + s.count("[")
+                    closes = s.count("}") + s.count("]")
+                    # 単一行エントリ処理後に深さ更新
+                    kv_m = kv_str_re.match(s)
+                    if is_changed:
+                        if section in crit_key_set:
+                            crit_changed = True
+                        elif section in dep_key_set and kv_m:
+                            target_deps[kv_m.group(1)] = kv_m.group(2)
+                        elif section in dep_key_set:
+                            # dep セクション内のカンマ調整のみの行は非依存変更とみなさない
+                            if s not in ("{", "}", "},"):
+                                pass
+                        else:
+                            other_changed = True
+                    elif section in dep_key_set and kv_m:
+                        target_deps[kv_m.group(1)] = kv_m.group(2)
+
+                    section_depth += opens - closes
+                    if section_depth <= 0:
+                        section = None
+                        section_depth = 0
+                    continue
+
+                # section 不明時のヒューリスティック
+                if s in ("{", "}", "},", "[", "]", "],"):
+                    continue
+                kv_m = kv_str_re.match(s)
+                if kv_m:
+                    kname, kval = kv_m.group(1), kv_m.group(2)
+                    if kname in crit_key_set:
+                        if is_changed:
+                            crit_changed = True
+                    elif kname not in NON_DEP_PACKAGE_JSON_KEYS and (
+                        sibling_looks_like_deps or (VERSION_SPEC_RE.match(kval.strip()) and raw.startswith("    "))
+                    ):
+                        target_deps[kname] = kval
+                    elif is_changed:
+                        other_changed = True
+                elif is_changed:
+                    ak = kv_any_re.match(s)
+                    if ak and ak.group(1) in crit_key_set:
+                        crit_changed = True
+                    else:
+                        other_changed = True
+
+    return before_deps, after_deps, crit_changed, other_changed
+
+
+def _analyze_toml_manifest_from_hunks(
+    base: str,
+    hunks: Sequence[Dict[str, Any]],
+) -> Tuple[Dict[str, str], Dict[str, str], bool, bool]:
+    before_deps: Dict[str, str] = {}
+    after_deps: Dict[str, str] = {}
+    crit_changed = False
+    other_changed = False
+
+    if base == "pyproject.toml":
+        crit_sections = {
+            "build-system",
+            "project.scripts",
+            "project.gui-scripts",
+            "project.entry-points",
+            "tool.poetry.scripts",
+            "tool.poetry.plugins",
+        }
+        dep_sections = {
+            "project.optional-dependencies",
+            "dependency-groups",
+            "tool.poetry.dependencies",
+            "tool.poetry.dev-dependencies",
+        }
+    else:  # Cargo.toml
+        crit_sections = {"bin", "lib", "features"}
+        dep_sections = {"dependencies", "dev-dependencies", "build-dependencies", "workspace.dependencies"}
+
+    for hunk in hunks:
+        ctx = hunk.get("header_ctx", "")
+        init_sec = ""
+        m_ctx_sec = re.search(r"\[\[?([^\]]+)\]\]?", ctx)
+        if m_ctx_sec:
+            init_sec = m_ctx_sec.group(1).strip()
+        elif base == "pyproject.toml" and "dependencies" in ctx:
+            init_sec = "project"
+
+        # 兄弟コンテキストが PEP508 依存文字列か判定
+        sibling_pep508 = any(
+            tag == " " and re.match(r'^"[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[^\]]*\])?\s*(?:[><=!~]|")', raw.strip())
+            for tag, raw in hunk["lines"]
+        )
+
+        for side in ("before", "after"):
+            target_deps = before_deps if side == "before" else after_deps
+            active_tag = "-" if side == "before" else "+"
+            section = init_sec
+            in_dep_array = base == "pyproject.toml" and "dependencies = [" in ctx
+
+            for tag, raw in hunk["lines"]:
+                if tag not in (" ", active_tag):
+                    continue
+                s = _strip_toml_comment(raw).strip()
+                if not s:
+                    continue
+                is_changed = tag == active_tag
+
+                if s.startswith("[") and s.endswith("]"):
+                    sec_name = s.strip("[]").strip()
+                    section = sec_name
+                    in_dep_array = False
+                    if is_changed:
+                        if sec_name in crit_sections:
+                            crit_changed = True
+                        elif sec_name not in dep_sections and not (
+                            base == "pyproject.toml" and sec_name.startswith("tool.poetry.group.") and sec_name.endswith(".dependencies")
+                        ):
+                            other_changed = True
+                    continue
+
+                if base == "pyproject.toml":
+                    is_poetry_group_dep = section.startswith("tool.poetry.group.") and section.endswith(".dependencies")
+                    if in_dep_array:
+                        if s.startswith("]"):
+                            in_dep_array = False
+                            continue
+                        for item in re.findall(r'"([^"]+)"|\'([^\']+)\'', s):
+                            spec = item[0] or item[1]
+                            name, ver = _parse_pep508_item(spec)
+                            if name:
+                                target_deps[name] = ver
+                        continue
+
+                    if "=" in s:
+                        k_raw, v_raw = s.split("=", 1)
+                        k = k_raw.strip().strip('"').strip("'")
+                        v = v_raw.strip()
+                        if section in ("project", "") and k == "dependencies":
+                            if "[" in v and "]" not in v:
+                                in_dep_array = True
+                            else:
+                                for item in re.findall(r'"([^"]+)"|\'([^\']+)\'', v):
+                                    spec = item[0] or item[1]
+                                    name, ver = _parse_pep508_item(spec)
+                                    if name:
+                                        target_deps[name] = ver
+                            continue
+                        if section == "project.optional-dependencies" or section == "dependency-groups":
+                            if "[" in v and "]" not in v:
+                                in_dep_array = True
+                            for item in re.findall(r'"([^"]+)"|\'([^\']+)\'', v):
+                                spec = item[0] or item[1]
+                                name, ver = _parse_pep508_item(spec)
+                                if name:
+                                    target_deps[name] = ver
+                            continue
+                        if section in ("tool.poetry.dependencies", "tool.poetry.dev-dependencies") or is_poetry_group_dep:
+                            if k.lower() != "python":
+                                parsed_v = _parse_toml_value(v)
+                                ver = parsed_v.get("version", "") if isinstance(parsed_v, dict) else str(parsed_v)
+                                target_deps[k] = ver
+                            continue
+                        if section in crit_sections or (section == "project" and k in ("scripts", "gui-scripts", "entry-points")) or (
+                            section == "tool.poetry" and k in ("scripts", "plugins")
+                        ):
+                            if is_changed:
+                                crit_changed = True
+                            continue
+                        if is_changed:
+                            other_changed = True
+                        continue
+
+                    if (section in ("project", "project.optional-dependencies", "dependency-groups") or sibling_pep508) and (
+                        s.startswith(('"', "'"))
+                    ):
+                        for item in re.findall(r'"([^"]+)"|\'([^\']+)\'', s):
+                            spec = item[0] or item[1]
+                            name, ver = _parse_pep508_item(spec)
+                            if name:
+                                target_deps[name] = ver
+                        continue
+                    if is_changed and s not in ("[", "]"):
+                        other_changed = True
+                else:
+                    # Cargo.toml
+                    if section in dep_sections and "=" in s:
+                        k_raw, v_raw = s.split("=", 1)
+                        k = k_raw.strip().strip('"').strip("'")
+                        parsed_v = _parse_toml_value(v_raw.strip())
+                        ver = parsed_v.get("version", "") if isinstance(parsed_v, dict) else str(parsed_v)
+                        target_deps[k] = ver
+                    elif is_changed:
+                        if section in crit_sections:
+                            crit_changed = True
+                        elif "=" in s:
+                            k = s.split("=", 1)[0].strip().strip('"').strip("'")
+                            if k in crit_sections:
+                                crit_changed = True
+                            else:
+                                other_changed = True
+                        elif s not in ("[", "]"):
+                            other_changed = True
+
+    return before_deps, after_deps, crit_changed, other_changed
+
+
+def _analyze_manifest_from_patch(
+    path: str,
+    hunks: Sequence[Dict[str, Any]],
+    added_lines: Sequence[str],
+    deleted_lines: Sequence[str],
+    explicit_repo_root: Optional[str],
+    old_path: Optional[str],
+    status: str,
+) -> Tuple[Dict[str, Any], str]:
+    """unified diff からマニフェスト変更を解析する（--repo 明示時は復元を優先試行）。"""
+    if explicit_repo_root is not None:
+        reconstructed = _try_reconstruct_texts_from_repo(explicit_repo_root, path, old_path, status, hunks)
+        if reconstructed is not None:
+            return _analyze_manifest(path, reconstructed[0], reconstructed[1])
+
+    base = posixpath.basename(path)
+    before_deps: Dict[str, str] = {}
+    after_deps: Dict[str, str] = {}
+    crit_changed = False
+    other_changed = False
+
+    if base == "package.json":
+        before_deps, after_deps, crit_changed, other_changed = _analyze_json_manifest_from_hunks(
+            hunks,
+            (
+                "dependencies",
+                "devDependencies",
+                "peerDependencies",
+                "optionalDependencies",
+                "bundledDependencies",
+                "bundleDependencies",
+                "overrides",
+                "resolutions",
+            ),
+            ("scripts", "exports", "bin", "imports", "workspaces"),
+        )
+    elif base == "composer.json":
+        before_deps, after_deps, crit_changed, other_changed = _analyze_json_manifest_from_hunks(
+            hunks,
+            ("require", "require-dev"),
+            ("scripts", "bin", "autoload", "autoload-dev"),
+        )
+    elif base in ("pyproject.toml", "Cargo.toml"):
+        before_deps, after_deps, crit_changed, other_changed = _analyze_toml_manifest_from_hunks(base, hunks)
+    elif base.startswith("requirements") and base.endswith(".txt"):
+        before_deps = _extract_requirements_deps("\n".join(deleted_lines))
+        after_deps = _extract_requirements_deps("\n".join(added_lines))
+    elif base == "go.mod":
+        for hunk in hunks:
+            ctx = hunk.get("header_ctx", "")
+            for side in ("before", "after"):
+                tdeps = before_deps if side == "before" else after_deps
+                active_tag = "-" if side == "before" else "+"
+                in_req = "require (" in ctx
+                for tag, raw in hunk["lines"]:
+                    if tag not in (" ", active_tag):
+                        continue
+                    s = raw.split("//", 1)[0].strip()
+                    if not s:
+                        continue
+                    if s.startswith("require ("):
+                        in_req = True
+                        continue
+                    if in_req and s == ")":
+                        in_req = False
+                        continue
+                    if s.startswith("require "):
+                        parts = s[len("require ") :].split()
+                        if len(parts) >= 2:
+                            tdeps[parts[0]] = parts[1]
+                        continue
+                    if in_req:
+                        parts = s.split()
+                        if len(parts) >= 2:
+                            tdeps[parts[0]] = parts[1]
+                        continue
+                    # ハンク文脈に require ( が映らない場合でも module/version 形式を認識
+                    m_mod = re.match(r"^([A-Za-z0-9._~/-]+\.[A-Za-z0-9._~/-]+)\s+(v\d+\.\d+\.\d+\S*)", s)
+                    if m_mod and not s.startswith(("module ", "replace ", "exclude ", "retract ")):
+                        tdeps[m_mod.group(1)] = m_mod.group(2)
+                    elif tag == active_tag:
+                        other_changed = True
+    else:
+        for hunk in hunks:
+            b_chunk = "\n".join(raw for tag, raw in hunk["lines"] if tag in (" ", "-"))
+            a_chunk = "\n".join(raw for tag, raw in hunk["lines"] if tag in (" ", "+"))
+            before_deps.update(_extract_generic_manifest_deps(base, b_chunk))
+            after_deps.update(_extract_generic_manifest_deps(base, a_chunk))
+        if not hunks:
+            before_deps = _extract_generic_manifest_deps(base, "\n".join(deleted_lines))
+            after_deps = _extract_generic_manifest_deps(base, "\n".join(added_lines))
+
+    added, updated, removed = _diff_dep_maps(before_deps, after_deps)
+    non_dep_changed = crit_changed or other_changed
+    promotion = "must_read" if crit_changed else ("skim" if other_changed else "none")
+    dep_obj = {
+        "manifest": path,
+        "added": added,
+        "updated": updated,
+        "removed": removed,
+        "non_dependency_changes": non_dep_changed,
+    }
+    return dep_obj, promotion
+
+
 def _detect_test_skip_or_assertion_removal(patch: Optional[str]) -> bool:
     if not patch:
         return False
@@ -1280,92 +1938,394 @@ def _determine_provisional_size(
     return "L", reasons
 
 
-def analyze_repo(
-    *,
-    repo_path: str,
-    base: Optional[str],
-    head: str,
-    mode: str,
-    max_patch_bytes: int,
-) -> Dict[str, Any]:
-    """リポジトリ差分を解析し、トリアージ結果辞書を返す。"""
-    repo_root = _resolve_repo_root(repo_path)
-    head_sha = _verify_commit(repo_root, head)
-    if head_sha is None:
-        raise GitError(f"指定された --head ref が見つかりません（またはコミット未作成）: {head}")
+def _unquote_git_path(token: str) -> str:
+    """Git の C エスケープ付きパス表記 ("...") を復元する。"""
+    t = token.strip()
+    if not (len(t) >= 2 and t.startswith('"') and t.endswith('"')):
+        return t
+    inner = t[1:-1]
+    buf = bytearray()
+    i = 0
+    escapes = {
+        "a": ord("\a"),
+        "b": ord("\b"),
+        "f": ord("\f"),
+        "n": ord("\n"),
+        "r": ord("\r"),
+        "t": ord("\t"),
+        "v": ord("\v"),
+        "\\": ord("\\"),
+        '"': ord('"'),
+    }
+    while i < len(inner):
+        ch = inner[i]
+        if ch == "\\" and i + 1 < len(inner):
+            nxt = inner[i + 1]
+            if nxt in escapes:
+                buf.append(escapes[nxt])
+                i += 2
+                continue
+            if i + 3 < len(inner) and all(c in "01234567" for c in inner[i + 1 : i + 4]):
+                buf.append(int(inner[i + 1 : i + 4], 8))
+                i += 4
+                continue
+        buf.extend(ch.encode("utf-8", errors="surrogateescape"))
+        i += 1
+    return bytes(buf).decode("utf-8", errors="surrogateescape")
 
-    base_ref, base_sha = _resolve_base_ref(repo_root, base, head_sha, mode)
-    assert base_sha is not None
 
-    warnings: List[Dict[str, str]] = []
-    if mode == "working":
-        merge_base_sha = head_sha
-        diff_target_args = [head_sha]
-    else:
-        mb_proc = _run_git_bytes(repo_root, ["merge-base", base_sha, head_sha], check=False)
-        if mb_proc.returncode == 0:
-            merge_base_sha = mb_proc.stdout.decode("utf-8", errors="replace").strip()
+def _strip_ab_prefix(path: str, prefix: str) -> str:
+    if path.startswith(prefix):
+        return path[len(prefix) :]
+    return path
+
+
+def _parse_diff_git_paths(line: str) -> Tuple[Optional[str], Optional[str]]:
+    rest = line[len("diff --git ") :]
+    if rest.startswith('"'):
+        tokens: List[str] = []
+        i = 0
+        while i < len(rest) and len(tokens) < 2:
+            while i < len(rest) and rest[i] == " ":
+                i += 1
+            if i >= len(rest):
+                break
+            if rest[i] == '"':
+                j = i + 1
+                while j < len(rest):
+                    if rest[j] == "\\" and j + 1 < len(rest):
+                        j += 2
+                        continue
+                    if rest[j] == '"':
+                        break
+                    j += 1
+                tokens.append(_unquote_git_path(rest[i : j + 1]))
+                i = j + 1
+            else:
+                j = rest.find(" ", i)
+                if j == -1:
+                    tokens.append(rest[i:])
+                    i = len(rest)
+                else:
+                    tokens.append(rest[i:j])
+                    i = j + 1
+        if len(tokens) == 2:
+            return _strip_ab_prefix(tokens[0], "a/"), _strip_ab_prefix(tokens[1], "b/")
+        return None, None
+
+    if rest.startswith("a/"):
+        splits: List[int] = []
+        pos = 2
+        while True:
+            idx = rest.find(" b/", pos)
+            if idx == -1:
+                break
+            splits.append(idx)
+            pos = idx + 1
+        if len(splits) == 1:
+            idx = splits[0]
+            return rest[2:idx], rest[idx + 3 :]
+        for idx in splits:
+            if rest[2:idx] == rest[idx + 3 :]:
+                return rest[2:idx], rest[idx + 3 :]
+        if splits:
+            idx = splits[0]
+            return rest[2:idx], rest[idx + 3 :]
+    parts = rest.split()
+    if len(parts) >= 2:
+        return _strip_ab_prefix(parts[0], "a/"), _strip_ab_prefix(parts[1], "b/")
+    return None, None
+
+
+def _parse_header_path(raw: str, prefix: str) -> Optional[str]:
+    cleaned = raw.strip()
+    if cleaned == "/dev/null":
+        return None
+    # unified diff によっては末尾に \ttimestamp が付くことがある
+    if "\t" in cleaned and not cleaned.startswith('"'):
+        cleaned = cleaned.split("\t", 1)[0].rstrip()
+    unquoted = _unquote_git_path(cleaned)
+    return _strip_ab_prefix(unquoted, prefix)
+
+
+def _parse_unified_diff(diff_text: str) -> List[Dict[str, Any]]:
+    """unified diff 文字列を解析し、ファイル別差分情報リストを返す。"""
+    normalized = diff_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+
+    entries: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+    in_hunk = False
+    old_rem = 0
+    new_rem = 0
+    old_cur = 1
+    new_cur = 1
+    current_hunk: Optional[Dict[str, Any]] = None
+
+    def flush_current() -> None:
+        nonlocal cur, current_hunk, in_hunk
+        if cur is None:
+            return
+        if current_hunk is not None:
+            cur["hunks"].append(current_hunk)
+            current_hunk = None
+        in_hunk = False
+        # 最終パス・ステータス確定
+        status = cur["status"]
+        old_p = cur["old_path"]
+        new_p = cur["new_path"]
+        if status is None:
+            if cur["minus_path"] is None and cur["plus_path"] is not None:
+                status = "A"
+            elif cur["plus_path"] is None and cur["minus_path"] is not None:
+                status = "D"
+            else:
+                status = "M"
+        if status == "A":
+            final_path = new_p or cur["plus_path"] or cur["minus_path"] or ""
+            eff_old = None
+        elif status == "D":
+            final_path = old_p or cur["minus_path"] or cur["plus_path"] or ""
+            eff_old = None
+        elif status in ("R", "C"):
+            final_path = new_p or cur["plus_path"] or ""
+            eff_old = old_p or cur["minus_path"]
         else:
-            merge_base_sha = base_sha
-            warnings.append({
-                "code": "SHALLOW_OR_UNRELATED_HISTORY",
-                "severity": "warn",
-                "path": "",
-                "message": "git merge-base を解決できないため 2点ドット差分で代替しました（shallow clone の可能性があります）。",
-            })
-        if mode == "committed":
-            diff_target_args = [merge_base_sha, head_sha]
-        else:  # all
-            diff_target_args = [merge_base_sha]
+            final_path = new_p or cur["plus_path"] or old_p or cur["minus_path"] or ""
+            eff_old = old_p if (old_p and old_p != final_path) else None
 
-    numstat_raw = _run_git_bytes(repo_root, ["diff", "--numstat", "-M", "-z", *diff_target_args]).stdout
-    status_raw = _run_git_bytes(repo_root, ["diff", "--name-status", "-M", "-z", *diff_target_args]).stdout
-    w_numstat_raw = _run_git_bytes(repo_root, ["diff", "-w", "--numstat", "-M", "-z", *diff_target_args]).stdout
+        if not final_path:
+            cur = None
+            return
 
-    numstat_map = _parse_numstat_z(numstat_raw)
-    w_numstat_map = _parse_numstat_z(w_numstat_raw)
-    status_entries = _parse_name_status_z(status_raw)
+        patch_lines: List[str] = []
+        for h in cur["hunks"]:
+            patch_lines.append(h["header_line"])
+            for tag, txt in h["lines"]:
+                patch_lines.append(tag + txt)
 
-    raw_items: List[Dict[str, Any]] = []
-    seen_paths: Set[str] = set()
-    for status, path, old_path in status_entries:
-        seen_paths.add(path)
-        added, deleted, is_binary, ns_old = numstat_map.get(path, (0, 0, False, old_path))
-        eff_old = old_path or ns_old
-        w_added, w_deleted, _, _ = w_numstat_map.get(path, (0, 0, is_binary, eff_old))
+        is_binary = cur["is_binary"]
+        added = 0 if is_binary else cur["added"]
+        deleted = 0 if is_binary else cur["deleted"]
         flags: List[str] = []
-        if not is_binary and (added > 0 or deleted > 0) and w_added == 0 and w_deleted == 0:
-            flags.append("whitespace_or_format_only")
-        raw_items.append({
-            "path": path,
+        if not is_binary and (added > 0 or deleted > 0):
+            del_ws = "".join(re.sub(r"\s+", "", ln) for ln in cur["deleted_lines"])
+            add_ws = "".join(re.sub(r"\s+", "", ln) for ln in cur["added_lines"])
+            if del_ws == add_ws:
+                flags.append("whitespace_or_format_only")
+
+        entries.append({
+            "path": final_path,
             "old_path": eff_old,
             "status": status,
             "added": added,
             "deleted": deleted,
             "is_binary": is_binary,
             "flags": flags,
+            "hunks": cur["hunks"],
+            "added_lines": cur["added_lines"],
+            "deleted_lines": cur["deleted_lines"],
+            "before_top_lines": cur["before_top_lines"],
+            "after_top_lines": cur["after_top_lines"],
+            "saw_before_top": cur["saw_before_top"],
+            "saw_after_top": cur["saw_after_top"],
+            "patch": "\n".join(patch_lines) if patch_lines else "",
         })
+        cur = None
 
-    if mode in ("working", "all"):
-        untracked_raw = _run_git_bytes(repo_root, ["ls-files", "--others", "--exclude-standard", "-z"]).stdout
-        for raw_p in untracked_raw.split(b"\x00"):
-            if not raw_p:
-                continue
-            path = _decode_path(raw_p)
-            if path in seen_paths:
-                continue
-            seen_paths.add(path)
-            lines, is_binary = _count_untracked_file(os.path.join(repo_root, path))
-            raw_items.append({
-                "path": path,
-                "old_path": None,
-                "status": "?",
-                "added": lines,
-                "deleted": 0,
-                "is_binary": is_binary,
-                "flags": ["untracked"],
-            })
+    def new_entry(old_p: Optional[str] = None, new_p: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "old_path": old_p,
+            "new_path": new_p,
+            "minus_path": old_p,
+            "plus_path": new_p,
+            "status": None,
+            "added": 0,
+            "deleted": 0,
+            "is_binary": False,
+            "hunks": [],
+            "added_lines": [],
+            "deleted_lines": [],
+            "before_top_lines": [],
+            "after_top_lines": [],
+            "saw_before_top": False,
+            "saw_after_top": False,
+        }
 
+    idx = 0
+    n = len(lines)
+    while idx < n:
+        line = lines[idx]
+
+        # ハンク内処理（old_rem / new_rem に基づきファイル内容とヘッダを厳密に区別）
+        if in_hunk and cur is not None:
+            if old_rem <= 0 and new_rem <= 0:
+                if current_hunk is not None:
+                    cur["hunks"].append(current_hunk)
+                    current_hunk = None
+                in_hunk = False
+                # 同じ行をヘッダ判定へ回す
+            else:
+                if line.startswith("\\"):
+                    idx += 1
+                    continue
+                if line.startswith("+") and new_rem > 0:
+                    text = line[1:]
+                    cur["added"] += 1
+                    cur["added_lines"].append(text)
+                    if new_cur <= 30:
+                        cur["saw_after_top"] = True
+                        cur["after_top_lines"].append(text)
+                    assert current_hunk is not None
+                    current_hunk["lines"].append(("+", text))
+                    new_cur += 1
+                    new_rem -= 1
+                    idx += 1
+                    continue
+                if line.startswith("-") and old_rem > 0:
+                    text = line[1:]
+                    cur["deleted"] += 1
+                    cur["deleted_lines"].append(text)
+                    if old_cur <= 30:
+                        cur["saw_before_top"] = True
+                        cur["before_top_lines"].append(text)
+                    assert current_hunk is not None
+                    current_hunk["lines"].append(("-", text))
+                    old_cur += 1
+                    old_rem -= 1
+                    idx += 1
+                    continue
+                if (line.startswith(" ") or line == "") and (old_rem > 0 or new_rem > 0):
+                    text = line[1:] if line.startswith(" ") else ""
+                    if old_cur <= 30:
+                        cur["saw_before_top"] = True
+                        cur["before_top_lines"].append(text)
+                    if new_cur <= 30:
+                        cur["saw_after_top"] = True
+                        cur["after_top_lines"].append(text)
+                    assert current_hunk is not None
+                    current_hunk["lines"].append((" ", text))
+                    old_cur += 1
+                    new_cur += 1
+                    old_rem -= 1
+                    new_rem -= 1
+                    idx += 1
+                    continue
+                # 想定外の行（例: 手書きパッチで行数ズレ）が出たらハンク終了してヘッダ処理へ
+                if current_hunk is not None:
+                    cur["hunks"].append(current_hunk)
+                    current_hunk = None
+                in_hunk = False
+
+        if line.startswith("diff --git "):
+            flush_current()
+            op, np = _parse_diff_git_paths(line)
+            cur = new_entry(op, np)
+            idx += 1
+            continue
+
+        # diff --git なしの標準 unified diff (--- a/... / +++ b/...) 対応
+        if cur is None and line.startswith("--- ") and idx + 1 < n and lines[idx + 1].startswith("+++ "):
+            mp = _parse_header_path(line[4:], "a/")
+            pp = _parse_header_path(lines[idx + 1][4:], "b/")
+            cur = new_entry(mp, pp)
+            cur["minus_path"] = mp
+            cur["plus_path"] = pp
+            idx += 2
+            continue
+
+        if cur is None:
+            idx += 1
+            continue
+
+        hm = HUNK_HEADER_RE.match(line)
+        if hm:
+            if current_hunk is not None:
+                cur["hunks"].append(current_hunk)
+            old_start = int(hm.group(1))
+            old_count = int(hm.group(2)) if hm.group(2) is not None else 1
+            new_start = int(hm.group(3))
+            new_count = int(hm.group(4)) if hm.group(4) is not None else 1
+            old_cur = old_start
+            new_cur = new_start
+            old_rem = old_count
+            new_rem = new_count
+            current_hunk = {
+                "old_start": old_start,
+                "old_count": old_count,
+                "new_start": new_start,
+                "new_count": new_count,
+                "header_ctx": hm.group(5).strip(),
+                "header_line": line,
+                "lines": [],
+            }
+            in_hunk = True
+            idx += 1
+            continue
+
+        if line.startswith("new file mode "):
+            cur["status"] = "A"
+        elif line.startswith("deleted file mode "):
+            cur["status"] = "D"
+        elif line.startswith("rename from "):
+            cur["status"] = "R"
+            cur["old_path"] = _unquote_git_path(line[len("rename from ") :].strip())
+        elif line.startswith("rename to "):
+            cur["status"] = "R"
+            cur["new_path"] = _unquote_git_path(line[len("rename to ") :].strip())
+        elif line.startswith("copy from "):
+            cur["status"] = "C"
+            cur["old_path"] = _unquote_git_path(line[len("copy from ") :].strip())
+        elif line.startswith("copy to "):
+            cur["status"] = "C"
+            cur["new_path"] = _unquote_git_path(line[len("copy to ") :].strip())
+        elif line.startswith("GIT binary patch"):
+            cur["is_binary"] = True
+        elif line.startswith("Binary files ") and line.endswith(" differ"):
+            cur["is_binary"] = True
+            bm = re.match(r"^Binary files (.+) and (.+) differ$", line)
+            if bm:
+                left = _parse_header_path(bm.group(1), "a/")
+                right = _parse_header_path(bm.group(2), "b/")
+                cur["minus_path"] = left
+                cur["plus_path"] = right
+                if left is None and right is not None:
+                    cur["status"] = "A"
+                    cur["new_path"] = right
+                elif right is None and left is not None:
+                    cur["status"] = "D"
+                    cur["old_path"] = left
+        elif line.startswith("--- "):
+            mp = _parse_header_path(line[4:], "a/")
+            cur["minus_path"] = mp
+            if mp is not None and cur["old_path"] is None:
+                cur["old_path"] = mp
+        elif line.startswith("+++ "):
+            pp = _parse_header_path(line[4:], "b/")
+            cur["plus_path"] = pp
+            if pp is not None and cur["new_path"] is None:
+                cur["new_path"] = pp
+
+        idx += 1
+
+    flush_current()
+    return entries
+
+
+def _triage_items(
+    *,
+    raw_items: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+    initial_warnings: List[Dict[str, str]],
+    get_patch: Any,
+    get_added_lines: Any,
+    analyze_manifest_item: Any,
+    check_gen_headers: Any,
+) -> Dict[str, Any]:
+    """Git モードと unified diff モード共通の 3 階層仕分け・警告・規模集計エンジン。"""
+    warnings: List[Dict[str, str]] = list(initial_warnings)
     changed_basenames = {posixpath.basename(it["path"]) for it in raw_items}
     any_schema_changed = any(_is_schema_source(it["path"]) for it in raw_items)
 
@@ -1395,9 +2355,7 @@ def analyze_repo(
             if not patch_loaded:
                 patch_loaded = True
                 if not is_binary:
-                    patch_cache = _get_file_patch(
-                        repo_root, mode, merge_base_sha, head_sha, path, old_path, status, max_patch_bytes
-                    )
+                    patch_cache = get_patch(item)
             return patch_cache
 
         if _is_lockfile(path):
@@ -1420,9 +2378,7 @@ def analyze_repo(
         elif _is_dependency_manifest(path):
             category = "safe_to_skip"
             reason = "dependency_manifest"
-            before_t = _read_before_text(repo_root, merge_base_sha, path, old_path, status, max_patch_bytes)
-            after_t = _read_after_text(repo_root, mode, head_sha, path, status, max_patch_bytes)
-            dep_obj, promo = _analyze_manifest(path, before_t, after_t)
+            dep_obj, promo = analyze_manifest_item(item)
             dependencies.append(dep_obj)
             if promo == "must_read":
                 category = "must_read"
@@ -1492,7 +2448,6 @@ def analyze_repo(
             category = "must_read"
             reason = "production_code"
 
-        # import パス置換のみ判定 (リスクパス以外、または生成物でない通常修正コード)
         if (
             category in ("must_read", "skim")
             and status == "M"
@@ -1505,16 +2460,29 @@ def analyze_repo(
                 reason = "import_path_only"
                 flags.append("import_path_only")
 
-        # 自動生成ファイル手動改変チェック（対象となりうるコード・生成パスを検査）
-        if reason not in ("lockfile", "snapshot", "orm_generated_metadata", "dependency_manifest", "documentation", "test_file", "test_skip_or_assertion_removal"):
-            before_t = _read_before_text(repo_root, merge_base_sha, path, old_path, status, min(max_patch_bytes, 16384))
-            after_t = _read_after_text(repo_root, mode, head_sha, path, status, min(max_patch_bytes, 16384))
+        if reason not in (
+            "lockfile",
+            "snapshot",
+            "orm_generated_metadata",
+            "dependency_manifest",
+            "documentation",
+            "test_file",
+            "test_skip_or_assertion_removal",
+        ):
+            before_t, after_t, had_ovr, has_ovr = check_gen_headers(item)
+            need_patch = _is_codegen_path(path) or (
+                _has_gen_header(before_t) if had_ovr is None else had_ovr
+            ) or (
+                _has_gen_header(after_t) if has_ovr is None else has_ovr
+            )
             manual_reason = _check_manual_gen_edit(
                 path=path,
                 status=status,
                 before_text=before_t,
                 after_text=after_t,
-                patch=load_patch() if (_is_codegen_path(path) or _has_gen_header(before_t) or _has_gen_header(after_t)) else None,
+                had_header_override=had_ovr,
+                has_header_override=has_ovr,
+                patch=load_patch() if need_patch else None,
                 any_schema_changed=any_schema_changed,
             )
             if manual_reason:
@@ -1527,6 +2495,18 @@ def analyze_repo(
                     "path": path,
                     "message": f"自動生成ファイルへの手動改変の疑い ({manual_reason}) のため must_read へ強制昇格しました。",
                 })
+
+        if category in ("must_read", "skim") and not is_binary and status != "D":
+            added_lines_for_bp = get_added_lines(item, load_patch)
+            if _detect_boilerplate_heavy(
+                path=path,
+                status=status,
+                reason=reason,
+                is_binary=is_binary,
+                flags=flags,
+                added_lines=added_lines_for_bp,
+            ):
+                flags.append("boilerplate_heavy")
 
         entry: Dict[str, Any] = {
             "path": path,
@@ -1549,7 +2529,6 @@ def analyze_repo(
         else:
             safe_to_skip.append(entry)
 
-    # 集計
     total_files = len(raw_items)
     total_added = sum(it["added"] for it in raw_items)
     total_deleted = sum(it["deleted"] for it in raw_items)
@@ -1607,6 +2586,7 @@ def analyze_repo(
 
     has_manual_gen_edit = any(w["code"] == "SUSPECTED_MANUAL_GEN_EDIT" for w in warnings)
     has_risk_path = any(f["is_risk_path"] for f in effective_list)
+    has_boilerplate_heavy = any("boilerplate_heavy" in f["flags"] for f in effective_list)
 
     provisional_size, size_reasons = _determine_provisional_size(
         effective_files=effective_files,
@@ -1619,6 +2599,7 @@ def analyze_repo(
     )
 
     must_verify: List[str] = []
+    notes: List[str] = []
     if provisional_size == "S":
         must_verify.append("size_s_single_layer_check")
     if any(d["added"] or d["updated"] for d in dependencies):
@@ -1631,17 +2612,13 @@ def analyze_repo(
         must_verify.append("xl_split_proposal_check")
     if any(".github/workflows/" in f["path"] for f in effective_list) and effective_files <= 2 and effective_lines < 30:
         must_verify.append("minor_ci_override_to_size_s_if_non_risk")
+    if has_boilerplate_heavy:
+        must_verify.append("boilerplate_heavy_skim_note")
+        notes.append(BOILERPLATE_GUIDANCE_TEXT)
 
     return {
         "schema_version": SCHEMA_VERSION,
-        "meta": {
-            "repo_root": repo_root,
-            "base_ref": base_ref,
-            "merge_base_sha": merge_base_sha,
-            "head_ref": head,
-            "head_sha": head_sha,
-            "mode": mode,
-        },
+        "meta": meta,
         "summary": {
             "total_files": total_files,
             "total_added": total_added,
@@ -1671,15 +2648,329 @@ def analyze_repo(
         },
         "ai_override_guidance": {
             "must_verify": must_verify,
+            "notes": notes,
         },
     }
+
+
+def analyze_repo(
+    *,
+    repo_path: str = ".",
+    base: Optional[str] = None,
+    head: str = "HEAD",
+    mode: str = "committed",
+    max_patch_bytes: int = 262144,
+) -> Dict[str, Any]:
+    """ローカル Git リポジトリ差分を解析し、トリアージ結果辞書を返す。"""
+    repo_root = _resolve_repo_root(repo_path)
+    head_sha = _verify_commit(repo_root, head)
+    if head_sha is None:
+        raise GitError(f"指定された --head ref が見つかりません（またはコミット未作成）: {head}")
+
+    base_ref, base_sha = _resolve_base_ref(repo_root, base, head_sha, mode)
+    assert base_sha is not None
+
+    warnings: List[Dict[str, str]] = []
+    if mode == "working":
+        merge_base_sha = head_sha
+        diff_target_args = [head_sha]
+    else:
+        mb_proc = _run_git_bytes(repo_root, ["merge-base", base_sha, head_sha], check=False)
+        if mb_proc.returncode == 0:
+            merge_base_sha = mb_proc.stdout.decode("utf-8", errors="replace").strip()
+        else:
+            merge_base_sha = base_sha
+            warnings.append({
+                "code": "SHALLOW_OR_UNRELATED_HISTORY",
+                "severity": "warn",
+                "path": "",
+                "message": "git merge-base を解決できないため 2点ドット差分で代替しました（shallow clone の可能性があります）。",
+            })
+        if mode == "committed":
+            diff_target_args = [merge_base_sha, head_sha]
+        else:
+            diff_target_args = [merge_base_sha]
+
+    numstat_raw = _run_git_bytes(repo_root, ["diff", "--numstat", "-M", "-z", *diff_target_args]).stdout
+    status_raw = _run_git_bytes(repo_root, ["diff", "--name-status", "-M", "-z", *diff_target_args]).stdout
+    w_numstat_raw = _run_git_bytes(repo_root, ["diff", "-w", "--numstat", "-M", "-z", *diff_target_args]).stdout
+
+    numstat_map = _parse_numstat_z(numstat_raw)
+    w_numstat_map = _parse_numstat_z(w_numstat_raw)
+    status_entries = _parse_name_status_z(status_raw)
+
+    raw_items: List[Dict[str, Any]] = []
+    seen_paths: Set[str] = set()
+    for status, path, old_path in status_entries:
+        seen_paths.add(path)
+        added, deleted, is_binary, ns_old = numstat_map.get(path, (0, 0, False, old_path))
+        eff_old = old_path or ns_old
+        w_added, w_deleted, _, _ = w_numstat_map.get(path, (0, 0, is_binary, eff_old))
+        flags: List[str] = []
+        if not is_binary and (added > 0 or deleted > 0) and w_added == 0 and w_deleted == 0:
+            flags.append("whitespace_or_format_only")
+        raw_items.append({
+            "path": path,
+            "old_path": eff_old,
+            "status": status,
+            "added": added,
+            "deleted": deleted,
+            "is_binary": is_binary,
+            "flags": flags,
+        })
+
+    if mode in ("working", "all"):
+        untracked_raw = _run_git_bytes(repo_root, ["ls-files", "--others", "--exclude-standard", "-z"]).stdout
+        for raw_p in untracked_raw.split(b"\x00"):
+            if not raw_p:
+                continue
+            path = _decode_path(raw_p)
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            lines, is_binary = _count_untracked_file(os.path.join(repo_root, path))
+            raw_items.append({
+                "path": path,
+                "old_path": None,
+                "status": "?",
+                "added": lines,
+                "deleted": 0,
+                "is_binary": is_binary,
+                "flags": ["untracked"],
+            })
+
+    def get_patch(item: Dict[str, Any]) -> Optional[str]:
+        return _get_file_patch(
+            repo_root, mode, merge_base_sha, head_sha, item["path"], item["old_path"], item["status"], max_patch_bytes
+        )
+
+    def get_added_lines(item: Dict[str, Any], load_patch_fn: Any) -> List[str]:
+        if item["status"] == "?":
+            txt = _read_working_text(repo_root, item["path"], max_patch_bytes)
+            return txt.splitlines() if txt is not None else []
+        p = load_patch_fn()
+        if not p:
+            return []
+        added_l, _ = _iter_patch_changes(p)
+        return added_l
+
+    def analyze_manifest_item(item: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        before_t = _read_before_text(
+            repo_root, merge_base_sha, item["path"], item["old_path"], item["status"], max_patch_bytes
+        )
+        after_t = _read_after_text(repo_root, mode, head_sha, item["path"], item["status"], max_patch_bytes)
+        return _analyze_manifest(item["path"], before_t, after_t)
+
+    def check_gen_headers(item: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[bool], Optional[bool]]:
+        limit = min(max_patch_bytes, 16384)
+        before_t = _read_before_text(repo_root, merge_base_sha, item["path"], item["old_path"], item["status"], limit)
+        after_t = _read_after_text(repo_root, mode, head_sha, item["path"], item["status"], limit)
+        return before_t, after_t, None, None
+
+    meta: Dict[str, Any] = {
+        "source_type": "git",
+        "repo_root": repo_root,
+        "base_ref": base_ref,
+        "merge_base_sha": merge_base_sha,
+        "head_ref": head,
+        "head_sha": head_sha,
+        "mode": mode,
+        "pr": None,
+    }
+    return _triage_items(
+        raw_items=raw_items,
+        meta=meta,
+        initial_warnings=warnings,
+        get_patch=get_patch,
+        get_added_lines=get_added_lines,
+        analyze_manifest_item=analyze_manifest_item,
+        check_gen_headers=check_gen_headers,
+    )
+
+
+def analyze_unified_diff(
+    diff_text: str,
+    *,
+    source_type: str = "patch_file",
+    explicit_repo_root: Optional[str] = None,
+    patch_file_label: Optional[str] = None,
+    pr_meta: Optional[Dict[str, Any]] = None,
+    max_patch_bytes: int = 262144,
+) -> Dict[str, Any]:
+    """unified diff 文字列を解析し、トリアージ結果辞書を返す。"""
+    raw_items = _parse_unified_diff(diff_text)
+
+    def get_patch(item: Dict[str, Any]) -> Optional[str]:
+        p = item.get("patch") or ""
+        if not p or len(p.encode("utf-8", errors="replace")) > max_patch_bytes:
+            return None
+        return p
+
+    def get_added_lines(item: Dict[str, Any], _load_patch_fn: Any) -> List[str]:
+        return list(item.get("added_lines", []))
+
+    def analyze_manifest_item(item: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+        return _analyze_manifest_from_patch(
+            item["path"],
+            item["hunks"],
+            item["added_lines"],
+            item["deleted_lines"],
+            explicit_repo_root,
+            item["old_path"],
+            item["status"],
+        )
+
+    def check_gen_headers(item: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[bool], Optional[bool]]:
+        had_ovr: Optional[bool] = None
+        has_ovr: Optional[bool] = None
+        if item["saw_before_top"]:
+            had_ovr = bool(GEN_HEADER_RE.search("\n".join(item["before_top_lines"])))
+        if item["saw_after_top"]:
+            has_ovr = bool(GEN_HEADER_RE.search("\n".join(item["after_top_lines"])))
+
+        if explicit_repo_root is not None and (had_ovr is None or has_ovr is None):
+            local_txt = _read_working_text(explicit_repo_root, item["path"], 8192)
+            if local_txt is None and item["old_path"]:
+                local_txt = _read_working_text(explicit_repo_root, item["old_path"], 8192)
+            if local_txt is not None:
+                local_has = _has_gen_header(local_txt)
+                if had_ovr is None and item["status"] != "A":
+                    had_ovr = local_has
+                if has_ovr is None and item["status"] != "D":
+                    has_ovr = local_has
+
+        if had_ovr is None:
+            had_ovr = False
+        if has_ovr is None:
+            has_ovr = False
+        return None, None, had_ovr, has_ovr
+
+    meta: Dict[str, Any] = {
+        "source_type": source_type,
+        "repo_root": explicit_repo_root,
+        "base_ref": pr_meta["base_ref"] if pr_meta else None,
+        "merge_base_sha": None,
+        "head_ref": pr_meta["head_ref"] if pr_meta else None,
+        "head_sha": None,
+        "mode": source_type,
+        "pr": pr_meta,
+    }
+    if patch_file_label is not None:
+        meta["patch_file"] = patch_file_label
+
+    return _triage_items(
+        raw_items=raw_items,
+        meta=meta,
+        initial_warnings=[],
+        get_patch=get_patch,
+        get_added_lines=get_added_lines,
+        analyze_manifest_item=analyze_manifest_item,
+        check_gen_headers=check_gen_headers,
+    )
+
+
+def analyze_pr(
+    *,
+    pr_ref: str,
+    explicit_repo: Optional[str] = None,
+    max_patch_bytes: int = 262144,
+) -> Dict[str, Any]:
+    """読み取り専用の `gh pr view` と `gh pr diff` を実行して既存 PR を解析する。"""
+    explicit_repo_root = _try_resolve_repo_root(explicit_repo)
+    run_cwd = explicit_repo_root if explicit_repo_root is not None else (os.getcwd() if os.path.isdir(os.getcwd()) else None)
+
+    view_cmd = [
+        "gh",
+        "pr",
+        "view",
+        pr_ref,
+        "--json",
+        "number,title,url,baseRefName,headRefName,additions,deletions",
+    ]
+    try:
+        view_proc = subprocess.run(view_cmd, cwd=run_cwd, capture_output=True, check=False)
+    except OSError as exc:
+        raise GitError(f"gh CLI の実行に失敗しました（GitHub CLI が導入されているか確認してください）: {exc}") from exc
+    if view_proc.returncode != 0:
+        err = view_proc.stderr.decode("utf-8", errors="replace").strip()
+        raise GitError(f"`gh pr view {pr_ref}` が失敗しました: {err or f'exit {view_proc.returncode}'}")
+
+    try:
+        view_data = json.loads(view_proc.stdout.decode("utf-8", errors="replace"))
+    except ValueError as exc:
+        raise GitError(f"`gh pr view` の JSON 出力を解釈できませんでした: {exc}") from exc
+    if not isinstance(view_data, dict):
+        raise GitError("`gh pr view` の出力形式が不正です（JSON オブジェクトではありません）。")
+
+    diff_cmd = ["gh", "pr", "diff", pr_ref]
+    try:
+        diff_proc = subprocess.run(diff_cmd, cwd=run_cwd, capture_output=True, check=False)
+    except OSError as exc:
+        raise GitError(f"`gh pr diff` の実行に失敗しました: {exc}") from exc
+    if diff_proc.returncode != 0:
+        err = diff_proc.stderr.decode("utf-8", errors="replace").strip()
+        raise GitError(f"`gh pr diff {pr_ref}` が失敗しました: {err or f'exit {diff_proc.returncode}'}")
+
+    diff_text = diff_proc.stdout.decode("utf-8", errors="replace")
+    pr_meta: Dict[str, Any] = {
+        "number": view_data.get("number"),
+        "title": view_data.get("title"),
+        "url": view_data.get("url"),
+        "base_ref": view_data.get("baseRefName"),
+        "head_ref": view_data.get("headRefName"),
+        "additions": view_data.get("additions"),
+        "deletions": view_data.get("deletions"),
+    }
+    return analyze_unified_diff(
+        diff_text,
+        source_type="github_pr",
+        explicit_repo_root=explicit_repo_root,
+        pr_meta=pr_meta,
+        max_patch_bytes=max_patch_bytes,
+    )
+
+
+def _read_patch_source(patch_file: str) -> str:
+    if patch_file == "-":
+        stream = sys.stdin
+        if stream is None:
+            raise GitError("標準入力が利用できません。")
+        try:
+            buf = getattr(stream, "buffer", None)
+            if buf is not None:
+                return buf.read().decode("utf-8", errors="replace")
+            return stream.read()
+        except OSError as exc:
+            raise GitError(f"標準入力からのパッチ読み込みに失敗しました: {exc.strerror or exc}") from exc
+
+    if not os.path.isfile(patch_file):
+        raise GitError(f"パッチファイルが見つかりません: {patch_file}")
+    try:
+        with open(patch_file, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        raise GitError(f"パッチファイルを開けません ({patch_file}): {exc.strerror or exc}") from exc
+    return raw.decode("utf-8", errors="replace")
 
 
 def render_text_report(result: Dict[str, Any]) -> str:
     meta = result["meta"]
     s = result["summary"]
+    source_type = meta.get("source_type", "git")
+    if source_type == "github_pr" and isinstance(meta.get("pr"), dict):
+        pr_info = meta["pr"]
+        header_line = (
+            f"PR #{pr_info.get('number')}: {pr_info.get('title') or ''} "
+            f"({pr_info.get('base_ref') or '?'} <- {pr_info.get('head_ref') or '?'}) [github_pr]"
+        )
+    elif source_type == "patch_file":
+        header_line = f"Source: patch_file ({meta.get('patch_file', '-')})"
+    else:
+        mb = (meta.get("merge_base_sha") or "")[:8]
+        header_line = f"Base: {meta['base_ref']} ({mb}) -> Head: {meta['head_ref']} [{meta['mode']}]"
+
     lines = [
-        f"Base: {meta['base_ref']} ({meta['merge_base_sha'][:8]}) -> Head: {meta['head_ref']} [{meta['mode']}]",
+        header_line,
         f"Provisional Size: {s['provisional_size']} (special_case={s['special_case']})",
         (
             f"Scope: total {s['total_files']} files (+{s['total_added']}/-{s['total_deleted']} = {s['total_lines']} lines) "
@@ -1703,7 +2994,8 @@ def render_text_report(result: Dict[str, Any]) -> str:
         items = result["files"][bucket]
         lines.append(f"{bucket} ({len(items)}):")
         for f in items:
-            lines.append(f"  - {f['status']} {f['path']} (+{f['added']}/-{f['deleted']}) [{f['reason']}]")
+            flag_suffix = f" ({', '.join(f['flags'])})" if f.get("flags") else ""
+            lines.append(f"  - {f['status']} {f['path']} (+{f['added']}/-{f['deleted']}) [{f['reason']}]{flag_suffix}")
     return "\n".join(lines)
 
 
@@ -1716,14 +3008,42 @@ def _run(argv: Optional[List[str]]) -> int:
     if args.max_patch_bytes <= 0:
         _error("--max-patch-bytes は正の整数を指定してください。")
         return 2
+
+    if args.pr is not None and args.patch_file is not None:
+        _error("pr_diff_triage.py: --pr と --patch-file は同時に指定できません。")
+        return 2
+    if (args.pr is not None or args.patch_file is not None) and (
+        args.base is not None or args.head is not None or args.mode is not None
+    ):
+        _error("pr_diff_triage.py: --pr / --patch-file 指定時は --base / --head / --mode を併用できません。")
+        return 2
+
     try:
-        result = analyze_repo(
-            repo_path=args.repo,
-            base=args.base,
-            head=args.head,
-            mode=args.mode,
-            max_patch_bytes=args.max_patch_bytes,
-        )
+        if args.pr is not None:
+            result = analyze_pr(
+                pr_ref=args.pr,
+                explicit_repo=args.repo,
+                max_patch_bytes=args.max_patch_bytes,
+            )
+        elif args.patch_file is not None:
+            explicit_repo_root = _try_resolve_repo_root(args.repo)
+            diff_text = _read_patch_source(args.patch_file)
+            result = analyze_unified_diff(
+                diff_text,
+                source_type="patch_file",
+                explicit_repo_root=explicit_repo_root,
+                patch_file_label=args.patch_file,
+                pr_meta=None,
+                max_patch_bytes=args.max_patch_bytes,
+            )
+        else:
+            result = analyze_repo(
+                repo_path=args.repo if args.repo is not None else ".",
+                base=args.base,
+                head=args.head if args.head is not None else "HEAD",
+                mode=args.mode if args.mode is not None else "committed",
+                max_patch_bytes=args.max_patch_bytes,
+            )
     except GitError as exc:
         _error(f"pr_diff_triage.py: {exc}")
         return 2

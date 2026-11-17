@@ -1,265 +1,249 @@
 ---
 name: human-first-pr
-description: >-
-  AIが書いたPRの冗長コード（AIスロップ）の無言整理・差分トリアージ・Mermaid図解を組み合わせ、「3秒で全体像と読むべき箇所がわかるPR概要（Pull Request本文）」を作成・再構成するスキル。
-  「PRを作って」「プルリクエストを作成」「PRの説明文を書いて」「PR本文を書き直して」「変更を図解してPRにまとめて」「PR提出前に整理して」「PRを分割すべきか見て概要を作って」「gh pr create」「draft a PR description」「rewrite this PR body」「make this PR easier to review」など、PR本文の新規作成・改善・可視化、またはPR提出準備が目的の場面で必ず使用する。
-  一方、コミットメッセージ作成単体（commit-message）、他者PRやdiffのバグ指摘・設計監査（fable-code-review）、PR作成を伴わないコード掃除単体（deslop）、PRと無関係な一般日本語推敲（yomiyasu）には使用しない。
+description: すでに出されている Pull Request（PR番号・URL・ローカルGit差分・unified diffパッチ）を、人間がすぐ全体像と読む順番を把握できるよう Chat 上で言葉と Mermaid 図解で噛み砕いて解説する完全 Read-Only スキル。lockfile・自動生成物・AI特有の冗長ボイラープレートを解説側で濾過し、読むべき核心箇所と設計判断を案内する。ユーザーが「/human-first-pr」「human-first-pr」と指定したとき、または「このPRの内容をわかりやすく教えて」「PR #234 の全体像を図解で解説して」「AIが書いた巨大PRのどこから読めばいいか整理して」「lockfileだらけのPRの読む順番を教えて」「pr_diff.patch を噛み砕いて説明して」「PR説明文と実コードの差分にズレがないか確認しながら解説して」「walk me through this PR visually」など、既存PRや差分の理解・図解解説・読む順番ガイドを求めたときに使用する。新規PR作成やPR本文執筆（gh pr create）、既存PR説明文の書き換え（gh pr edit）、コード編集・スロップ削除リファクタ（deslop）、バグ・脆弱性を厳しく監査するコードレビュー（fable-code-review / yharuto-code-review）、コミットメッセージ作成（commit-message）、一般文書の日本語推敲（yomiyasu）には使用しない。
 ---
 
-# Human-First PR Skill
+# Human-First PR — Read-Only Chat PR Briefing
 
-本スキルの中核アンカーは **3-Gate PR Pipeline（減量 → 仕分け → 視覚化）** である。PR 提出前に冗長防衛コードや無関係変更を無言で整理し、lockfile や自動生成物のノイズを隔離した上で、レビュアーが 3 秒で全体像と読む順番を判断できる Pull Request 本文を作成する。
+すでに出されている Pull Request（またはブランチ差分・パッチファイル）を読み取り専用で解析し、人間が短時間で「なぜ・何を変えた PR か」「どの順番でどこを読めばよいか」を理解できるよう、**Chat 上で自然な言葉＋Mermaid 図解＋読む順番ガイドとして噛み砕いて解説するスキル**です。
 
-```text
-Step 0 (Mode / Base / テンプレート / 絵文字規約の確定)
-  ├─ Mode A (編集可: 既定) ─▶ Gate 1 (差分内スロップ整理 + 検証 + コミット前承認) ─▶ Gate 2
-  └─ Mode B (Read-Only) ────▶ [Gate 1 スキップ] ────────────────────────────────▶ Gate 2
-                                                                                     │
-  Gate 3 (Size S 最小4行 / Size M・L 図解構成 / Size XL 分割案+WARNING) ◀──────────┘
-    └─ pr_body_lint.py (--yomiyasu-lint) exit 0 確認 ─▶ 出力 / 投稿前確認
-```
+---
 
-## 起動意図・実行モード・書き込み規約
+## 1. 絶対原則（4つの柱）
 
-- **起動形態**: Auto-trigger（PR 作成・PR 本文リライト・PR 提出前整理の依頼時）および Manual-run（`/human-first-pr`）。
-- **実行モードと適用境界**:
+1. **100% Read-Only（完全読み取り専用）**
+   - 対象リポジトリのソースコード編集、AIスロップ削除リファクタリング、`git commit` / `git push` / `git restore` / 作業ツリーを書き換える `git checkout`、`gh pr create` / `gh pr edit`、および `.github/pull_request_template.md` を埋める作業は **一切行わない**。
+   - 一時ファイル（トリアージ JSON やセルフリント用下書き）を作る場合は必ず OS の一時領域（`mktemp` 等）を使い、対象リポジトリの `git status --porcelain` を一切汚さない。
+   - 解説は原則として **Chat の返答として直接出力**する（ユーザーから明示的にファイル保存を求められた場合のみ指定パスへ保存する）。
+2. **目的は「人間がすぐ理解できる Chat PR ブリーフィング」**
+   - 作成者になり代わって GitHub 提出用の自己申告文を書くのではなく、**第三者の案内役**として PR の背景・仕組み・設計判断・読む順番・注意点をわかりやすく整理して伝える。
+3. **実 Diff 一次根拠主義（既存 PR 説明文は未検証の参考情報）**
+   - PR 作成者（または別 AI）が書いた既存の PR タイトル・本文は「未検証の参考情報」として扱う。
+   - すべての技術的説明は **実際のコード Diff と実行確認できた事実** を一次根拠とし、PR 説明文の主張（定数値・実装範囲・「全テスト通過済み」等）と実コードに食い違いがあれば明示的に指摘する。
+4. **言葉での説明を十分に書く（図の裸置き禁止）**
+   - 窮屈な行数切り詰めや機械的なファイル変更実況（「L50 を編集」）を避け、**背景（Why）・変更ストーリー・設計のポイントを自然な日本語（既定は「です・ます」調）でしっかり言葉にする**。
+   - Mermaid 図だけを裸で置かず、図の前後に「何を表す図か」「どの経路・状態変化が今回の核心か」を必ず言葉で補足する（`BR010`）。
 
-| 状況 / 依頼内容 | 選択モード | Gate 1 | 最終出力・振る舞い |
-|---|---|---|---|
-| ブランチ実装完了後の PR 作成・提出前整理（既定） | **Mode A** | 実施 | 整理＋検証後にコミット承認を確認し、PR 本文を生成 |
-| 「PR 本文だけ書いて」「コードは触らないで」「PR #N 書き直し」 | **Mode B** | 禁止 | コード未変更で Gate 2〜3 のみ実行（スロップは本文外の末尾メモ 1〜3 行のみ） |
-| 読み取り専用環境・マージ済み PR・Gate 1 拒否時 | **Mode B** | 禁止 | 同上 |
-| コミットメッセージ単体 / 他者 PR 監査 / PR なし掃除 / 一般文書推敲 | **適用外** | — | 本スキルを中断し `commit-message` / `fable-code-review` / `deslop` / `yomiyasu` へ委譲 |
+---
 
-- **冪等書き込みと安全境界**:
-  - Gate 1 のコード編集はベースブランチとの差分ハンクのみを対象とし、2 回目実行で追加差分が出ない冪等な最小編集にとどめる。
-  - Gate 3 の PR 本文出力・更新は **上書き置換** とし、再実行時に既存セクションを重複追記しない。
-  - **ユーザー確認なしの `git commit`・`git push`・`gh pr create`・`gh pr edit` 実行は禁止**。
-  - **既存テストの無断削除・skip・コメントアウト、および無関係な `README.md`・ドキュメントの変更は禁止**。
+## 2. 起動条件と隣接スキルとの境界
 
-## 厳格禁止事項（4 原則）
-
-以下の 4 点はサイズ・モード・テンプレート種別を問わず常に守る。
-
-1. **Diff の What 実況禁止**: 行番号や関数名の変更カタログを並べず、「なぜ（Why）変えたか」と「外から観測できる振る舞い変化」のみを書く（TL;DR は非空 3 行以内・日本語 150 字目安）。
-2. **AI クリシェ禁止**: 「堅牢性を向上」「シームレスに統合」「包括的なエラーハンドリング」「クリーンで保守性の高い設計」などの曖昧語を禁止し、条件・数値・型・例外の具体挙動で書く。
-3. **Gate 1 削減量アピール・削減グラフ禁止**: 整理で削った行数やコードダイエットの成果・比較グラフを PR 本文へ一切書かない（大量削除 PR の客観 Scope 表記は除く）。
-4. **未実行テスト・確認事項の捏造禁止**: 実際に実行し成功を確認したコマンドと根拠のみ `- [x]` とし、未実行・環境不足による失敗・手動確認待ちは `- [ ]` へ分離して理由を明記する。
-
-## JIT リファレンス読込とスクリプト解決
-
-コンテキスト肥大と誤出力を防ぐため、専門辞書は該当フェーズに入った時点で初めて読み込む。各仕様の詳細はリファレンスを単一情報源（SSOT）とし、本ファイルへ重複記載しない。
-
-| 実行フェーズ / 条件 | 読み込むファイル | 読まない条件（制約意図） |
+| ユーザーの依頼内容 | 本スキルの対象か | 適切な対応・委譲先 |
 |---|---|---|
-| Gate 1 開始時（Mode A のみ） | `references/gate1-slop-diet.md` | **Mode B 時は読込禁止** |
-| Gate 2 開始時（全モード） | `references/triage-rules.md` | なし（分類確認・サイズ確定に使用） |
-| Gate 3 執筆時（全サイズ） | `references/japanese-pr-style.md` | なし（日本語規約・クリシェ回避に使用） |
-| Gate 3 執筆時（Size M / L / XL のみ） | `references/mermaid-and-templates.md` | **Size S 確定時は読込禁止**（図表誤出力を構造的に遮断） |
-
-- **`<skill-dir>` の解決ルール**: `<skill-dir>` は本 `SKILL.md` が配置されたディレクトリを指す。対象リポジトリのルートを作業ディレクトリとしてコマンドを実行する場合は、`<skill-dir>` を絶対パス（例: `SKILL_DIR`）または作業ディレクトリからの相対パスに解決して呼び出す。スキルディレクトリ側から別リポジトリを対象にする場合は `--repo <target-repo-path>` を指定する。
-  ```bash
-  # 例: 対象リポジトリをカレントディレクトリにして実行する場合
-  python3 "<skill-dir>/scripts/pr_diff_triage.py" --mode committed --format json
-  # 例: スキルディレクトリ等をカレントディレクトリにしたまま対象リポジトリを指定する場合
-  python3 "<skill-dir>/scripts/pr_diff_triage.py" --repo "<target-repo>" --mode committed --format json
-  ```
+| 既存 PR（番号・URL・ローカル差分・`.patch`）の全体像・仕組み・読む順番を Chat で解説してほしい | **対象（起動する）** | 本スキルの 3-Step Pipeline を実行 |
+| AI が書いた大きな PR のノイズや冗長コードに惑わされず、本質箇所だけ教えてほしい | **対象（起動する）** | コードは編集せず、解説側でボイラープレートを濾過して案内 |
+| このブランチで PR を新規作成して / `gh pr create` して | **対象外** | 通常の PR 作成フロー（本スキルは起動しない） |
+| 既存 PR #123 の説明文を `gh pr edit` で書き換えて更新して | **対象外** | GitHub PR 編集作業（本スキルは Read-Only 解説専用） |
+| PR を出す前に冗長な try-catch や不要コメントを削ってコードを掃除して | **対象外** | `deslop` スキル |
+| PR にバグ・競合状態・セキュリティ脆弱性がないか厳しく監査して指摘して | **対象外** | `fable-code-review` / `yharuto-code-review` スキル |
+| ステージ済み差分からコミットメッセージを作って | **対象外** | `commit-message` スキル |
+| PR と無関係なドキュメントや案内文の日本語を推敲して | **対象外** | `yomiyasu` スキル |
 
 ---
 
-## Step 0: 実行モード・ベースブランチ・リポジトリ規約の確定
+## 3. 3-Step PR Comprehension Pipeline（取得 → 仕分け → Chat図解解説）
 
-着手時に以下 4 点を確定し、誤った比較ベースや規約違反によるやり直しを防ぐ。
+解説は以下の 3 ステップを一気通貫で実行し、最後に必ず `pr_briefing_lint.py` の自己検査を通過させてから Chat に出力します。`<skill-dir>` は本 `SKILL.md` が置かれているディレクトリを指します。
 
-1. **実行モード確定**: 上記境界表で **Mode A** か **Mode B** かを決め、一時作業ディレクトリを作成する。既存 PR や下書きファイルを書き直す場合（Mode B）は、Issue 参照（`Closes #...`）と未確認チェックリストを控える一方、元文の「全テストパス」等の主張は信用せず実コードと実測結果だけで裏取りする。
-   ```bash
-   TMP_DIR=$(mktemp -d)
-   CUR_BRANCH=$(git branch --show-current)
-   ```
-2. **ベースブランチ特定**: `main` の決め打ちと `@{u}` 参照（push 済み feature ブランチで自分自身を指し差分 0 になる罠）を禁止する。
-   - ユーザー明示指定（`develop` 向け等）があればそれを `BASE_REF` とする。
-   - 未指定かつ `gh` CLI 利用可能時は既存 PR から取得を試みる（未作成・オフライン時は空のまま進む）:
-     ```bash
-     BASE_REF=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || true)
-     ```
-   - `BASE_REF` が空なら `--base` を省略し、`pr_diff_triage.py` の純ローカル Git 解決（`origin/HEAD` → 候補ブランチのうち現在ブランチ同名ローカルを除いた最小 `rev-list` 距離）へ委ねる。
-3. **絵文字禁止規約の自動検出**: `CLAUDE.md`、`AGENTS.md`、`.github/pull_request_template.md`、`.yomiyasu-words/` 内に絵文字禁止規定がある場合、またはユーザーが絵文字なしを指定した場合は、Gate 3 で `--badge-mode text`（`[SCOPE]` / `[TARGET]` / `[MUST]` / `[SKIM]` / `[SKIP]`）を自動選択する。
-   ```bash
-   rg -n "絵文字|emoji|\[MUST\]|\[SCOPE\]" CLAUDE.md AGENTS.md .github/pull_request_template.md 2>/dev/null || true
-   ```
-4. **既存 PR テンプレートと CI の探索**: 以下のテンプレート有無と、`.github/workflows/*.yml` 内の PR 見出し・チェックリスト必須検証 CI（Danger / pr-lint 等）の有無を確認する。
-   ```bash
-   ls -1 .github/pull_request_template.md .github/PULL_REQUEST_TEMPLATE.md \
-     .github/PULL_REQUEST_TEMPLATE/*.md docs/pull_request_template.md 2>/dev/null || true
-   rg -n "pull_request_template|danger|pr-lint" .github/workflows/ 2>/dev/null || true
-   ```
+### リファレンス文書の段階的読み込み（Progressive Disclosure）
 
----
+コンテキスト消費を抑えるため、必要な場面でのみ該当リファレンスを読み込みます。
 
-## Gate 1: Silent Code Diet（Mode A のみ）
-
-Mode B の場合は Gate 1 をスキップして Gate 2 へ進む。具体的なスロップ 6 類型とスタック別チェックコマンドは `references/gate1-slop-diet.md` を参照する。
-
-### 1.1 作業ツリー保護と編集範囲の限定
-
-1. `git status --porcelain` と `git diff --name-only` で作業ツリーの状態を確認する。
-2. 未コミット変更（staged / unstaged / untracked）がある場合は、作業ツリーを変更せず非破壊スナップショットを作成する（`git checkout -- .` や `git reset --hard` による巻き戻しは厳禁）:
-   ```bash
-   STASH_SHA=$(git stash create || true)
-   git diff HEAD > "$TMP_DIR/pre_gate1.patch"
-   ```
-3. 編集範囲は **ベースブランチとの差分（`<merge-base>`〜作業ツリー）に含まれる変更関数・近傍ハンクのみ** とし、未変更の既存コードへの理由なきリファクタは行わない。
-
-### 1.2 4 つの整理観点
-
-`references/gate1-slop-diet.md` に従い、外部仕様を保ったまま次の順で整理する。
-
-1. **車輪の再発明の排除**: 新規関数・型・定数・エラー処理が既存資産（`utils/`, `shared/`, `common/` 等）と重複していれば既存実装へ統合する。薄いラッパーや重複関数を削除・統合する前にテストファイルを含む全参照箇所を `rg` 等で検索し、旧関数を直接呼ぶテストがあれば統合先に合わせて更新または確認する。
-2. **AI スロップの削除**: 到達不能な `null` / `undefined` チェック、要件外の無意味フォールバック、握りつぶしまたは再送出のみの `try-catch`、1 箇所呼び出しの薄いラッパー・使い捨て中間変数、What をなぞるだけの自明コメントを削る。
-3. **3 段以上ネストの平坦化**: ガード節・早期リターンへ書き換える。
-4. **無関係変更の扱い**: 本 PR の主題と無関係な周辺変更（未コミット・コミット済みともに）を **無断で `git restore` や削除しない**。該当ファイルと差分要約を一覧化し、差し戻すか別ブランチへ退避するか保持するかをユーザーへ確認する。
-
-### 1.3 検証・失敗時ロールバック・コミット前承認プロトコル
-
-1. マニフェストや CI 定義（`pyproject.toml` / `package.json` / `Cargo.toml` / `go.mod` / `Makefile` / `.github/workflows/`）を探索し、**型チェック → リンター/フォーマッター → テスト** の順で実実行する。
-   - 既存テストが最初から落ちている可能性があるリポジトリ（DB 環境変数不足等）では、編集前にベースラインの失敗有無を把握し、新規悪化と既存失敗を切り分ける。
-   - Gate 3 で根拠付き `[x]`（または未実行 `[ ]`）を書けるよう、実行コマンド・通過件数・エラー内容を正確に控えておく。
-2. **テスト失敗時のロールバック手順**:
-   - Gate 1 の編集が原因で失敗した場合は、当該ファイルのみ直ちに復元（クリーン状態なら `git restore -- <file>`、ダーティ状態なら `git checkout "$STASH_SHA" -- <file>` 等で編集前へ戻し事前状態を保全）して再検証し、通過を確認した上で当該箇所を「意図的保持」として残す。
-   - 編集前から失敗していたテストがある場合は、動作変更を伴う構造リファクタ（薄いラッパー統合・大規模ネスト展開）を控え、静的範囲の整理にとどめる。
-3. **コミット前承認の取得**: 検証通過後、**`git commit` 前に** 以下の 4 項目をチャット上で提示してユーザー承認を求める（確認なしに自動コミット・自動 push しない）。
-   ```text
-   - Gate 1 変更要約: <git diff --stat（PR本文へは転記しない）>
-   - 検証コマンド結果: <実行コマンドと通過/失敗件数>
-   - 無関係変更の確認: <該当ファイルと差し戻し/退避/保持の相談、なければ「なし」>
-   - 提案コミットメッセージ: <Conventional Commits + 日本語>
-   → (A) コミットを承認して Gate 2 (--mode committed) へ進む / (B) 未コミットのまま Gate 2 (--mode all) へ進む
-   ```
-
----
-
-## Gate 2: Diff Sizing & Signal/Noise Triage
-
-`references/triage-rules.md` を読み込み、`pr_diff_triage.py` を実行して定量集計・初期分類・警告・依存変更を取得する。
-
-```bash
-python3 <skill-dir>/scripts/pr_diff_triage.py \
-  --base <ref> \
-  --mode {committed,working,all} \
-  --format json > "$TMP_DIR/pr_triage.json"
-```
-
-- 事前に `BASE_REF` を取得済みなら `--base "$BASE_REF"` を渡し、未取得なら `--base` 自体を省略する。
-- 変更がすべてコミット済み（Mode B または承認コミット後）なら `--mode committed`、Gate 1 の未コミット編集を残したまま進むなら `--mode all`、作業ツリー単体確認時は `--mode working` を選ぶ。別ディレクトリから実行する場合は `--repo <path>` を添える。
-
-### AI による最終確定とルーティング
-
-`pr_triage.json` の `summary`, `warnings`, `dependencies`, `files`, `ai_override_guidance` と実際の `git diff` を突き合わせ、以下を確定する。
-
-1. **自動生成ファイル手動改変（`SUSPECTED_MANUAL_GEN_EDIT`）**:
-   - スクリプトが警告したファイルは `Safe-to-Skip` に戻さず **`🧠 Must-Read` へ昇格して警告** を明記する。外部 API 定義等に基づく正当な再生成であると Diff から確認できた場合のみ `Safe-to-Skip` に戻し、理由を 1 行添える。
-2. **意味的リスクとテスト健全性の検査**:
-   - タイムアウト値等の 1 行定数変更や 1 ファイル内の複数レイヤー混在、テスト内 `.skip` / アサーション削除（`TEST_SKIP_OR_ASSERTION_REMOVAL`）を確認し、必要に応じて `Must-Read` / Size M 以上へ引き上げる。
-3. **依存パッケージ理由の 1 行抽出**:
-   - `dependencies` に `added` / `updated` がある場合は、パッケージ名と **コード上の利用箇所から確認した導入理由 1 行** を抽出する（`scripts` / `exports` 等非依存キー改変は `Must-Read` / `Skim` へ昇格）。
-4. **確定サイズ別の Gate 3 ルーティング**（詳細閾値と特殊 PR 判定は `references/triage-rules.md` を参照）:
-
-| 確定規模 / 特殊状態 | 読み込むリファレンス | Gate 3 の出力アクション |
+| リファレンス | 読み込むタイミング | 注意事項 |
 |---|---|---|
-| **Size S** / 健全な `skip_only` | `japanese-pr-style.md` のみ（図表リファレンス読込禁止） | 3.1 節の最小 4 行テンプレートのみ出力 |
-| **Size M** / **Size L** / `deletion_heavy` / 大規模 Docs・CI | `mermaid-and-templates.md` + `japanese-pr-style.md` | 3.2 節の Visual-First 構成を出力 |
-| **Size XL**（または独立責務混在） | 同上 | **まず PR 分割提案（Split Proposal）を出し、続けて `> [!WARNING]` 付きの 1 本版 PR ドラフトも同時出力** |
-| **`empty_diff`** | なし | PR 本文を生成せず、比較ベースや未保存変更をユーザーへ確認 |
-
-5. **テンプレート統合モードの確定**: 既存 PR テンプレートがある場合、必須見出し検証 CI があれば `--template-mode strict`、それ以外は `--template-mode merge`（既定）を選ぶ。
+| [references/triage-rules.md](references/triage-rules.md) | Step 1〜2 で強制昇格警告・`boilerplate_heavy` 行レンジ濾過・特殊 PR・Size XL 分割読解を扱うとき | 3階層辞書と規模判定の詳細正本 |
+| [references/mermaid-and-templates.md](references/mermaid-and-templates.md) | Step 3 で **Size M / L / XL** の図解・構成・Text-Only モードを作成するとき | **Size S では読み込み禁止**（過剰装飾防止） |
+| [references/japanese-pr-style.md](references/japanese-pr-style.md) | Step 3 で文章スタイル・AIクリシェ回避（`BR005`）・PR説明文とのギャップ表現を確認するとき | `/yomiyasu` 連携と日本語表現の正本 |
 
 ---
 
-## Gate 3: Visual-First PR Generation & Self-Lint
+### Step 1: PR Context & Diff Acquisition（PR情報・差分の取得）
 
-確定したサイズと統合モードに従い、PR 本文ドラフトを作成して自己検証する。
+入力ソースに応じて以下の 3 経路から読み取り専用で情報を取得し、一時ファイル `$TMP_TRIAGE`（例: `mktemp /tmp/hfpr_triage.XXXXXX.json`）へ保存します。
 
-### 3.1 Size S 最小 4 行テンプレート（本節を正本とする）
+1. **経路①：GitHub PR 番号・URL 指定**（ローカル checkout 不要）
+   ```bash
+   gh pr view <num|url> --json number,title,body,baseRefName,headRefName,url
+   python3 <skill-dir>/scripts/pr_diff_triage.py --pr <num|url> --pretty > "$TMP_TRIAGE"
+   ```
+   - `gh pr diff <num|url>`（または特定ファイルの差分確認）で実コードの変更内容を読み取る。既存 PR の `body` は未検証情報として保持し、後のギャップ照合に使う。
+2. **経路②：ローカル Git リポジトリのブランチ / 作業差分**
+   ```bash
+   python3 <skill-dir>/scripts/pr_diff_triage.py --repo <repo_path> [--base <ref>] [--head <ref>] --mode {committed,working,all} --pretty > "$TMP_TRIAGE"
+   ```
+   - 既定は `--mode committed`（ベースとのコミット済み差分）。未コミット変更を含めて解説を求められた場合のみ `working` または `all` を選ぶ。
+3. **経路③：Unified Diff パッチファイル / 標準入力**（Git リポジトリ外でも実行可）
+   ```bash
+   python3 <skill-dir>/scripts/pr_diff_triage.py --patch-file <path|-> --pretty > "$TMP_TRIAGE"
+   ```
 
-実質コードが Size S 確定時は `references/mermaid-and-templates.md` を **読み込まず**、`references/japanese-pr-style.md` のみ確認して以下の最小構成で出力する（Scope バナー・Mermaid 図・Markdown 表・`<details>`・設計判断表は出力禁止）。
+**Step 1 の確認事項**:
+- リポジトリ内の `CLAUDE.md` / `AGENTS.md` やユーザー指示に「絵文字禁止」がある場合は **Text-Only モード**（`--badge-mode text`: `[SCOPE]`, `[TARGET]`, `[MUST]`, `[SKIM]`, `[SKIP]`）を選択する。
+- テスト通過状況は、CI 結果（`gh pr checks`）やローカル環境で安全に読み取り実行できた結果のみを事実として扱い、環境変数不足（DB DSN 未設定等）やパッチ単体入力で未実行の場合は正直に「未確認（環境変数未設定のためローカル実行不可 等）」と記載する。推測で「全テスト通過済み」と断定してはならない（`BR006`）。
+
+---
+
+### Step 2: Signal / Noise Triage & Boilerplate Filtering（ノイズ隔離と読むべき箇所の仕分け）
+
+`$TMP_TRIAGE` の出力（`summary`, `warnings`, `dependencies`, `files`, `ai_override_guidance`）と実 Diff を照合し、解説方針を確定します（詳細規則は [references/triage-rules.md](references/triage-rules.md) 参照）。
+
+1. **3 階層の仕分けと強制昇格の確認**
+   - `🧠 Must-Read`（`[MUST]`）: コアロジック、API 境界、認証・認可・決済・CI ワークフロー・DB マイグレーション等のリスクパス。
+   - `👀 Skim`（`[SKIM]`）: テストコード、ドキュメント、`import_path_only`（import 文のみの変更）、定型設定。
+   - `⏭️ Safe-to-Skip`（`[SKIP]`）: lockfile、自動生成コード、Drizzle/Prisma メタデータ、ビルド成果物、スナップショット、純粋な依存追加のみのマニフェスト。
+   - **警告フラグの精査**:
+     - `SUSPECTED_MANUAL_GEN_EDIT`: `DO NOT EDIT` 等の生成ファイルにスキーマ変更を伴わない手動編集や `TODO`/`HACK` がある場合、`Must-Read` に昇格させ「再生成で消える手動パッチの疑い」を必ず解説で警告する。
+     - `NON_DEPENDENCY_MANIFEST_CHANGE` / `LOCKFILE_WITHOUT_MANIFEST` / `TEST_SKIP_OR_ASSERTION_REMOVAL` が検出された場合も理由を確認し注意ポイントに載せる。
+2. **Read-Only ボイラープレート濾過（`boilerplate_heavy` 対応）**
+   - AI が生成した PR には、防衛的な多重 `None` チェック、薄いパススルーラッパー関数、自明な What コメント、冗長な `try/except` が混在しやすい。
+   - コードを書き換えて削る代わりに、**実 Diff を読んで本質ロジックと定型ボイラープレートを解説側で切り分ける**。
+   - `flags` に `"boilerplate_heavy"` があるファイルや冗長構造が目立つファイルでは、「`L220〜L250` の `create_order_summary` が金額計算と検証の本質ロジックであり、前半の補助ラッパー関数群は定型チェックのみのため流し読みでよい」のように具体的な行レンジ・関数名で読解負荷を下げる。
+3. **解説規模（Size S / M / L / XL）と特殊ケースの確定**
+   - **Size S**: `effective_files <= 2` かつ `effective_lines < 30` かつ本番コード変更が単一機能レイヤー以下（リスクパスや手動生成改変なし）。
+   - **Size M**: 標準的な機能追加・バグ修正（`effective_files <= 10`, `effective_lines <= 300`）。
+   - **Size L**: 複数レイヤー・DB スキーマ・非同期ワーカー等をまたぐ中〜大規模変更（`effective_files <= 20`, `effective_lines <= 600`）。
+   - **Size XL**: 巨大 PR（`effective_lines > 600`、`effective_files > 20`、推定読解 `> 45分`、または `>= 4層` かつ `> 400行`）。すでに出されている PR であるため、作成者への PR 分割要求ではなく **読み手が段階的に理解するための「分割読解ガイド（Reading Chunks）」** を用意する。
+   - **`summary.special_case` 別の扱い**:
+     - `empty_diff`: 差分が 0 件である旨と指定ブランチ／ベース参照の確認ポイントを簡潔に伝える。
+     - `skip_only`: lockfile や自動生成物のみの変更であることを伝え、マニフェストとの整合性（`LOCKFILE_WITHOUT_MANIFEST` の有無）と再生成コマンドの妥当性だけを案内する。
+     - `docs_or_config_only`: ドキュメント・CI 設定のみの変更を過剰に Size XL 扱いしない。ただし `.github/workflows/` 等の CI 変更は `Safe-to-Skip` に入れず読解対象として解説する。
+     - `deletion_heavy`: 不要機能・旧コード撤去が主体の PR。Scope バナーの客観的な `-N行` 表記は残しつつ、「スロップを N 行削減した」のような自慢表現は書かない（`BR006`）。
+
+---
+
+### Step 3: Visual & Verbal PR Briefing on Chat（Chat上での言葉＋図解によるPR解説）
+
+確定したサイズに応じて Chat 解説を組み立てます（文体と表現ルールは [references/japanese-pr-style.md](references/japanese-pr-style.md) 参照）。
+
+#### A. Size S の出力構成（小変更：本セクションが正本テンプレート）
+
+- **厳守事項**: Mermaid 図、`> 🎯 Scope:` バナー、Markdown 表、`<details>` 折りたたみは **一切出力しない**（`BR003_SIZE_S_OVERKILL`）。[references/mermaid-and-templates.md](references/mermaid-and-templates.md) も読み込まない。
+- 以下の構成で、言葉と箇条書きのみで明快に解説する：
 
 ```markdown
-## TL;DR
-<Why と外部から観測できる振る舞いの変化を最大3行・150字目安で記述>
+## 全体像
+<何の課題・バグに対するPRか（背景 Why）と、どこをどう変えて挙動がどう変わるようになったかを、自然な文章で3〜6行程度でわかりやすく説明する>
 
-## 検証ステータス
-- [x] `<実際に実行し成功を確認したコマンド>`（<通過件数・根拠>）
+## 主な変更と確認ポイント
+- `<ファイルパス>`（`<関数・クラス名>`）: <変更内容と入力・出力の振る舞い変化（機械的な行番号実況ではなく意味単位で説明）>
+- 依存パッケージ（追加・更新がある場合のみ）: `<パッケージ名>`（<導入理由を1文で説明>）
+- 確認ポイント: <追加テストの内容、実行確認できた結果または未確認事項、既存PR説明文との差異があれば明記>
 ```
 
-- 依存追加が伴う Size S のみ、`## TL;DR` 本文直下に `- 依存追加: <pkg>（導入理由1行）` を 1 行だけ添えてよい。
-- 未実行テストや手動確認項目がある場合は `## 検証ステータス` に `- [ ] <項目と未実行理由>` を追記する。
+#### B. Size M / L / XL の出力構成（中〜大規模変更）
 
-### 3.2 Size M / L / XL の出力方針とテンプレート統合
+作成前に [references/mermaid-and-templates.md](references/mermaid-and-templates.md) を読み込み、以下の 5 セクション構成で出力します（Text-Only モード時は絵文字を `[SCOPE]` / `[TARGET]` / `[MUST]` / `[SKIM]` / `[SKIP]` に統一し、一切混在させない）。
 
-`references/mermaid-and-templates.md` と `references/japanese-pr-style.md` を読み込み、次の規則で本文を組み立てる。
+1. **`## 全体像（なぜ・何を変えたPRか）`**（または `## 全体像`）
+   - **3〜10行目安（上限12行、`BR002`）** の自然な日本語で、従来の課題（Why）・今回の解決アプローチ・変更後の処理ストーリーを言葉で丁寧に説明する（必要に応じて要点箇条書きを併用可）。
+   - セクション末尾に **Scope バナー** を置く（`BR004`）：
+     `> 🎯 Scope: 総差分 <total_files>ファイル (+<added>/-<deleted>行) → 実質読むべき箇所 <effective_files>ファイル (<effective_lines>行) | 推定読解: 約<min>〜<max>分 | Size <M|L|XL>`
+2. **`## 仕組み・処理フロー`**
+   - 変更の性質に最も合う Mermaid 図を **1〜2 図（上限 3 図、`BR007`）** 作成する：
+     - コンポーネント関係・責務境界の変更 → `flowchart LR`（または `TD`）
+     - API・DB・非同期ワーカーの時系列連携 → `sequenceDiagram`
+     - ステータス・リトライ・ライフサイクル遷移 → `stateDiagram-v2`
+     - テーブル新設・外部キー構造の変更 → `erDiagram`
+   - **図の前後の言語補足（必須、`BR010`）**: 図の前に「この図が示す全体構造」、図の後に「今回の PR で新設・変更された経路と注目すべきデータの流れ」を **2〜4行以上の散文または箇条書き** で必ず説明する。
+   - **Mermaid GFM 安全規約（`BR007`〜`BR009`）**:
+     - 1 図あたりユニークノード／アクター数は **8 個以下目安（絶対上限 10 個）**。
+     - 括弧・スラッシュ・コロン・日本語等を含むラベルは必ず `"..."` で囲む。生 `<>` 禁止（改行は `<br/>`）、`:::` 短縮記法禁止、予約語裸 ID（`end`, `default`, `class`, `style` 等）禁止。
+     - `classDef` は **`flowchart` のみ** で使用し、必ず `color:#000` を含む規定 4 色（`added`: `fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#000` / `modified`: `fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#000` / `risk`: `fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#000` / `base`: `fill:#f3f4f6,stroke:#6b7280,stroke-width:1px,color:#000`）を使う。
+3. **`## 主な変更ポイントと設計判断`**
+   - 変更を意味のあるまとまりごとに言葉で解説する。`- **変更点**: 〜` や `- **改善点**: 〜` のような分類ラベル太字箇条書きは禁止（`BR015`）。
+   - `dependencies` に追加・更新パッケージがある場合は、**すべてのパッケージ名と導入理由を 1 行で明記**する（`BR013`）。
+   - 複数の設計案・トレードオフがある変更（特に Size L / XL）では、`◎ / ○ / △ / ×` を用いた **設計判断の比較表** を添えて「なぜこの方式を採っているか」を明確にする。
+4. **`## 読む順番ガイド`**
+   - `### 🎯 読むべきファイル`（Text-Only 時は `### [TARGET] 読むべきファイル`）を置き、`must_read` 全件を漏れなく含めて **人間の理解が最もスムーズに進む順序**（例：DBスキーマ・型／値オブジェクト → ドメイン／コアロジック → ワーカー／APIハンドラ → ルーティング → `👀 Skim` のテスト・ドキュメントは後半）で番号付き表にする（単純アルファベット順の羅列は避ける、`BR012`）。
+   - 表の「変更・注目ポイント」列には、核心の関数名・行レンジに加え、冗長な防衛コードやラッパーがある場合の **ボイラープレート読み飛ばし案内** を具体的に書く。
+   - ノイズ比率が高い場合（`noise_ratio_pct >= 30%` かつ `safe_to_skip_lines >= 50` かつ非ゼロ区分 2 つ以上）は `pie showData` で実質コードとノイズ行数の内訳を図示する（値 `0` のスライスは入れない）。
+   - `safe_to_skip_files > 0` の場合は、必ず `<details><summary>⏭️ Safe-to-Skip（自動生成・ロックファイル等 N件 / +A -D行）</summary>...</details>`（Text-Only 時は `[SKIP]`）で折りたたむ（`BR011`）。
+5. **`## 注意・確認ポイント`**
+   - 生成ファイルの手動改変疑い（`SUSPECTED_MANUAL_GEN_EDIT`）、テスト `.skip`・アサーション削除、DB マイグレーションやレスポンス形式変更などの破壊的変更リスク、未実行テストの条件を整理する。
+   - **PR 作成者説明文とのギャップ**: 既存 PR 本文に実 Diff と食い違う記述（誤った定数値、未実装機能の記載、根拠のないテスト全パス宣言等）がある場合は、実コードの該当箇所を示して穏やかかつ明確に指摘する。
+   - **Size XL 時の分割読解ガイド（Reading Chunks）**: 巨大な PR を 2〜4 個のテーマ別チャンク（例：Chunk 1 データ層 → Chunk 2 非同期処理層 → Chunk 3 API・テスト層）に分け、チャンクごとの所要時間目安と確認観点を案内する。
 
-- **標準骨格と連番詰め**: `## TL;DR` ＋ Scope バナー → `## 1. アーキテクチャ比較（Before / After）` →（必要時）`## 2. 振る舞い・エッジケース図解` → `## 3. 差分トリアージと読むべきコード` →（トレードオフ時）`## 4. 設計判断マトリクス` → `## 5. 検証ステータス`。任意節を省く場合は空見出しを残さず番号を詰める。
-- **既存 PR テンプレート統合**: `--template-mode strict` 時は元テンプレートの見出し名・順序を一切変えず各見出し配下へ要素を差し込む。`merge` 時は Human-First PR 骨格を主軸にしつつ、`Closes #...`・破壊的変更チェック・DB マイグレーション欄・チェックリストを欠落なく引き継ぎ、ガイド用 HTML コメント（Bot マーカー除く）は削除する。
-- **読むべきファイル表**: `🧠 Must-Read` → `👀 Skim` の順かつ理解しやすい順（型・スキーマ契約 → コアロジック → 呼び出し元・結線 → テスト）に並べる。アルファベット順は禁止。
-- **Mermaid GFM 安全制約**: 1 図最大 8〜10 ノード（`Before`+`After` 合算）、主図解 1〜2 個（＋条件満たす場合の定量 `pie showData` 1 個）、特殊文字・矢印ラベルの `"..."` クォート必須、`classDef` は `flowchart` 限定かつ規定 4 色（`color:#000`）、`:::` 短縮記法と予約語裸 ID（`end` 等）禁止。
-- **バッジモード統一**: 装飾絵文字（🚀✨⚠️ 等）は全面禁止。既定は許可バッジ 4 種（`🎯` / `🧠` / `👀` / `⏭️`）を所定位置のみに使い、絵文字禁止環境では `[SCOPE]` / `[TARGET]` / `[MUST]` / `[SKIM]` / `[SKIP]` で統一して混在させない。
+#### C. Size M / L / XL の標準骨格（出力イメージ）
 
-### 3.3 Mode B（既存 PR 本文・下書き書き直し）の固有手順
+````markdown
+## 全体像（なぜ・何を変えたPRか）
+<背景課題 Why・解決アプローチ・変更後の流れを自然な言葉で3〜10行で解説>
 
-既存の PR 本文や下書きファイル（例: `bad_pr_body.md`）を再構成する場合は、次を徹底する。
+> 🎯 Scope: 総差分 <total_files>ファイル (+<add>/-<del>行) → 実質読むべき箇所 <effective_files>ファイル (<effective_lines>行) | 推定読解: 約<min>〜<max>分 | Size <M|L|XL>
 
-1. 既存ファイルを読むか `gh pr view` で現行本文を取得し、保持すべき Issue 参照（`Closes #...`）と未確認チェック項目だけを抜き出す。
-   ```bash
-   gh pr view <PR_NUMBER> --json title,body,baseRefName,headRefName 2>/dev/null || true
-   ```
-2. 元文の「テスト全パス」「大幅高速化」などの記述は根拠として採用せず、`git diff` と実実行した検証結果だけで書き直す（未実行・環境不足で落ちる項目は `- [ ]` へ降格）。
-3. 元の文体（敬体指定テンプレート等）が明示されている場合のみ文体を合わせ、それ以外は常体で簡潔に記述する。
-4. 明白なスロップを見つけても PR 本文へは書かず、最終回答の末尾に 1〜3 行の任意クリーンアップ候補メモとして添える。
+## 仕組み・処理フロー
+<図の前に2〜4行で、この図が示す構造やリクエストの流れを言葉で導入する>
 
-### 3.4 `pr_body_lint.py` による自己検証と出力
-
-ドラフトを `"$TMP_DIR/pr_draft.md"` へ保存し、`pr_body_lint.py` で機械検証する（`--yomiyasu-lint` 指定時は導入済み環境の `yomiyasu_lint.py --doc-type pr` も自動実行・ポストフィルタ統合され、未導入環境では無言スキップされる）。
-
-```bash
-python3 <skill-dir>/scripts/pr_body_lint.py \
-  --size {S,M,L,XL} \
-  --triage-json <path> \
-  [--template <path> --template-mode {merge,strict}] \
-  [--badge-mode {auto,emoji,text}] \
-  [--yomiyasu-lint] \
-  --json < "$TMP_DIR/pr_draft.md"
+```mermaid
+flowchart LR
+  classDef added fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#000
+  classDef modified fill:#fef9c3,stroke:#ca8a04,stroke-width:2px,color:#000
+  classDef risk fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#000
+  classDef base fill:#f3f4f6,stroke:#6b7280,stroke-width:1px,color:#000
+  apiNode["API Handler"] -->|"検証・永続化"| svcNode["Domain Service"]
+  class apiNode modified
+  class svcNode added
 ```
 
-1. `status == "FAIL"`（終了コード `1`）が出た場合は `findings[]` を確認して下表に従い修正し、**終了コード `0`（`counts.fail == 0`）** になるまで再実行する。
+<図の後に2〜4行で、新設・変更された境界やデータの受け渡しポイントを補足する>
 
-| 検出 Rule ID | 主な原因 | 対処アクション |
-|---|---|---|
-| `PR001`〜`PR004` | TL;DR 欠落/超過、Size S 禁止要素、Scope 欠落 | TL;DR を 3 行・150 字目安へ圧縮、Size S なら図表削除、Size M 以上は Scope バナー補完 |
-| `PR005` / `PR006` / `PR016` / `PR018` / `PR019` | AI クリシェ、削減自慢、What 実況、分類ラベル、漢字「事/為」 | 具体挙動へ置換、削減表現削除、分類太字を外し 1 文統合、ひらがな化 |
-| `PR007`〜`PR009` / `PR017` | ノード超過、クォート漏れ、`classDef` 不備、GFM 非互換構文 | 責務単位で 10 ノード以下へ集約、特殊文字ラベル囲み、`color:#000` と `class` 行分離 |
-| `PR010`〜`PR015` | `<details>` / `must_read` / 依存理由欠落、`[x]` 根拠不足、絵文字/見出し違反 | Skip 折りたたみ・理解順表・1 行理由を補完、未確認は `[ ]` へ移しバッジモード統一 |
+## 主な変更ポイントと設計判断
+- <意味単位の変更ポイント解説（分類ラベル太字は使わない）>
+- 依存追加（該当する場合）: `<pkg>`（<導入理由を1文で説明>）
+<代替案とのトレードオフがある場合のみ ◎/○/△/× 比較表を配置>
 
-2. `/yomiyasu` 連携時でも `yomiyasu-check:` 等の内部レポート見出しは出力本文へ含めない。
-3. 指定出力先（例: `outputs/pr_body.md`）へ上書き保存またはチャット上に出力し、`rm -rf "$TMP_DIR"` で一時ディレクトリを削除する。
-4. GitHub 上への新規作成・上書き更新（`gh pr create` / `gh pr edit`）が必要な場合は、タイトル・ベースブランチ・ヘッドブランチ・出力本文を提示し、ユーザーの明示承認を得てから実行する。
+## 読む順番ガイド
+### 🎯 読むべきファイル
+| 優先順 | ファイル | 区分 | 変更・注目ポイント |
+|---|---|---|---|
+| 1 | `path/to/core.py` | 🧠 Must-Read | `func_name`（L40〜L75）が核心。前半の定型ラッパーは流し読み可 |
+| 2 | `tests/test_core.py` | 👀 Skim | 正常系・境界値の期待挙動を確認 |
+
+<details>
+<summary>⏭️ Safe-to-Skip（自動生成・ロックファイル等 N件 / +A -D行）</summary>
+
+- `uv.lock` (+2998/-3): `pyproject.toml` の依存更新に伴うロックファイル差分
+
+</details>
+
+## 注意・確認ポイント
+- <生成ファイル手動改変警告・DB移行確認・テスト未確認条件・既存PR説明文との食い違い等>
+````
 
 ---
 
-## 完了前セルフチェックと例外フォールバック
+## 4. 出力前セルフリント（`pr_briefing_lint.py` 必須実行）
 
-### 完了前セルフチェック（出力直前）
+Chat へ最終回答を出す前に、解説ドラフトを一時ファイル `$TMP_BRIEFING` に書き出し、必ず以下のセルフリントを実行します。
 
-- [ ] `pr_body_lint.py` が終了コード `0` で通過した（`PR001`〜`PR019` の FAIL 0 件）
-- [ ] 無断の `git commit`・`git push`・`gh pr create`・`gh pr edit` を行っていない
-- [ ] 未実行・環境不足で失敗したテストを `[x]` にせず、`[ ]` と理由で分離した
-- [ ] Gate 1 削減量アピール・AI クリシェ・What 実況・分類ラベル箇条書きが含まれない
-- [ ] 一時ディレクトリ（`"$TMP_DIR"`）を削除し、対象リポジトリを作業ゴミで汚していない
+```bash
+python3 <skill-dir>/scripts/pr_briefing_lint.py "$TMP_BRIEFING" \
+  --size <S|M|L|XL> \
+  --triage-json "$TMP_TRIAGE" \
+  [--badge-mode {auto,emoji,text}] \
+  --yomiyasu-lint \
+  --json
+```
 
-### 例外・フォールバック対処
+### 検査ルール一覧（`BR001`〜`BR016`）
 
-| 発生状況 | 対処方針 |
-|---|---|
-| テスト環境未整備・DB/API キー不足でローカル失敗 | 動作リスクのある Gate 1 リファクタを控え、検証ステータスで `[ ]` と失敗理由を事実どおり記載する |
-| `gh` CLI 未導入・未認証 | Base ブランチ特定は `pr_diff_triage.py` の純ローカル Git 解決に任せ、PR 本文はファイルまたはチャット出力にとどめる |
-| 対象リポジトリの差分が空（`empty_diff`） | PR 本文を生成せず、比較ベースブランチや未保存変更の有無をユーザーへ確認する |
-| `Size XL` かつ分割不要とユーザーが指示 | 冒頭の `> [!WARNING]` を残したまま 1 本版ドラフトを採用し、Mermaid は責務単位の抽象化（10 ノード以下）を維持する |
+| Rule ID | 対象 | 重大度 | 検査内容 |
+|---|---|---|---|
+| `BR001_OVERVIEW_MISSING` | ALL | FAIL | 冒頭の全体像セクション（`## 全体像` 等）と導入説明文が存在するか |
+| `BR002_OVERVIEW_LENGTH` | ALL | WARN/FAIL | 全体像が短すぎないか（`<30字` WARN）、逆に長すぎないか（`>18行` 等 FAIL） |
+| `BR003_SIZE_S_OVERKILL` | S | FAIL | Size S で Mermaid 図・Scope バナー・表・`<details>` を出していないか |
+| `BR004_MISSING_SCOPE_SUMMARY` | M/L/XL | FAIL | `> 🎯 Scope:` または `> [SCOPE]` の見かけ行数 vs 実質行数サマリーがあるか |
+| `BR005_AI_CLICHE_DETECTED` | ALL | FAIL | 「堅牢性を向上」「包括的な」「シームレスに統合」等の日英 AI クリシェがないか |
+| `BR006_PR_AUTHOR_MODE_CONFUSION` | ALL | FAIL | PR テンプレ HTML コメント残存・未検証テスト完了断言・コード削減量自慢がないか |
+| `BR007_MERMAID_NODE_LIMIT` | M/L/XL | WARN/FAIL | Mermaid 総数 `<=3`、各図ユニークノード／アクター数 `<=10`（`9〜10` WARN）か |
+| `BR008_MERMAID_UNQUOTED_SPECIAL` | M/L/XL | FAIL | ラベル `"` クォート漏れ・予約語裸 ID・`:::`・生 `<>` 等の GFM 構文違反がないか |
+| `BR009_MERMAID_CLASSDEF_COLOR` | M/L/XL | WARN/FAIL | `flowchart` 限定の `classDef`・`color:#000` 必須・規定 4 色パレット準拠か |
+| `BR010_MERMAID_WITHOUT_PROSE` | M/L/XL | WARN | Mermaid 図を含むセクション内に、図を言葉で補足する文章・箇条書きがあるか |
+| `BR011_DETAILS_MISSING_FOR_SKIP` | M/L/XL | FAIL | `safe_to_skip_files > 0` のときに `<details>` / `<summary>` 折りたたみがあるか |
+| `BR012_READING_GUIDE_COVERAGE` | M/L/XL | WARN/FAIL | `must_read` 全パスが読む順番ガイドに含まれ、単純辞書順の羅列になっていないか |
+| `BR013_DEPENDENCY_EXPLANATION` | ALL | FAIL | `dependencies` の追加・更新パッケージ名が解説本文で説明されているか |
+| `BR014_EMOJI_HYGIENE` | ALL | WARN/FAIL | 許可 4 種（`🎯🧠👀⏭️`）以外の装飾絵文字がないか、絵文字／テキスト混在がないか |
+| `BR015_CLASSIFICATION_BOLD_LABEL` | ALL | FAIL | `- **変更点**: 〜` 等の分類ラベル太字箇条書きが使われていないか |
+| `BR016_AUXILIARY_KANJI` | ALL | WARN | 「する事」「する為」等の補助動詞・形式名詞漢字が残っていないか |
+
+- `FAIL` が 1 件でも出た場合はドラフトを修正して再実行し、**終了コード `0`**（かつ `WARN` も原則解消）を確認してから一時ファイルを削除し、完成した解説を Chat に出力する。
