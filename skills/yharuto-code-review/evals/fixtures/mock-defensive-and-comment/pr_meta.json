@@ -1,0 +1,15 @@
+{
+  "pr_number": 519,
+  "title": "feat(checkout): 決済サマリーバッジ表示更新とキャンペーン価格表示の追加",
+  "body": "チェックアウト画面の割引バッジ状態切り替え処理と価格表示フォーマッタのキャンペーンラベル対応を追加しました。",
+  "author": "checkout-dev",
+  "is_fork_pr": false,
+  "base_branch": "main",
+  "head_branch": "pr-branch",
+  "head_repo": "org/storefront",
+  "checks": [
+    {"name": "ci/lint", "status": "completed", "conclusion": "success"},
+    {"name": "ci/typecheck", "status": "completed", "conclusion": "success"},
+    {"name": "ci/unit-test", "status": "completed", "conclusion": "success"}
+  ]
+}

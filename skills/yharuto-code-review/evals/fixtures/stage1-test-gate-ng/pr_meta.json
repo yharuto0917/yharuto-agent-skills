@@ -1,0 +1,15 @@
+{
+  "pr_number": 101,
+  "title": "feat(billing): 返金処理に1回あたりの上限額と残高超過チェックを追加",
+  "body": "不正・誤操作による高額返金を防ぐため、1回あたり50,000円の上限チェック、負数・0円以下の入力拒否、および注文残高の累積超過チェックを追加しました。",
+  "author": "dev-member",
+  "is_fork_pr": false,
+  "base_branch": "main",
+  "head_branch": "pr-branch",
+  "head_repo": "org/commerce-service",
+  "checks": [
+    {"name": "ci/lint", "status": "completed", "conclusion": "success"},
+    {"name": "ci/typecheck", "status": "completed", "conclusion": "success"},
+    {"name": "ci/unit-test", "status": "completed", "conclusion": "success"}
+  ]
+}

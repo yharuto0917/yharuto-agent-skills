@@ -1,0 +1,15 @@
+{
+  "pr_number": 204,
+  "title": "feat(player): 動画プレイヤーの全画面切り替えと初期テーマ即時反映を追加",
+  "body": "独自コントロールUIに合わせた全画面表示トグル処理（src/player.ts, src/PlayerView.ts）を追加しました。\n\nTODO: PR概要にテーマ変更を追記する",
+  "author": "frontend-dev",
+  "is_fork_pr": false,
+  "base_branch": "main",
+  "head_branch": "pr-branch",
+  "head_repo": "org/talk-portal",
+  "checks": [
+    {"name": "ci/lint", "status": "completed", "conclusion": "success"},
+    {"name": "ci/typecheck", "status": "completed", "conclusion": "success"},
+    {"name": "ci/unit-test", "status": "completed", "conclusion": "failure"}
+  ]
+}

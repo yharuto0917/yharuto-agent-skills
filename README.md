@@ -24,9 +24,9 @@ npx skills add yharuto0917/yharuto-agent-skills --skill <skill-name>
 gh skill install yharuto0917/yharuto-agent-skills <skill-name>
 ```
 
-> 例: `fable-code-review` をインストールする場合
+> 例: `yharuto-code-review` をインストールする場合
 > ```bash
-> npx skills add yharuto0917/yharuto-agent-skills --skill fable-code-review
+> npx skills add yharuto0917/yharuto-agent-skills --skill yharuto-code-review
 > ```
 
 ---
@@ -39,9 +39,9 @@ gh skill install yharuto0917/yharuto-agent-skills <skill-name>
 | [`ai-sdk`](./skills/ai-sdk) | Vercel AI SDK を用いたチャット UI・ストリーミング・構造化出力・Tool Calling・RAG・MCP 連携の実装ガイド | `references/` |
 | [`clipboardCopy`](./skills/clipboardCopy) | macOS の `pbcopy` と同梱スクリプトを使い、エスケープ問題を回避して安全にテキストやコード断片をコピーするスキル | `scripts/` (Py / Sh / JS), `evals/` |
 | [`commit-message`](./skills/commit-message) | `git diff` / `git status` から Conventional Commits・Semantic Commits・日本語慣習に沿ったコミットメッセージを生成するスキル | `references/` |
-| [`fable-code-review`](./skills/fable-code-review) | 違和感の検知から仮説検証・確定/棄却・重要度付けまで、コードレビューにおける判断の型を提供するスキル | - |
 | [`google-genai`](./skills/google-genai) | Python 版 `google-genai` SDK による Gemini API（テキスト生成・マルチモーダル・Function Calling・ストリーミング）実装ツールキット | `references/`, `scripts/` |
 | [`useAdviser`](./skills/useAdviser) | 高難度な設計判断やリスクの高い変更時に、読み取り専用の上位モデルを Subagent（アドバイザー）として呼び出し助言を得るスキル | `references/`, `evals/` |
+| [`yharuto-code-review`](./skills/yharuto-code-review) | `Test Gate`・スキップ不能CI・AI Slop監査・別Agent敵対的検証を備えた6段階パイプラインの統合コードレビュースキル | `references/`, `guidelines/`, `scripts/`, `tests/`, `evals/` |
 | [`yharuto-presentation-skill-for-slidev`](./skills/yharuto-presentation-skill-for-slidev) | パステルアクセントの独自デザインシステムを Slidev デッキ（Vite / Vue）に適用するプレゼンテーション作成スキル | `assets/` (CSS / Vue) |
 
 ---
@@ -59,9 +59,9 @@ yharuto-agent-skills/
     ├── ai-sdk/
     ├── clipboardCopy/
     ├── commit-message/
-    ├── fable-code-review/
     ├── google-genai/
     ├── useAdviser/
+    ├── yharuto-code-review/
     └── yharuto-presentation-skill-for-slidev/
 ```
 
