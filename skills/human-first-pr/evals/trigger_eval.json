@@ -1,0 +1,82 @@
+[
+  {
+    "query": "チームメンバーが出した PR #234 の内容がよくわからないので、何のための変更かと処理の流れを Mermaid 図解つきで Chat でわかりやすく解説して。",
+    "should_trigger": true
+  },
+  {
+    "query": "別AIが実装した PR #412 が 2,800 行あって読む気が起きない。コードは触らなくていいから、ノイズを除いてどこから順番に読めばいいか整理して教えて。",
+    "should_trigger": true
+  },
+  {
+    "query": "pnpm-lock.yaml と OpenAPI の自動生成ファイルだらけで膨らんでいる feat/billing-v2 ブランチの PR について、本当に人間が読むべき箇所と変更の全体像を説明してほしい。",
+    "should_trigger": true
+  },
+  {
+    "query": "手元にダウンロードした pr_diff.patch の変更内容を噛み砕いて説明してもらえる？DBマイグレーションとワーカーの関係図も一緒に見たい。",
+    "should_trigger": true
+  },
+  {
+    "query": "PR #142 の作成者が書いた説明文が「堅牢性を向上」みたいな定型文ばかりで怪しい。実際の diff を根拠にして、何が本当に変わったのかと説明文との食い違いを教えて。",
+    "should_trigger": true
+  },
+  {
+    "query": "Can you walk me through https://github.com/acme/order-service/pull/518 on chat with a clean architecture diagram and a reading order? Read-only please, don't modify any files.",
+    "should_trigger": true
+  },
+  {
+    "query": "レビュー依頼が来た fix/null-date-format ブランチの小さな差分を見て、どんなバグをどう直した PR なのか手短にわかりやすく教えて。",
+    "should_trigger": true
+  },
+  {
+    "query": "/human-first-pr で現在のブランチ feat/async-outbox と main の差分を解析して、設計判断と読む順番ガイドを Chat に出して。",
+    "should_trigger": true
+  },
+  {
+    "query": "絵文字禁止のルールに合わせて、[SCOPE] や [MUST] のテキスト表記で PR #88 の変更ストーリーと依存ライブラリ追加の理由を解説して。",
+    "should_trigger": true
+  },
+  {
+    "query": "この巨大な PR、防衛的な null チェックや薄いラッパー関数が多くて本質のビジネスロジックが見つけにくい。各ファイルのどの行周辺を重点的に読めばいいか案内して。",
+    "should_trigger": true
+  },
+  {
+    "query": "このブランチ feat/oauth-pkce の実装が終わったので、.github/pull_request_template.md に沿って PR 本文を作成し、gh pr create で PR を出して。",
+    "should_trigger": false
+  },
+  {
+    "query": "既存 PR #123 の説明文がわかりにくいので、Mermaid 図入りの新しい説明文に gh pr edit で直接書き換えて更新して。",
+    "should_trigger": false
+  },
+  {
+    "query": "Write a polished GitHub pull request description for my current branch and open the PR on GitHub for me.",
+    "should_trigger": false
+  },
+  {
+    "query": "PR を出す前に、src/services/cart.ts に溜まっている AI 生成の冗長な try-catch や自明なコメントをリファクタして削除して。",
+    "should_trigger": false
+  },
+  {
+    "query": "PR #189 に N+1 クエリや認可バイパスなどのバグ・セキュリティ脆弱性がないか厳しくレビュー指摘して、Blocker を洗い出して。",
+    "should_trigger": false
+  },
+  {
+    "query": "いま git diff --staged にある変更から、Conventional Commits 形式で日本語のコミットメッセージを3案作って。",
+    "should_trigger": false
+  },
+  {
+    "query": "障害ポストモーテム docs/postmortem-2026-11.md の AI っぽい比喩や回りくどい日本語を、自然な文章に推敲して整えてほしい。",
+    "should_trigger": false
+  },
+  {
+    "query": "まだコードは1行も書いていない新規決済マイクロサービスの設計書 docs/payment-rfc.md に貼る Mermaid シーケンス図を作って。",
+    "should_trigger": false
+  },
+  {
+    "query": "PR を squash merge しようとしたら uv.lock でコンフリクトが出たんだけど、安全に解消する git コマンド手順を教えて。",
+    "should_trigger": false
+  },
+  {
+    "query": "Issue #205 で報告されている format_iso_date(None) の AttributeError を直すコードとユニットテストを実装してコミットして。",
+    "should_trigger": false
+  }
+]
