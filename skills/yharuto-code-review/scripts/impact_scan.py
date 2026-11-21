@@ -21,7 +21,9 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from _lib import (  # noqa: E402
     emit_json,
     fail_with_code,
+    filter_diff_by_files,
     normalize_rel_path,
+    parse_diff_header_file_path,
     read_verified_gate_state,
     run_subproc,
     sha256_file,
@@ -334,35 +336,54 @@ def get_diff_and_changed_files(
     preset_changed: Sequence[str] | None,
     audit_paths: Sequence[str],
     all_files: Sequence[str],
+    *,
+    review_base_sha: str = "",
+    only_files: Sequence[str] | None = None,
 ) -> tuple[list[str], str]:
-    if mode in ("pr", "range") and merge_base_sha and head_sha:
-        diff_res = run_subproc(["git", "diff", "-U0", merge_base_sha, head_sha], cwd=repo_dir, timeout=GIT_TIMEOUT_SECONDS)
+    effective_base = review_base_sha or merge_base_sha
+    only_set = {normalize_rel_path(f) for f in (only_files or ()) if f}
+
+    if mode in ("pr", "range") and effective_base and head_sha:
+        diff_res = run_subproc(["git", "diff", "-U0", effective_base, head_sha], cwd=repo_dir, timeout=GIT_TIMEOUT_SECONDS)
         diff_text = diff_res.stdout if diff_res and diff_res.returncode == 0 else ""
         if preset_changed is not None:
-            return list(preset_changed), diff_text
-        names_res = run_subproc(["git", "diff", "--name-only", "-z", merge_base_sha, head_sha], cwd=repo_dir, timeout=GIT_TIMEOUT_SECONDS)
-        changed = split_nul_paths(names_res.stdout) if names_res else []
+            changed = list(preset_changed)
+        else:
+            names_res = run_subproc(["git", "diff", "--name-only", "-z", effective_base, head_sha], cwd=repo_dir, timeout=GIT_TIMEOUT_SECONDS)
+            changed = split_nul_paths(names_res.stdout) if names_res else []
+        if only_set:
+            changed = [f for f in changed if normalize_rel_path(f) in only_set]
+            diff_text = filter_diff_by_files(diff_text, only_set)
         return changed, diff_text
 
     if mode == "local":
         git_check = run_subproc(["git", "rev-parse", "--is-inside-work-tree"], cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         if git_check is None or git_check.returncode != 0:
             changed_fallback = list(preset_changed) if preset_changed is not None else list(all_files)
+            if only_set:
+                changed_fallback = [f for f in changed_fallback if normalize_rel_path(f) in only_set]
             snap_lines: list[str] = []
             for rel in changed_fallback:
                 p = workdir / rel
                 if p.is_file() and p.suffix.lower() in CODE_EXTENSIONS:
                     try:
+                        snap_lines.append(f"diff --git a/{rel} b/{rel}")
+                        snap_lines.append("--- /dev/null")
                         snap_lines.append(f"+++ b/{rel}")
                         snap_lines.extend("+" + ln for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines())
                     except OSError:
                         continue
             return changed_fallback, "\n".join(snap_lines)
 
+        use_since_ref = bool(review_base_sha and review_base_sha != head_sha)
         head_chk = run_subproc(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         has_head = head_chk is not None and head_chk.returncode == 0
-        diff_cmd = ["git", "diff", "-U0", "HEAD"] if has_head else ["git", "diff", "--cached", "-U0"]
-        names_cmd = ["git", "diff", "--name-only", "-z", "HEAD"] if has_head else ["git", "diff", "--cached", "--name-only", "-z"]
+        if use_since_ref:
+            diff_cmd = ["git", "diff", "-U0", review_base_sha]
+            names_cmd = ["git", "diff", "--name-only", "-z", review_base_sha]
+        else:
+            diff_cmd = ["git", "diff", "-U0", "HEAD"] if has_head else ["git", "diff", "--cached", "-U0"]
+            names_cmd = ["git", "diff", "--name-only", "-z", "HEAD"] if has_head else ["git", "diff", "--cached", "--name-only", "-z"]
         diff_res = run_subproc(diff_cmd, cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         names_res = run_subproc(names_cmd, cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         untracked_res = run_subproc(
@@ -378,11 +399,16 @@ def get_diff_and_changed_files(
             p = workdir / rel
             if p.is_file() and p.suffix.lower() in CODE_EXTENSIONS:
                 try:
+                    extra_lines.append(f"diff --git a/{rel} b/{rel}")
+                    extra_lines.append("--- /dev/null")
                     extra_lines.append(f"+++ b/{rel}")
                     extra_lines.extend("+" + ln for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines())
                 except OSError:
                     continue
         diff_text = (diff_res.stdout if diff_res else "") + ("\n" + "\n".join(extra_lines) if extra_lines else "")
+        if only_set:
+            changed = [f for f in changed if normalize_rel_path(f) in only_set]
+            diff_text = filter_diff_by_files(diff_text, only_set)
         return changed, diff_text
 
     # audit mode
@@ -399,11 +425,15 @@ def get_diff_and_changed_files(
         ]
     else:
         filtered = list(preset_changed) if preset_changed is not None else list(all_files)
+    if only_set:
+        filtered = [f for f in filtered if normalize_rel_path(f) in only_set]
     sampled_lines: list[str] = []
     for rel in filtered[:40]:
         fpath = workdir / rel
         if fpath.is_file() and fpath.suffix.lower() in CODE_EXTENSIONS:
             try:
+                sampled_lines.append(f"diff --git a/{rel} b/{rel}")
+                sampled_lines.append("--- /dev/null")
                 sampled_lines.append(f"+++ b/{rel}")
                 sampled_lines.extend("+" + ln for ln in fpath.read_text(encoding="utf-8", errors="ignore").splitlines()[:300])
             except OSError:
@@ -415,10 +445,22 @@ def extract_changed_symbols(diff_text: str) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
     current_file = ""
+    in_header = True
 
     for line in diff_text.splitlines():
-        if line.startswith("+++ b/"):
-            current_file = line[6:].strip()
+        if line.startswith("diff --git "):
+            in_header = True
+            current_file = ""
+            continue
+        if in_header:
+            plus_path = parse_diff_header_file_path(line, "+++ ")
+            if plus_path is not None:
+                in_header = False
+                current_file = "" if plus_path == "/dev/null" else plus_path
+                continue
+            if line.startswith("@@ "):
+                in_header = False
+                continue
             continue
         if current_file and is_non_production_path(current_file):
             continue
@@ -745,6 +787,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     state: dict[str, object] = {}
     preset_changed: list[str] | None = None
     audit_paths: list[str] = []
+    review_base_sha = ""
+    only_files: list[str] = []
 
     if args.session is not None:
         session_dir = Path(str(args.session)).expanduser().resolve()
@@ -754,10 +798,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo_dir = Path(str(state.get("repo_dir") or workdir)).resolve()
         mode = str(state.get("mode") or "local")
         merge_base_sha = str(state.get("merge_base_sha") or state.get("base_sha") or "")
+        review_base_sha = str(state.get("review_base_sha") or "")
         head_sha = str(state.get("head_sha") or "")
         ch_raw = state.get("changed_files")
         if isinstance(ch_raw, list):
             preset_changed = [str(x) for x in ch_raw]
+        of_raw = state.get("only_files")
+        if isinstance(of_raw, list):
+            only_files = [str(x) for x in of_raw]
         ap_raw = state.get("audit_paths")
         if isinstance(ap_raw, list):
             audit_paths = [str(x) for x in ap_raw]
@@ -803,6 +851,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         preset_changed=preset_changed,
         audit_paths=audit_paths,
         all_files=all_files,
+        review_base_sha=review_base_sha,
+        only_files=only_files,
     )
 
     backend = choose_search_backend(workdir)

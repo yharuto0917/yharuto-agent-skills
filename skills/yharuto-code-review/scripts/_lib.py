@@ -755,15 +755,28 @@ def detect_ci_script_hazard_in_diff(diff_text: str) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     current_file = ""
     in_ci_config = False
+    in_header = True
 
     for raw_line in diff_text.splitlines():
-        if raw_line.startswith("+++ b/"):
-            current_file = raw_line[6:].strip()
-            in_ci_config = is_ci_config_path(current_file)
-            continue
-        if raw_line.startswith("+++ /dev/null"):
+        if raw_line.startswith("diff --git "):
+            in_header = True
             current_file = ""
             in_ci_config = False
+            continue
+        if in_header:
+            plus_path = parse_diff_header_file_path(raw_line, "+++ ")
+            if plus_path is not None:
+                in_header = False
+                if plus_path == "/dev/null":
+                    current_file = ""
+                    in_ci_config = False
+                else:
+                    current_file = plus_path
+                    in_ci_config = is_ci_config_path(current_file)
+                continue
+            if raw_line.startswith("@@ "):
+                in_header = False
+                continue
             continue
         if not in_ci_config:
             continue
@@ -824,6 +837,107 @@ def detect_ci_script_hazard_in_files(workdir: Path) -> tuple[bool, list[str]]:
 
 
 ALLOWED_STAGE1_SKIP_STATUSES: frozenset[str] = frozenset({"NG", "SKIPPED_BY_FLAG"})
+TEST_CHECK_TOOLS: frozenset[str] = frozenset({"test", "python_test"})
+GH_TEST_CHECK_WORD_RE = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:tests?|testing|specs?|pytest|unittests?|jest|vitest|mocha|rspec|phpunit|junit|e2e|playwright|cypress|nextest)"
+    r"(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+GH_TEST_CHECK_CAMEL_RE = re.compile(r"(?<=[a-z])(?:Tests?|Specs?)(?![a-z])")
+GH_FAIL_STATUS_TOKENS: frozenset[str] = frozenset(
+    {
+        "FAIL",
+        "FAILED",
+        "FAILURE",
+        "ERROR",
+        "CANCEL",
+        "CANCELLED",
+        "CANCELED",
+        "TIMED_OUT",
+        "ACTION_REQUIRED",
+        "STARTUP_FAILURE",
+        "STALE",
+    }
+)
+
+
+def reset_stage5_state() -> dict[str, object]:
+    """Return a clean unvalidated Stage 5 state dictionary."""
+    return {
+        "validated": False,
+        "review_file": None,
+        "review_sha256": None,
+        "mode": None,
+        "verdict": None,
+        "validated_at": None,
+    }
+
+
+def is_test_check_name(check_name: str) -> bool:
+    """Return True if a CI check name represents a test suite rather than lint/build/etc."""
+    cleaned = check_name.strip()
+    if not cleaned:
+        return False
+    return GH_TEST_CHECK_WORD_RE.search(cleaned) is not None or GH_TEST_CHECK_CAMEL_RE.search(cleaned) is not None
+
+
+def _is_gh_failed_status_token(raw_status: str) -> bool:
+    tokens = [tok for tok in re.split(r"[\s()/,]+", raw_status.strip().upper()) if tok]
+    return any(tok in GH_FAIL_STATUS_TOKENS for tok in tokens)
+
+
+def extract_failed_gh_check_names(lines: Sequence[str]) -> list[str]:
+    """Extract failing check names from `gh pr checks` TSV lines or `name: STATUS` summary lines."""
+    failed_names: list[str] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "\t" in line:
+            cols = [c.strip() for c in line.split("\t")]
+            if len(cols) >= 2 and cols[0] and _is_gh_failed_status_token(cols[1]):
+                failed_names.append(cols[0])
+            continue
+        if ": " in line:
+            name_part, status_part = line.rsplit(": ", 1)
+            if name_part.strip() and _is_gh_failed_status_token(status_part):
+                failed_names.append(name_part.strip())
+    return failed_names
+
+
+def find_stage2_test_failures(checks: object) -> list[str]:
+    """Return tool labels for Stage 2 checks that represent failing tests (status == 'failed')."""
+    if not isinstance(checks, list):
+        return []
+    failed_tools: list[str] = []
+    for chk in checks:
+        if not isinstance(chk, dict) or chk.get("status") != "failed":
+            continue
+        tool = str(chk.get("tool") or "").strip()
+        if tool in TEST_CHECK_TOOLS:
+            failed_tools.append(tool)
+            continue
+        if tool == "gh_pr_checks":
+            raw_failed_checks = chk.get("failed_checks")
+            if isinstance(raw_failed_checks, list):
+                if any(isinstance(name, str) and is_test_check_name(name) for name in raw_failed_checks):
+                    failed_tools.append(tool)
+                continue
+            summary_lines = chk.get("summary_lines")
+            if isinstance(summary_lines, list):
+                str_lines = [ln for ln in summary_lines if isinstance(ln, str)]
+                if any(is_test_check_name(name) for name in extract_failed_gh_check_names(str_lines)):
+                    failed_tools.append(tool)
+    return failed_tools
+
+
+def has_stage2_test_failure(state: Mapping[str, object]) -> bool:
+    """Return True when recorded Stage 2 checks contain a regression test failure."""
+    stage2 = state.get("stage2")
+    if not isinstance(stage2, dict):
+        return False
+    return len(find_stage2_test_failures(stage2.get("checks"))) > 0
 
 
 def is_stage1_passed_or_skipped(state: Mapping[str, object]) -> bool:
@@ -832,6 +946,422 @@ def is_stage1_passed_or_skipped(state: Mapping[str, object]) -> bool:
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
     if s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
         return True
-    if bool(state.get("skip_test", False)) and s1_status in ALLOWED_STAGE1_SKIP_STATUSES:
+    if (
+        bool(state.get("skip_test", False))
+        and not bool(state.get("skip_test_revoked", False))
+        and not has_stage2_test_failure(state)
+        and s1_status in ALLOWED_STAGE1_SKIP_STATUSES
+    ):
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Re-review Scope Filtering & Cross-Session Review History
+# ---------------------------------------------------------------------------
+
+MAX_HISTORY_ENTRIES = 30
+_C_ESCAPE_BYTES: Mapping[str, int] = {
+    "a": 0x07,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+    "v": 0x0B,
+    "\\": 0x5C,
+    '"': 0x22,
+}
+
+
+def normalize_only_files(raw_entries: Sequence[str] | None) -> list[str]:
+    """Normalize repeatable/comma-separated --only-files entries into unique repo-relative POSIX paths."""
+    if raw_entries is None:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_entries:
+        for part in str(raw_item).split(","):
+            cleaned = part.strip()
+            if not cleaned:
+                continue
+            raw_norm = normalize_rel_path(cleaned)
+            p = Path(raw_norm)
+            if not raw_norm or p.is_absolute() or ".." in p.parts:
+                fail_with_code(
+                    f"Invalid --only-files path '{cleaned}': must be a repository-relative path without '..'.",
+                    2,
+                )
+            canonical = normalize_rel_path(p.as_posix()).rstrip("/")
+            if not canonical or canonical == ".":
+                fail_with_code(
+                    f"Invalid --only-files path '{cleaned}': must be a repository-relative path without '..'.",
+                    2,
+                )
+            if canonical not in seen:
+                seen.add(canonical)
+                result.append(canonical)
+    if not result:
+        fail_with_code(
+            "Empty --only-files value: provide at least one repository-relative file path.",
+            2,
+        )
+    return result
+
+
+def _unquote_git_path(raw: str) -> str:
+    """Decode a Git C-quoted path (if wrapped in double quotes) into UTF-8 text."""
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        inner = raw[1:-1]
+        buf = bytearray()
+        i = 0
+        n = len(inner)
+        while i < n:
+            ch = inner[i]
+            if ch == "\\" and i + 1 < n:
+                nxt = inner[i + 1]
+                if nxt in _C_ESCAPE_BYTES:
+                    buf.append(_C_ESCAPE_BYTES[nxt])
+                    i += 2
+                    continue
+                if nxt in "01234567" and i + 3 < n and all(c in "01234567" for c in inner[i + 1 : i + 4]):
+                    buf.append(int(inner[i + 1 : i + 4], 8) & 0xFF)
+                    i += 4
+                    continue
+                buf.extend(nxt.encode("utf-8"))
+                i += 2
+                continue
+            buf.extend(ch.encode("utf-8"))
+            i += 1
+        return buf.decode("utf-8", errors="replace")
+    return raw
+
+
+def parse_diff_header_file_path(raw_line: str, prefix: str) -> str | None:
+    """Parse a unified diff file header line ('+++ ', '--- ', 'rename to ', 'rename from ')."""
+    if not raw_line.startswith(prefix):
+        return None
+    payload = raw_line[len(prefix) :].rstrip("\r\n")
+    if not payload:
+        return None
+    if payload == "/dev/null":
+        return "/dev/null"
+    if payload.startswith('"'):
+        # Extract up to closing unescaped double quote (ignoring optional trailing tab/timestamp)
+        i = 1
+        n = len(payload)
+        while i < n:
+            if payload[i] == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if payload[i] == '"':
+                payload = payload[: i + 1]
+                break
+            i += 1
+        decoded = _unquote_git_path(payload)
+    else:
+        if "\t" in payload:
+            payload = payload.split("\t", 1)[0]
+        decoded = payload
+    if prefix == "+++ ":
+        if decoded.startswith("b/"):
+            decoded = decoded[2:]
+        else:
+            return None
+    elif prefix == "--- ":
+        if decoded.startswith("a/"):
+            decoded = decoded[2:]
+        else:
+            return None
+    return normalize_rel_path(decoded)
+
+
+def _consume_git_quoted_token(text: str, start: int) -> tuple[str, int]:
+    i = start + 1
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if text[i] == '"':
+            return _unquote_git_path(text[start : i + 1]), i + 1
+        i += 1
+    return _unquote_git_path(text[start:]), n
+
+
+def _extract_git_diff_header_paths(diff_git_line: str) -> tuple[str, str]:
+    rest = diff_git_line[len("diff --git ") :].rstrip("\r\n")
+    if not rest:
+        return "", ""
+
+    def _strip_ab(val: str, pref: str) -> str:
+        return normalize_rel_path(val[len(pref) :] if val.startswith(pref) else val)
+
+    # Case 1: first token is C-quoted
+    if rest.startswith('"'):
+        tok1, idx = _consume_git_quoted_token(rest, 0)
+        rem = rest[idx:].lstrip(" ")
+        if rem.startswith('"'):
+            tok2, _ = _consume_git_quoted_token(rem, 0)
+        else:
+            tok2 = rem
+        return _strip_ab(tok1, "a/"), _strip_ab(tok2, "b/")
+
+    # Case 2: first token unquoted, second token C-quoted (e.g. `a/plain.py "b/tab\t.py"`)
+    q_marker = ' "b/'
+    q_idx = rest.find(q_marker)
+    if rest.startswith("a/") and q_idx > 2 and rest.endswith('"'):
+        tok1 = rest[:q_idx]
+        tok2, _ = _consume_git_quoted_token(rest, q_idx + 1)
+        return _strip_ab(tok1, "a/"), _strip_ab(tok2, "b/")
+
+    # Case 3: both unquoted — exact midpoint match handles paths containing ' b/' when old == new
+    if rest.startswith("a/") and (len(rest) - 1) % 2 == 0:
+        mid = (len(rest) - 1) // 2
+        if rest[mid] == " " and rest[mid + 1 :].startswith("b/") and rest[2:mid] == rest[mid + 3 :]:
+            path_val = normalize_rel_path(rest[2:mid])
+            return path_val, path_val
+
+    marker = " b/"
+    idx = rest.rfind(marker)
+    if rest.startswith("a/") and idx > 2:
+        return normalize_rel_path(rest[2:idx]), normalize_rel_path(rest[idx + 3 :])
+    return "", ""
+
+
+def filter_diff_by_files(diff_text: str, allowed_files: set[str]) -> str:
+    """Filter unified diff to files in allowed_files (matching git diff --name-only semantics)."""
+    if not diff_text or not allowed_files:
+        return ""
+    norm_allowed = {normalize_rel_path(f) for f in allowed_files if f}
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    in_git_block = False
+
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("diff --git "):
+            if current:
+                blocks.append(current)
+            current = [raw_line]
+            in_git_block = True
+        elif not in_git_block and parse_diff_header_file_path(raw_line, "+++ ") is not None:
+            if current:
+                blocks.append(current)
+            current = [raw_line]
+        else:
+            if current:
+                current.append(raw_line)
+    if current:
+        blocks.append(current)
+
+    kept: list[str] = []
+    for blk in blocks:
+        old_h = ""
+        new_h = ""
+        if blk[0].startswith("diff --git "):
+            old_h, new_h = _extract_git_diff_header_paths(blk[0])
+
+        plus_path: str | None = None
+        minus_path: str | None = None
+        rename_to: str | None = None
+        for ln in blk:
+            # Stop header parsing as soon as the first hunk begins so diff body lines never forge headers
+            if ln.startswith("@@ "):
+                break
+            if plus_path is None:
+                p_cand = parse_diff_header_file_path(ln, "+++ ")
+                if p_cand is not None:
+                    plus_path = p_cand
+                    continue
+            if minus_path is None:
+                m_cand = parse_diff_header_file_path(ln, "--- ")
+                if m_cand is not None:
+                    minus_path = m_cand
+                    continue
+            if rename_to is None:
+                r_cand = parse_diff_header_file_path(ln, "rename to ")
+                if r_cand is not None:
+                    rename_to = r_cand
+
+        if plus_path == "/dev/null":
+            canonical_path = (minus_path if minus_path and minus_path != "/dev/null" else "") or old_h
+        else:
+            canonical_path = plus_path or rename_to or new_h
+
+        if canonical_path and canonical_path in norm_allowed:
+            kept.append("\n".join(blk))
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+def get_current_git_branch(repo_dir: Path) -> str:
+    """Return current checked-out git branch name, or empty string when detached / non-git."""
+    res = run_subproc(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=repo_dir, timeout=10)
+    if res is not None and res.returncode == 0:
+        return res.stdout.strip()
+    return ""
+
+
+def resolve_history_dir(
+    session_root: Path,
+    effective_scope: str,
+    *,
+    create_if_missing: bool = False,
+) -> Path | None:
+    """Resolve persistent history directory outside the target repository."""
+    if effective_scope == "global":
+        cand_dir = session_root.resolve() / ".history"
+        return cand_dir if (create_if_missing or cand_dir.is_dir()) else None
+
+    env_override = os.environ.get("YHARUTO_SESSION_ROOT", "").strip()
+    if env_override:
+        base_cand = Path(env_override).expanduser()
+    else:
+        base_cand = Path.home() / ".gemini" / "tmp" / "yharuto-code-review"
+
+    if not create_if_missing:
+        hist_cand = base_cand.resolve() / ".history"
+        return hist_cand if hist_cand.is_dir() else None
+
+    if _probe_writable_dir(base_cand):
+        return base_cand.resolve() / ".history"
+    return None
+
+
+def _history_repo_key(repo_dir: Path) -> str:
+    return hashlib.sha256(str(repo_dir.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _read_history_file_entries(path: Path) -> list[dict[str, object]]:
+    if not path.is_file():
+        return []
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, dict):
+        return []
+    entries_raw = raw.get("entries")
+    if isinstance(entries_raw, list):
+        return [{str(k): v for k, v in item.items()} for item in entries_raw if isinstance(item, dict)]
+    return [{str(k): v for k, v in raw.items()}]
+
+
+def save_review_history(
+    session_dir: Path,
+    state: Mapping[str, object],
+    expected_mode: str,
+    verdict: str | None,
+) -> Path | None:
+    """Persist lightweight review metadata outside the target repo for future --rereview runs."""
+    repo_dir_str = str(state.get("repo_dir") or "").strip()
+    if not repo_dir_str:
+        return None
+    repo_dir = Path(repo_dir_str).resolve()
+    session_root = session_dir.resolve().parent
+    effective_scope = str(state.get("session_scope") or "global")
+    history_dir = resolve_history_dir(session_root, effective_scope, create_if_missing=True)
+    if history_dir is None:
+        return None
+
+    mode = str(state.get("mode") or "")
+    if mode not in {"pr", "range", "local"}:
+        return None
+
+    pr_raw = state.get("pr_number")
+    pr_number = pr_raw if isinstance(pr_raw, int) and not isinstance(pr_raw, bool) else None
+    repo_key = _history_repo_key(repo_dir)
+    ch_raw = state.get("changed_files")
+    changed_files = [str(x) for x in ch_raw] if isinstance(ch_raw, list) else []
+    head_sha = str(state.get("head_sha") or "")
+    branch_name = ""
+    if mode == "local":
+        branch_name = get_current_git_branch(repo_dir)
+    elif head_sha:
+        head_res = run_subproc(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=repo_dir, timeout=10)
+        if head_res is not None and head_res.returncode == 0 and head_res.stdout.strip() == head_sha:
+            branch_name = get_current_git_branch(repo_dir)
+
+    entry: dict[str, object] = {
+        "schema_version": 2,
+        "repo_dir": str(repo_dir),
+        "mode": mode,
+        "commits_reviewed": mode in {"pr", "range"},
+        "branch": branch_name,
+        "pr_number": pr_number,
+        "base_sha": str(state.get("base_sha") or ""),
+        "merge_base_sha": str(state.get("merge_base_sha") or ""),
+        "head_sha": head_sha,
+        "changed_files": changed_files,
+        "verdict": verdict,
+        "review_mode": expected_mode,
+        "reviewed_at": utc_now_iso(),
+    }
+
+    try:
+        history_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(history_dir, 0o700)
+        except OSError:
+            pass
+
+        if pr_number is not None:
+            dest = history_dir / f"{repo_key}-pr-{pr_number}.json"
+            write_json_atomic(dest, entry)
+        else:
+            dest = history_dir / f"{repo_key}-runs.json"
+            existing = _read_history_file_entries(dest)
+            legacy_path = history_dir / f"{repo_key}-local.json"
+            if not existing and legacy_path.is_file():
+                existing = _read_history_file_entries(legacy_path)
+            dedup_key = (
+                mode,
+                branch_name,
+                str(entry["merge_base_sha"]),
+                str(entry["head_sha"]),
+            )
+            filtered = [
+                item
+                for item in existing
+                if (
+                    str(item.get("mode") or ""),
+                    str(item.get("branch") or ""),
+                    str(item.get("merge_base_sha") or ""),
+                    str(item.get("head_sha") or ""),
+                )
+                != dedup_key
+            ]
+            entries_out = [entry, *filtered][:MAX_HISTORY_ENTRIES]
+            write_json_atomic(dest, {"schema_version": 2, "entries": entries_out})
+        try:
+            os.chmod(dest, 0o600)
+        except OSError:
+            pass
+        return dest
+    except OSError:
+        return None
+
+
+def load_review_history_candidates(
+    session_root: Path,
+    effective_scope: str,
+    repo_dir: Path,
+    pr_number: int | None,
+) -> tuple[list[dict[str, object]], bool]:
+    """Load review history candidates sorted newest-first without creating directories.
+
+    Returns (candidates_newest_first, exact_pr_match).
+    """
+    history_dir = resolve_history_dir(session_root, effective_scope, create_if_missing=False)
+    if history_dir is None or not history_dir.is_dir():
+        return [], False
+
+    repo_key = _history_repo_key(repo_dir)
+    if pr_number is not None:
+        exact_entries = _read_history_file_entries(history_dir / f"{repo_key}-pr-{pr_number}.json")
+        return (exact_entries, True) if exact_entries else ([], False)
+
+    candidates: list[dict[str, object]] = []
+    for path in sorted(history_dir.glob(f"{repo_key}-*.json")):
+        candidates.extend(_read_history_file_entries(path))
+    candidates.sort(key=lambda item: str(item.get("reviewed_at") or ""), reverse=True)
+    return candidates, False

@@ -19,15 +19,18 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from _lib import (  # noqa: E402
+    ALLOWED_STAGE1_SKIP_STATUSES,
     FencedBlock,
     MARKDOWN_LINK_RE,
     SectionSlice,
     TEST_PATH_RE,
     collect_repo_porcelain,
     emit_json,
+    has_stage2_test_failure,
     is_separator_row,
     load_session_hmac_key,
     parse_fenced_blocks,
+    save_review_history,
     sha256_bytes,
     sha256_file,
     slice_sections_by_prefix,
@@ -481,16 +484,23 @@ def validate_gate_state(
     # 4. Verify Stage 1 Test Sufficiency Gate
     stage1 = state.get("stage1")
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-    skip_test = bool(state.get("skip_test", False))
+    skip_test_revoked = bool(state.get("skip_test_revoked", False)) or has_stage2_test_failure(state)
+    effective_skip_test = bool(state.get("skip_test", False)) and not skip_test_revoked
 
     if s1_status == "NG":
         gaps = stage1.get("gaps_count", 0) if isinstance(stage1, dict) else 0
         if not isinstance(gaps, int) or gaps < 1:
             gate_errors.append("Stage 1 status is NG, but gaps_count >= 1 was not recorded via gate-stage1.")
-        if not skip_test:
+        if not effective_skip_test:
             return "stage1_ng", state, gate_errors, False, hmac_ok
-    elif skip_test and s1_status == "SKIPPED_BY_FLAG":
-        pass
+    elif s1_status == "SKIPPED_BY_FLAG":
+        if not effective_skip_test:
+            if bool(state.get("skip_test", False)) and skip_test_revoked:
+                return "stage1_ng", state, gate_errors, False, hmac_ok
+            gate_errors.append(
+                "Stage 1 status is SKIPPED_BY_FLAG, but --skip-test is not active on this session."
+            )
+            return default_ok_mode, state, gate_errors, False, hmac_ok
     elif s1_status not in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
         gate_errors.append(
             f"Stage 1 Test Sufficiency Gate was not passed (current status: '{s1_status}')."
@@ -1195,10 +1205,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             s1_dict = state.get("stage1")
             s1_status_val = s1_dict.get("status") if isinstance(s1_dict, dict) else None
-            skip_test_bypassed = bool(state.get("skip_test", False)) and s1_status_val in {
-                "NG",
-                "SKIPPED_BY_FLAG",
-            }
+            skip_test_bypassed = (
+                bool(state.get("skip_test", False))
+                and not bool(state.get("skip_test_revoked", False))
+                and not has_stage2_test_failure(state)
+                and s1_status_val in ALLOWED_STAGE1_SKIP_STATUSES
+            )
             if bug_count == 0 and risk_count == 0 and not has_stage2_failure:
                 if skip_test_bypassed:
                     if parsed_verdict not in (GREEN_VERDICTS | YELLOW_VERDICTS):
@@ -1255,6 +1267,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "validated_at": utc_now_iso(),
         }
         write_sealed_gate_state(session_dir, state)
+        only_files_raw = state.get("only_files")
+        has_only_files = isinstance(only_files_raw, list) and len(only_files_raw) > 0
+        if passed and expected_mode == "full" and not has_only_files:
+            save_review_history(
+                session_dir=session_dir,
+                state=state,
+                expected_mode=expected_mode,
+                verdict=parsed_verdict,
+            )
 
     result: dict[str, object] = {
         "passed": passed,

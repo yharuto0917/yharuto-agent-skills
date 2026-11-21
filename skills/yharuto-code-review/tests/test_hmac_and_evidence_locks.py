@@ -870,6 +870,542 @@ class TestHmacAndEvidenceLocks(unittest.TestCase):
             self.assertEqual(run_script("run_checks.py", ["--session", str(sdir_c)], env=env)[0], 0)
             self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir_c)], env=env)[0], 0)
 
+    def test_skip_test_revoked_when_tests_fail_but_allowed_when_only_lint_fails(self) -> None:
+        from _lib import find_stage2_test_failures
+
+        # Unit check: URL / description / passing test names containing 'error'/'fail'/'stale' must NOT false-positive
+        self.assertEqual(
+            find_stage2_test_failures(
+                [
+                    {
+                        "tool": "gh_pr_checks",
+                        "status": "failed",
+                        "summary_lines": [
+                            "lint\tfail\t2s\thttps://github.com/org/my-test-repo/actions/runs/1\t1 error in tests/foo.test.ts",
+                            "unit-tests\tpass\t5s\thttps://github.com/org/my-test-repo/actions/runs/2\t0 failed, 42 passed",
+                            "test-error-handling: SUCCESS",
+                            "unit-test (fail-fast): SUCCESS",
+                            "test-stale-cache: SUCCESS",
+                            "ci/lint: FAILURE",
+                        ],
+                    }
+                ]
+            ),
+            [],
+        )
+        # Positive checks: cancel status, CamelCase unitTest, e2e, nextest, and structured failed_checks
+        for sample_check in (
+            {
+                "tool": "gh_pr_checks",
+                "status": "failed",
+                "summary_lines": [
+                    "unit-tests\tfail\t5s\thttps://github.com/org/repo/actions/runs/3",
+                ],
+            },
+            {
+                "tool": "gh_pr_checks",
+                "status": "failed",
+                "summary_lines": [
+                    "ci/e2e\tcancel\t3s\thttps://github.com/org/repo/actions/runs/4",
+                ],
+            },
+            {
+                "tool": "gh_pr_checks",
+                "status": "failed",
+                "failed_checks": ["unitTest"],
+                "summary_lines": ["lint: SUCCESS"],
+            },
+            {
+                "tool": "gh_pr_checks",
+                "status": "failed",
+                "failed_checks": ["cargo nextest"],
+                "summary_lines": [],
+            },
+        ):
+            self.assertEqual(find_stage2_test_failures([sample_check]), ["gh_pr_checks"])
+        # Non-test words containing 'test' substring (latest / attestation / contest) must NOT match
+        self.assertEqual(
+            find_stage2_test_failures(
+                [
+                    {
+                        "tool": "gh_pr_checks",
+                        "status": "failed",
+                        "failed_checks": ["check-latest", "build-attestation", "contest-lint"],
+                    }
+                ]
+            ),
+            [],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sess_root = root / "sessions"
+            env = {"YHARUTO_SESSION_ROOT": str(sess_root), "YOMIYASU_LINT_DISABLE": "1"}
+
+            # 1. Failing test regression repo: --skip-test must be revoked at Stage 2 and enforce stage1_ng
+            fail_repo = root / "fail_repo"
+            init_git_repo(fail_repo)
+            (fail_repo / "src").mkdir()
+            (fail_repo / "tests").mkdir()
+            (fail_repo / "src" / "discountCalc.mjs").write_text(
+                "export function computeDiscount(amount) {\n  return Math.floor(amount * 0.1);\n}\n",
+                encoding="utf-8",
+            )
+            (fail_repo / "tests" / "discount.test.mjs").write_text(
+                "import test from 'node:test';\n"
+                "import assert from 'node:assert/strict';\n"
+                "import { computeDiscount } from '../src/discountCalc.mjs';\n"
+                "test('basic discount', () => { assert.equal(computeDiscount(100), 10); });\n",
+                encoding="utf-8",
+            )
+            (fail_repo / "package.json").write_text(
+                json.dumps({"name": "fail-demo", "type": "module", "scripts": {"test": "node --test tests/discount.test.mjs"}}),
+                encoding="utf-8",
+            )
+            git_commit_all(fail_repo, "base passing test")
+
+            run_git(fail_repo, ["checkout", "-b", "pr-branch"])
+            (fail_repo / "src" / "discountCalc.mjs").write_text(
+                "export function computeDiscount(amount) {\n  return Math.floor(amount * 0.2);\n}\n",
+                encoding="utf-8",
+            )
+            git_commit_all(fail_repo, "break discount calculation")
+
+            # 1a. --verdict NG with --skip-test -> Stage 2 fails test -> revoked -> stage1_ng enforced
+            rc1, prep1, _, stderr1 = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(fail_repo), "--range", "main..pr-branch", "--skip-test"],
+                env=env,
+            )
+            self.assertEqual(rc1, 0, stderr1)
+            sdir1 = Path(str(prep1["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir1)], env=env)[0], 0)
+            rc_g1, out_g1, _, _ = run_script(
+                "prepare_worktree.py",
+                ["gate-stage1", "--session", str(sdir1), "--verdict", "NG", "--gaps-count", "1", "--summary", "異常系テスト不足"],
+                env=env,
+            )
+            self.assertEqual(rc_g1, 0)
+            self.assertIs(out_g1["stage1"]["bypassed_by_skip_test"], True)
+
+            rc_ci1, out_ci1, _, stderr_ci1 = run_script("run_checks.py", ["--session", str(sdir1)], env=env)
+            self.assertEqual(rc_ci1, 0, stderr_ci1)
+            self.assertIs(out_ci1.get("skip_test_revoked"), True)
+            self.assertEqual(out_ci1.get("required_output_mode"), "stage1_ng")
+
+            # Stage 3, Stage 4, gate-stage1 re-override, and Stage 2 re-run must all be blocked
+            rc_sm1, out_sm1, _, _ = run_script("scan_diff_smells.py", ["--session", str(sdir1)], env=env)
+            self.assertEqual(rc_sm1, 2)
+            self.assertIs(out_sm1.get("skip_test_revoked"), True)
+
+            draft1 = Path(str(prep1["draft_findings_path"]))
+            draft1.write_text("[]\n", encoding="utf-8")
+            rc_p4_1, out_p4_1, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare-stage4", "--session", str(sdir1), "--draft", str(draft1)],
+                env=env,
+            )
+            self.assertEqual(rc_p4_1, 2)
+            self.assertIs(out_p4_1.get("skip_test_revoked"), True)
+
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir1), "--verdict", "SKIP", "--skip-test"],
+                    env=env,
+                )[0],
+                2,
+            )
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir1), "--verdict", "OK", "--verified-tests", "tests/discount.test.mjs"],
+                    env=env,
+                )[0],
+                2,
+            )
+            self.assertEqual(run_script("run_checks.py", ["--session", str(sdir1)], env=env)[0], 2)
+
+            # Full review output must be rejected while stage1_ng output passes
+            full_md1 = sdir1 / "wrong_full.md"
+            full_md1.write_text(
+                build_clean_full_review(
+                    verdict="🔴 Request changes",
+                    alert_tag="[!CAUTION]",
+                    file_rel="src/discountCalc.mjs",
+                    file_label="discountCalc.mjs",
+                ),
+                encoding="utf-8",
+            )
+            rc_vf1, out_vf1, _, _ = run_script(
+                "validate_review_output.py",
+                ["--session", str(sdir1), "--file", str(full_md1)],
+                env=env,
+            )
+            self.assertEqual(rc_vf1, 1)
+            self.assertFalse(out_vf1["passed"])
+            self.assertEqual(out_vf1["mode"], "stage1_ng")
+
+            ng_md1 = Path(str(prep1["review_output_path"]))
+            ng_md1.write_text(
+                build_clean_stage1_ng_review(
+                    code_rel="src/discountCalc.mjs",
+                    code_label="discountCalc.mjs",
+                    test_rel="tests/discount.test.mjs",
+                    test_label="discount.test.mjs",
+                ),
+                encoding="utf-8",
+            )
+            rc_vn1, out_vn1, _, _ = run_script(
+                "validate_review_output.py",
+                ["--session", str(sdir1), "--file", str(ng_md1)],
+                env=env,
+            )
+            self.assertEqual(rc_vn1, 0, json.dumps(out_vn1, ensure_ascii=False))
+            self.assertEqual(out_vn1["mode"], "stage1_ng")
+
+            rc_post1, out_post1, _, stderr_post1 = run_script(
+                "post_pending_review.py",
+                ["--session", str(sdir1), "--repo", "example/shop", "--pr", "10", "--review-md", str(ng_md1), "--dry-run"],
+                env=env,
+            )
+            self.assertEqual(rc_post1, 0, stderr_post1)
+            self.assertEqual(out_post1["inline_count"], 0)
+
+            audit1 = root / "revoked_audit.json"
+            env_audit1 = dict(env)
+            env_audit1["YHARUTO_REVIEW_AUDIT_LOG"] = str(audit1)
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir1)], env=env_audit1)[0], 0)
+            audit1_obj = json.loads(audit1.read_text(encoding="utf-8"))
+            self.assertIs(audit1_obj["hmac_verified"], True)
+            self.assertIs(audit1_obj["skip_test"], True)
+            self.assertIs(audit1_obj["skip_test_revoked"], True)
+            self.assertEqual(audit1_obj["stage1"]["status"], "NG")
+            self.assertIs(audit1_obj["stage1"]["bypassed_by_skip_test"], False)
+
+            # 1b. --verdict SKIP with --skip-test -> Stage 2 fails test -> downgraded to NG and stage1_ng passes
+            rc1b, prep1b, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(fail_repo), "--range", "main..pr-branch", "--skip-test"],
+                env=env,
+            )
+            self.assertEqual(rc1b, 0)
+            sdir1b = Path(str(prep1b["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir1b)], env=env)[0], 0)
+            self.assertEqual(
+                run_script("prepare_worktree.py", ["gate-stage1", "--session", str(sdir1b), "--verdict", "SKIP"], env=env)[0],
+                0,
+            )
+            rc_ci1b, out_ci1b, _, _ = run_script("run_checks.py", ["--session", str(sdir1b)], env=env)
+            self.assertEqual(rc_ci1b, 0)
+            self.assertIs(out_ci1b.get("skip_test_revoked"), True)
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir1b)], env=env)[0], 2)
+            ng_md1b = Path(str(prep1b["review_output_path"]))
+            ng_md1b.write_text(
+                build_clean_stage1_ng_review(
+                    code_rel="src/discountCalc.mjs",
+                    code_label="discountCalc.mjs",
+                    test_rel="tests/discount.test.mjs",
+                    test_label="discount.test.mjs",
+                ),
+                encoding="utf-8",
+            )
+            rc_vn1b, out_vn1b, _, _ = run_script(
+                "validate_review_output.py",
+                ["--session", str(sdir1b), "--file", str(ng_md1b)],
+                env=env,
+            )
+            self.assertEqual(rc_vn1b, 0, json.dumps(out_vn1b, ensure_ascii=False))
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir1b)], env=env)[0], 0)
+
+            # 2. Passing tests + failing lint: --skip-test stays active because tests themselves passed
+            lint_fail_repo = root / "lint_fail_repo"
+            init_git_repo(lint_fail_repo)
+            (lint_fail_repo / "src").mkdir()
+            (lint_fail_repo / "tests").mkdir()
+            (lint_fail_repo / "src" / "discountCalc.mjs").write_text(
+                "export function computeDiscount(amount) {\n  return Math.floor(amount * 0.1);\n}\n",
+                encoding="utf-8",
+            )
+            (lint_fail_repo / "tests" / "discount.test.mjs").write_text(
+                "import test from 'node:test';\n"
+                "import assert from 'node:assert/strict';\n"
+                "import { computeDiscount } from '../src/discountCalc.mjs';\n"
+                "test('basic discount', () => { assert.equal(computeDiscount(100), 10); });\n",
+                encoding="utf-8",
+            )
+            (lint_fail_repo / "lint_runner.mjs").write_text("process.exit(0);\n", encoding="utf-8")
+            (lint_fail_repo / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "lint-fail-demo",
+                        "type": "module",
+                        "scripts": {
+                            "test": "node --test tests/discount.test.mjs",
+                            "lint": "node lint_runner.mjs",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            git_commit_all(lint_fail_repo, "base ok")
+
+            run_git(lint_fail_repo, ["checkout", "-b", "pr-branch"])
+            (lint_fail_repo / "src" / "discountCalc.mjs").write_text(
+                "export function computeDiscount(amount) {\n  return Math.max(0, Math.floor(amount * 0.1));\n}\n",
+                encoding="utf-8",
+            )
+            (lint_fail_repo / "lint_runner.mjs").write_text(
+                "console.error('src/discountCalc.mjs:2:1: error lint rule');\nprocess.exit(1);\n",
+                encoding="utf-8",
+            )
+            git_commit_all(lint_fail_repo, "pass test but fail lint")
+
+            rc2, prep2, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(lint_fail_repo), "--range", "main..pr-branch", "--skip-test"],
+                env=env,
+            )
+            self.assertEqual(rc2, 0)
+            sdir2 = Path(str(prep2["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir2)], env=env)[0], 0)
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir2), "--verdict", "NG", "--gaps-count", "1", "--summary", "境界値テスト不足"],
+                    env=env,
+                )[0],
+                0,
+            )
+            rc_ci2, out_ci2, _, _ = run_script("run_checks.py", ["--session", str(sdir2)], env=env)
+            self.assertEqual(rc_ci2, 0)
+            self.assertNotIn("skip_test_revoked", out_ci2)
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir2)], env=env)[0], 0)
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir2)], env=env)[0], 0)
+
+            # 3. Fork PR (--untrusted + --pr-meta): gh_pr_checks test failure revokes --skip-test; lint-only failure does not
+            base_sha = run_git(fail_repo, ["rev-parse", "main"]).stdout.strip()
+            head_sha = run_git(fail_repo, ["rev-parse", "pr-branch"]).stdout.strip()
+
+            meta_test_fail = root / "meta_test_fail.json"
+            meta_test_fail.write_text(
+                json.dumps(
+                    {
+                        "number": 77,
+                        "is_fork_pr": True,
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "checks": [
+                            {"name": "unit-tests", "conclusion": "FAILURE"},
+                            {"name": "lint", "conclusion": "SUCCESS"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rc3a, prep3a, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(fail_repo), "--pr", "77", "--pr-meta", str(meta_test_fail), "--skip-test"],
+                env=env,
+            )
+            self.assertEqual(rc3a, 0)
+            sdir3a = Path(str(prep3a["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir3a)], env=env)[0], 0)
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir3a), "--verdict", "NG", "--gaps-count", "1", "--summary", "不足"],
+                    env=env,
+                )[0],
+                0,
+            )
+            rc_ci3a, out_ci3a, _, _ = run_script("run_checks.py", ["--session", str(sdir3a)], env=env)
+            self.assertEqual(rc_ci3a, 0)
+            self.assertIs(out_ci3a.get("skip_test_revoked"), True)
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir3a)], env=env)[0], 2)
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir3a)], env=env)[0], 0)
+
+            meta_lint_only = root / "meta_lint_only.json"
+            meta_lint_only.write_text(
+                json.dumps(
+                    {
+                        "number": 78,
+                        "is_fork_pr": True,
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "checks": [
+                            {"name": "unit-tests", "conclusion": "SUCCESS"},
+                            {"name": "eslint", "conclusion": "FAILURE"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rc3b, prep3b, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(fail_repo), "--pr", "78", "--pr-meta", str(meta_lint_only), "--skip-test"],
+                env=env,
+            )
+            self.assertEqual(rc3b, 0)
+            sdir3b = Path(str(prep3b["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir3b)], env=env)[0], 0)
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir3b), "--verdict", "NG", "--gaps-count", "1", "--summary", "不足"],
+                    env=env,
+                )[0],
+                0,
+            )
+            rc_ci3b, out_ci3b, _, _ = run_script("run_checks.py", ["--session", str(sdir3b)], env=env)
+            self.assertEqual(rc_ci3b, 0)
+            self.assertNotIn("skip_test_revoked", out_ci3b)
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir3b)], env=env)[0], 0)
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir3b)], env=env)[0], 0)
+
+            # 4. >40 pr_meta checks with failing test at #45 (beyond SUMMARY_TAIL_LINES=40) must still revoke --skip-test
+            many_checks: list[dict[str, str]] = [
+                {"name": f"build-matrix-{idx}", "conclusion": "SUCCESS"} for idx in range(1, 45)
+            ]
+            many_checks.append({"name": "unitTest", "conclusion": "FAILURE"})
+            meta_many = root / "meta_many.json"
+            meta_many.write_text(
+                json.dumps(
+                    {
+                        "number": 79,
+                        "is_fork_pr": True,
+                        "base_sha": base_sha,
+                        "head_sha": head_sha,
+                        "checks": many_checks,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rc4, prep4, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(fail_repo), "--pr", "79", "--pr-meta", str(meta_many), "--skip-test"],
+                env=env,
+            )
+            self.assertEqual(rc4, 0)
+            sdir4 = Path(str(prep4["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir4)], env=env)[0], 0)
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir4), "--verdict", "NG", "--gaps-count", "1", "--summary", "不足"],
+                    env=env,
+                )[0],
+                0,
+            )
+            rc_ci4, out_ci4, _, _ = run_script("run_checks.py", ["--session", str(sdir4)], env=env)
+            self.assertEqual(rc_ci4, 0)
+            self.assertIs(out_ci4.get("skip_test_revoked"), True)
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir4)], env=env)[0], 0)
+
+            # 5. Re-running Stage 2 into test failure after Stage 4/5 resets stage5 and blocks record-stage4, run-stage4-cli, and post_pending_review
+            rc5, prep5, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(fail_repo), "--pr", "80", "--pr-meta", str(meta_lint_only), "--skip-test"],
+                env=env,
+            )
+            self.assertEqual(rc5, 0)
+            sdir5 = Path(str(prep5["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir5)], env=env)[0], 0)
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir5), "--verdict", "NG", "--gaps-count", "1", "--summary", "不足"],
+                    env=env,
+                )[0],
+                0,
+            )
+            self.assertEqual(run_script("run_checks.py", ["--session", str(sdir5)], env=env)[0], 0)
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir5)], env=env)[0], 0)
+            draft5 = Path(str(prep5["draft_findings_path"]))
+            draft5.write_text("[]\n", encoding="utf-8")
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["prepare-stage4", "--session", str(sdir5), "--draft", str(draft5)],
+                    env=env,
+                )[0],
+                0,
+            )
+            nonce5 = extract_challenge_nonce(Path(str(prep5["adversarial_input_path"])))
+            resp5 = Path(str(prep5["adversarial_response_path"]))
+            resp5.write_text(
+                json.dumps(
+                    {
+                        "challenge_nonce": nonce5,
+                        "challenged_findings": [],
+                        "missed_findings": [],
+                        "checked_files": ["src/discountCalc.mjs"],
+                        "audit_notes": "初回レビュー対象ファイルを確認し記録しました。",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["record-stage4", "--session", str(sdir5), "--verifier-mode", "subagent", "--response-file", str(resp5)],
+                    env=env,
+                )[0],
+                0,
+            )
+            review5 = Path(str(prep5["review_output_path"]))
+            review5.write_text(
+                build_clean_full_review(
+                    verdict="🔴 Request changes",
+                    alert_tag="[!CAUTION]",
+                    file_rel="src/discountCalc.mjs",
+                    file_label="discountCalc.mjs",
+                ),
+                encoding="utf-8",
+            )
+            rc_v5, out_v5, _, _ = run_script(
+                "validate_review_output.py",
+                ["--session", str(sdir5), "--file", str(review5)],
+                env=env,
+            )
+            self.assertEqual(rc_v5, 0, json.dumps(out_v5, ensure_ascii=False))
+
+            # Now re-run Stage 2 with --allow-exec on fail_repo -> local test fails -> revokes --skip-test & resets stage5
+            rc_ci5_rerun, out_ci5_rerun, _, _ = run_script(
+                "run_checks.py",
+                ["--session", str(sdir5), "--allow-exec"],
+                env=env,
+            )
+            self.assertEqual(rc_ci5_rerun, 0)
+            self.assertIs(out_ci5_rerun.get("skip_test_revoked"), True)
+
+            # Stale full review MUST be rejected by post_pending_review, and Stage 4 record/CLI MUST be blocked
+            rc_post5, out_post5, _, _ = run_script(
+                "post_pending_review.py",
+                ["--session", str(sdir5), "--repo", "example/shop", "--pr", "80", "--review-md", str(review5), "--dry-run"],
+                env=env,
+            )
+            self.assertEqual(rc_post5, 2)
+            self.assertIn("stage5.validated", str(out_post5.get("error", "")))
+
+            rc_r4_5, out_r4_5, _, _ = run_script(
+                "prepare_worktree.py",
+                ["record-stage4", "--session", str(sdir5), "--verifier-mode", "subagent", "--response-file", str(resp5)],
+                env=env,
+            )
+            self.assertEqual(rc_r4_5, 2)
+            self.assertIs(out_r4_5.get("skip_test_revoked"), True)
+
+            rc_c4_5, out_c4_5, _, _ = run_script(
+                "prepare_worktree.py",
+                ["run-stage4-cli", "--session", str(sdir5), "--cmd", f"{sys.executable} -B -c pass"],
+                env=env,
+            )
+            self.assertEqual(rc_c4_5, 2)
+            self.assertIs(out_c4_5.get("skip_test_revoked"), True)
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir5)], env=env)[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

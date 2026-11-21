@@ -23,12 +23,16 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from _lib import (  # noqa: E402
+    ALLOWED_STAGE1_SKIP_STATUSES,
     detect_ci_script_hazard_in_files,
     emit_json,
+    extract_failed_gh_check_names,
     fail_with_code,
+    find_stage2_test_failures,
     is_stage1_passed_or_skipped,
     prune_created_project_dirs,
     read_verified_gate_state,
+    reset_stage5_state,
     resolve_session_root,
     run_subproc,
     sha256_file,
@@ -308,6 +312,7 @@ def evaluate_pr_meta_checks(
         checks_raw = untrusted_pr_meta.get("checks")
         if isinstance(checks_raw, list) and len(checks_raw) > 0:
             summary_lines: list[str] = []
+            failed_checks: list[str] = []
             any_failed = False
             any_pending = False
             for entry in checks_raw:
@@ -317,6 +322,7 @@ def evaluate_pr_meta_checks(
                     summary_lines.append(f"{cname}: {disp}")
                     if cls == "failed":
                         any_failed = True
+                        failed_checks.append(cname)
                     elif cls == "pending":
                         any_pending = True
                 else:
@@ -339,6 +345,8 @@ def evaluate_pr_meta_checks(
                 "exit_code": exit_code,
                 "summary_lines": summary_lines[:SUMMARY_TAIL_LINES],
             }
+            if failed_checks:
+                chk["failed_checks"] = failed_checks
             return chk, "[gh_pr_checks (from pr_meta)]\n" + "\n".join(summary_lines) + "\n"
 
     if pr_number is not None and not is_offline and shutil.which("gh") is not None:
@@ -377,14 +385,19 @@ def evaluate_pr_meta_checks(
                 status = "pending"
             else:
                 status = "failed"
+            live_chk: dict[str, object] = {
+                "tool": "gh_pr_checks",
+                "cmd": ["gh", "pr", "checks", str(pr_number)],
+                "status": status,
+                "exit_code": res.returncode,
+                "summary_lines": lines[-SUMMARY_TAIL_LINES:],
+            }
+            if status == "failed":
+                live_failed_checks = extract_failed_gh_check_names(lines)
+                if live_failed_checks:
+                    live_chk["failed_checks"] = live_failed_checks
             return (
-                {
-                    "tool": "gh_pr_checks",
-                    "cmd": ["gh", "pr", "checks", str(pr_number)],
-                    "status": status,
-                    "exit_code": res.returncode,
-                    "summary_lines": lines[-SUMMARY_TAIL_LINES:],
-                },
+                live_chk,
                 f"[gh pr checks {pr_number}] exit={res.returncode} status={status}\n{combined}\n",
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -912,17 +925,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         stage1 = state.get("stage1")
         s1_status = stage1.get("status") if isinstance(stage1, dict) else None
         if not is_stage1_passed_or_skipped(state):
+            revoked = bool(state.get("skip_test_revoked", False))
+            reason_suffix = (
+                f" (--skip-test revoked: {state.get('skip_test_revoked_reason')})"
+                if revoked
+                else ""
+            )
             fail_with_code(
                 f"Stage 2 blocked: Stage 1 gate status must be OK or EXEMPT_NO_TESTABLE_CODE "
-                f"(or NG/SKIPPED_BY_FLAG with --skip-test; current: '{s1_status}').",
+                f"(or NG/SKIPPED_BY_FLAG with active --skip-test; current: '{s1_status}'){reason_suffix}.",
                 2,
-                extra={"stage1_status": s1_status, "skip_test": bool(state.get("skip_test", False))},
+                extra={
+                    "stage1_status": s1_status,
+                    "skip_test": bool(state.get("skip_test", False)),
+                    "skip_test_revoked": revoked,
+                },
             )
 
         mode = str(state.get("mode") or "")
         workdir = Path(str(state.get("workdir") or "")).resolve()
         repo_dir = Path(str(state.get("repo_dir") or workdir)).resolve()
         merge_base_sha = str(state.get("merge_base_sha") or "")
+        review_base_sha = str(state.get("review_base_sha") or "")
+        head_sha = str(state.get("head_sha") or "")
         is_fork_pr = bool(state.get("is_fork_pr", False))
         ci_script_hazard = bool(state.get("ci_script_hazard", False))
         lockfile_modified = bool(state.get("lockfile_modified", False))
@@ -940,6 +965,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         mode = "standalone"
         repo_dir = workdir
         merge_base_sha = ""
+        review_base_sha = ""
+        head_sha = ""
         is_fork_pr = False
         ci_script_hazard, _ = detect_ci_script_hazard_in_files(workdir)
         lockfile_modified = False
@@ -1082,16 +1109,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                         checks_out.append(chk_entry)
                         log_chunks.append(chk_log)
 
+                reverify_base_sha = (
+                    review_base_sha
+                    if (mode == "local" and review_base_sha and review_base_sha != head_sha)
+                    else merge_base_sha
+                )
                 if (
                     session_dir is not None
                     and mode in {"pr", "range", "local"}
-                    and merge_base_sha
+                    and reverify_base_sha
                     and any(c.get("status") == "failed" for c in checks_out)
                 ):
                     reverify_failures_against_base(
                         session_dir=session_dir,
                         repo_dir=repo_dir,
-                        merge_base_sha=merge_base_sha,
+                        merge_base_sha=reverify_base_sha,
                         checks_out=checks_out,
                         env=env,
                         bind_repo_deps=bind_repo_deps,
@@ -1121,6 +1153,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     write_sealed_gate_state(session_dir, state)
 
         overall_status = compute_overall_status(checks_out, block_status=block_status)
+
+        skip_test_revoked = False
+        skip_test_revoked_reason = ""
+        if session_dir is not None:
+            s1_state = state.get("stage1")
+            was_stage1_bypassed = isinstance(s1_state, dict) and (
+                s1_state.get("bypassed_by_skip_test") is True
+                or (bool(state.get("skip_test", False)) and s1_state.get("status") in ALLOWED_STAGE1_SKIP_STATUSES)
+            )
+            failed_test_tools = find_stage2_test_failures(checks_out)
+            if was_stage1_bypassed and failed_test_tools:
+                skip_test_revoked = True
+                tools_csv = ", ".join(failed_test_tools)
+                skip_test_revoked_reason = (
+                    f"Stage 2 test check(s) failed ({tools_csv}); --skip-test cannot bypass failing tests."
+                )
+                log_chunks.append(f"[skip_test_guard] REVOKED: {skip_test_revoked_reason}\n")
+
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("".join(log_chunks), encoding="utf-8")
         log_sha = sha256_file(log_path)
@@ -1135,6 +1185,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "log_sha256": log_sha,
                 "updated_at": utc_now_iso(),
             }
+            state["stage5"] = reset_stage5_state()
+            if skip_test_revoked:
+                state["skip_test_revoked"] = True
+                state["skip_test_revoked_reason"] = skip_test_revoked_reason
+                s1_prev = state.get("stage1")
+                if isinstance(s1_prev, dict):
+                    s1_next = dict(s1_prev)
+                    s1_next["bypassed_by_skip_test"] = False
+                    s1_next["status"] = "NG"
+                    prev_gaps = s1_next.get("gaps_count")
+                    if not isinstance(prev_gaps, int) or isinstance(prev_gaps, bool) or prev_gaps < 1:
+                        s1_next["gaps_count"] = 1
+                    prev_summary = str(s1_next.get("summary") or "").strip()
+                    s1_next["summary"] = (
+                        f"{prev_summary} / {skip_test_revoked_reason}"
+                        if prev_summary
+                        else skip_test_revoked_reason
+                    )
+                    s1_next["updated_at"] = utc_now_iso()
+                    state["stage1"] = s1_next
             write_sealed_gate_state(session_dir, state)
     finally:
         if args.workdir is not None:
@@ -1146,15 +1216,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if standalone_root is not None and standalone_created_dirs:
                 prune_created_project_dirs(standalone_root, standalone_created_dirs)
 
-    emit_json(
-        {
-            "overall_status": overall_status,
-            "execution_policy": execution_policy,
-            "checks": checks_out,
-            "log_sha256": log_sha,
-        }
-    )
-    # Stage 2 MUST return exit 0 even when checks fail so the pipeline always advances to Stage 3.
+    result_payload: dict[str, object] = {
+        "overall_status": overall_status,
+        "execution_policy": execution_policy,
+        "checks": checks_out,
+        "log_sha256": log_sha,
+    }
+    if skip_test_revoked:
+        result_payload["skip_test_revoked"] = True
+        result_payload["skip_test_revoked_reason"] = skip_test_revoked_reason
+        result_payload["required_output_mode"] = "stage1_ng"
+    emit_json(result_payload)
+    # Stage 2 returns exit 0 even when checks fail (when skip_test_revoked is true, Stage 3-5 gates enforce stage1_ng).
     return 0
 
 

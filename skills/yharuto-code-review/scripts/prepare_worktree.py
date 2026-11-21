@@ -34,14 +34,21 @@ from _lib import (  # noqa: E402
     detect_ci_script_hazard_in_files,
     emit_json,
     fail_with_code,
+    filter_diff_by_files,
+    get_current_git_branch,
+    has_stage2_test_failure,
     init_session_hmac_key,
     is_safe_session_dir,
     is_stage1_passed_or_skipped,
+    load_review_history_candidates,
+    normalize_only_files,
     normalize_rel_path,
+    parse_diff_header_file_path,
     parse_fenced_blocks,
     prune_created_project_dirs,
     read_json_object,
     read_verified_gate_state,
+    reset_stage5_state,
     resolve_session_root,
     run_cmd,
     run_subproc,
@@ -662,24 +669,37 @@ def collect_diff_stats(
     head_sha: str,
     audit_paths: Sequence[str],
     is_git_repo: bool,
+    *,
+    review_base_sha: str = "",
+    only_files: Sequence[str] | None = None,
 ) -> tuple[list[str], list[str], int, str]:
     changed_files: list[str] = []
     active_files: list[str] = []
     diff_text = ""
+    effective_base = review_base_sha or merge_base_sha
+    only_set = {normalize_rel_path(f) for f in (only_files or ()) if f}
 
     if mode in ("pr", "range"):
-        all_res = run_cmd(["git", "diff", "--name-only", "-z", merge_base_sha, head_sha], cwd=repo_dir)
+        all_res = run_cmd(["git", "diff", "--name-only", "-z", effective_base, head_sha], cwd=repo_dir)
         acmr_res = run_cmd(
-            ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", merge_base_sha, head_sha],
+            ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", effective_base, head_sha],
             cwd=repo_dir,
         )
-        patch_res = run_cmd(["git", "diff", "-U0", merge_base_sha, head_sha], cwd=repo_dir)
+        patch_res = run_cmd(["git", "diff", "-U0", effective_base, head_sha], cwd=repo_dir)
         changed_files = split_nul_paths(all_res.stdout)
         active_files = split_nul_paths(acmr_res.stdout)
         diff_text = patch_res.stdout
     elif mode == "local":
+        use_since_ref = bool(review_base_sha and review_base_sha != head_sha)
         has_head = bool(merge_base_sha)
-        if has_head:
+        if use_since_ref:
+            tracked_res = run_cmd(["git", "diff", "--name-only", "-z", review_base_sha], cwd=repo_dir)
+            acmr_res = run_cmd(
+                ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", review_base_sha],
+                cwd=repo_dir,
+            )
+            patch_res = run_cmd(["git", "diff", "-U0", review_base_sha], cwd=repo_dir)
+        elif has_head:
             tracked_res = run_cmd(["git", "diff", "--name-only", "-z", "HEAD"], cwd=repo_dir)
             acmr_res = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", "HEAD"], cwd=repo_dir)
             patch_res = run_cmd(["git", "diff", "-U0", "HEAD"], cwd=repo_dir)
@@ -701,6 +721,8 @@ def collect_diff_stats(
             fpath = workdir / rel
             if fpath.is_file():
                 try:
+                    untracked_lines.append(f"diff --git a/{rel} b/{rel}")
+                    untracked_lines.append("--- /dev/null")
                     untracked_lines.append(f"+++ b/{rel}")
                     for raw_ln in fpath.read_text(encoding="utf-8", errors="ignore").splitlines():
                         untracked_lines.append("+" + raw_ln)
@@ -728,6 +750,8 @@ def collect_diff_stats(
                         for fn in sorted(fnames):
                             files.append((Path(root) / fn).relative_to(workdir).as_posix())
         changed_files = sorted(dict.fromkeys(files))
+        if only_set:
+            changed_files = [f for f in changed_files if normalize_rel_path(f) in only_set]
         active_files = [f for f in changed_files if (workdir / f).is_file()]
         total_audit_lines = 0
         for rel in active_files:
@@ -739,14 +763,34 @@ def collect_diff_stats(
         testable = [f for f in active_files if is_testable_code_file(f)]
         return changed_files, testable, total_audit_lines, ""
 
+    if only_set:
+        changed_files = [f for f in changed_files if normalize_rel_path(f) in only_set]
+        active_files = [f for f in active_files if normalize_rel_path(f) in only_set]
+        diff_text = filter_diff_by_files(diff_text, only_set)
+
     testable_files = [f for f in active_files if is_testable_code_file(f) and (workdir / f).is_file()]
     code_diff_lines = 0
     current_in_code = False
+    in_header = True
     for line in diff_text.splitlines():
-        if line.startswith("+++ b/"):
-            rel_path = line[6:].strip()
-            current_in_code = is_testable_code_file(rel_path) or TEST_PATH_RE.search(rel_path) is not None
-        elif line.startswith("+") and not line.startswith("+++"):
+        if line.startswith("diff --git "):
+            in_header = True
+            current_in_code = False
+            continue
+        if in_header:
+            plus_path = parse_diff_header_file_path(line, "+++ ")
+            if plus_path is not None:
+                in_header = False
+                if plus_path == "/dev/null":
+                    current_in_code = False
+                else:
+                    current_in_code = is_testable_code_file(plus_path) or TEST_PATH_RE.search(plus_path) is not None
+                continue
+            if line.startswith("@@ "):
+                in_header = False
+                continue
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
             if current_in_code:
                 code_diff_lines += 1
         elif line.startswith("-") and not line.startswith("---"):
@@ -826,6 +870,275 @@ def detect_signals_and_guidelines(
     return list(dict.fromkeys(signals)), list(dict.fromkeys(guidelines))
 
 
+def _is_git_ancestor(repo_dir: Path, older_sha: str, newer_sha: str) -> bool:
+    if not older_sha or not newer_sha:
+        return False
+    res = run_cmd(["git", "merge-base", "--is-ancestor", older_sha, newer_sha], cwd=repo_dir)
+    return res.returncode == 0
+
+
+def _has_uncommitted_local_changes(repo_dir: Path, has_head: bool) -> bool:
+    diff_cmd = (
+        ["git", "diff", "--name-only", "-z", "HEAD"]
+        if has_head
+        else ["git", "diff", "--cached", "--name-only", "-z"]
+    )
+    tracked_res = run_cmd(diff_cmd, cwd=repo_dir)
+    if any(not p.startswith(".gemini/") for p in split_nul_paths(tracked_res.stdout)):
+        return True
+    untracked_res = run_cmd(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=repo_dir)
+    return any(not p.startswith(".gemini/") for p in split_nul_paths(untracked_res.stdout))
+
+
+def _cleanup_failed_prepare(
+    repo_dir: Path,
+    session_root: Path,
+    created_project_dirs: list[str],
+    session_dir: Path | None = None,
+    worktree_created: bool = False,
+) -> None:
+    if session_dir is not None:
+        if worktree_created:
+            worktree_path = session_dir / "worktree"
+            run_subproc(
+                ["git", "worktree", "remove", "--force", str(worktree_path)],
+                cwd=repo_dir,
+                timeout=CMD_TIMEOUT_SECONDS,
+            )
+            run_subproc(["git", "worktree", "prune"], cwd=repo_dir, timeout=CMD_TIMEOUT_SECONDS)
+        delete_session_hmac_key(session_dir)
+        shutil.rmtree(session_dir, ignore_errors=True)
+    prune_created_project_dirs(session_root, created_project_dirs)
+
+
+def _summarize_history_entry(entry: Mapping[str, object] | None) -> dict[str, object] | None:
+    if entry is None:
+        return None
+    prev_files = entry.get("changed_files")
+    return {
+        "head_sha": str(entry.get("head_sha") or ""),
+        "merge_base_sha": str(entry.get("merge_base_sha") or ""),
+        "mode": str(entry.get("mode") or ""),
+        "branch": str(entry.get("branch") or ""),
+        "reviewed_at": str(entry.get("reviewed_at") or ""),
+        "verdict": entry.get("verdict"),
+        "review_mode": entry.get("review_mode"),
+        "changed_files": [str(x) for x in prev_files] if isinstance(prev_files, list) else [],
+    }
+
+
+def _resolve_rereview_scope(
+    *,
+    repo_dir: Path,
+    mode: str,
+    is_git_repo: bool,
+    base_sha: str,
+    merge_base_sha: str,
+    head_sha: str,
+    session_root: Path,
+    effective_scope: str,
+    pr_number: int | None,
+    rereview_flag: bool,
+    since_raw: str,
+    only_files: list[str],
+    explicit_source: str,
+) -> tuple[str, str | None, dict[str, object] | None, str | None]:
+    """Resolve (review_base_sha, rereview_source, previous_review_summary, error_msg)."""
+    is_rereview = rereview_flag or bool(since_raw) or bool(only_files)
+    if not is_rereview:
+        if explicit_source != "auto":
+            return (
+                "",
+                None,
+                None,
+                "--rereview-source requires --rereview/--again, --since, or --only-files.",
+            )
+        return merge_base_sha, None, None, None
+
+    if since_raw and mode == "audit":
+        return (
+            "",
+            None,
+            None,
+            "--since is not supported in --audit mode; use --pr, --range, or --local, or pass --only-files.",
+        )
+    if since_raw and not is_git_repo:
+        return "", None, None, "--since requires a git repository."
+
+    candidates, exact_pr_match = load_review_history_candidates(
+        session_root=session_root,
+        effective_scope=effective_scope,
+        repo_dir=repo_dir,
+        pr_number=pr_number,
+    )
+
+    valid_prev_head = ""
+    matched_entry: dict[str, object] | None = None
+    same_head_entry: dict[str, object] | None = None
+    rebased_pr_entry: dict[str, object] | None = None
+
+    if candidates and is_git_repo and head_sha:
+        if mode == "pr" and exact_pr_match:
+            entry = candidates[0]
+            cand_prev = str(entry.get("head_sha") or "").strip()
+            prev_mb = str(entry.get("merge_base_sha") or "").strip()
+            if cand_prev == head_sha and (not prev_mb or prev_mb == merge_base_sha):
+                same_head_entry = entry
+            elif cand_prev and cand_prev != head_sha and git_ref_exists(repo_dir, cand_prev):
+                if prev_mb:
+                    if prev_mb == merge_base_sha:
+                        valid_prev_head = cand_prev
+                        matched_entry = entry
+                    else:
+                        rebased_pr_entry = entry
+                elif _is_git_ancestor(repo_dir, merge_base_sha, cand_prev) and _is_git_ancestor(
+                    repo_dir, cand_prev, head_sha
+                ):
+                    valid_prev_head = cand_prev
+                    matched_entry = entry
+                else:
+                    rebased_pr_entry = entry
+        elif mode == "range":
+            for entry in candidates:
+                commits_rev = entry.get("commits_reviewed")
+                is_commit_history = (
+                    commits_rev is True
+                    if isinstance(commits_rev, bool)
+                    else str(entry.get("mode") or "") in {"pr", "range"}
+                )
+                if not is_commit_history:
+                    continue
+                cand_prev = str(entry.get("head_sha") or "").strip()
+                prev_mb = str(entry.get("merge_base_sha") or "").strip()
+                if not cand_prev:
+                    continue
+                if cand_prev == head_sha and (not prev_mb or prev_mb == merge_base_sha):
+                    same_head_entry = entry
+                    break
+                if (
+                    cand_prev != head_sha
+                    and cand_prev != merge_base_sha
+                    and git_ref_exists(repo_dir, cand_prev)
+                    and (not prev_mb or prev_mb == merge_base_sha)
+                    and _is_git_ancestor(repo_dir, cand_prev, head_sha)
+                    and _is_git_ancestor(repo_dir, merge_base_sha, cand_prev)
+                ):
+                    valid_prev_head = cand_prev
+                    matched_entry = entry
+                    break
+        elif mode == "local":
+            current_branch = get_current_git_branch(repo_dir)
+            for entry in candidates:
+                entry_pr = entry.get("pr_number")
+                entry_branch = str(entry.get("branch") or "").strip()
+                if entry_pr is not None:
+                    if not current_branch or entry_branch != current_branch:
+                        continue
+                elif current_branch and entry_branch and entry_branch != current_branch:
+                    continue
+                cand_prev = str(entry.get("head_sha") or "").strip()
+                if not cand_prev:
+                    continue
+                if cand_prev == head_sha:
+                    same_head_entry = entry
+                    break
+                if git_ref_exists(repo_dir, cand_prev) and _is_git_ancestor(repo_dir, cand_prev, head_sha):
+                    valid_prev_head = cand_prev
+                    matched_entry = entry
+                    break
+
+    prev_summary = _summarize_history_entry(
+        matched_entry or same_head_entry or rebased_pr_entry or (candidates[0] if (mode == "pr" and exact_pr_match and candidates) else None)
+    )
+
+    if since_raw:
+        if not git_ref_exists(repo_dir, since_raw):
+            return "", None, prev_summary, f"Cannot resolve --since git commit ref '{since_raw}'."
+        resolved_since = git_rev_parse(repo_dir, since_raw)
+        if mode in {"pr", "range"} and merge_base_sha:
+            if not _is_git_ancestor(repo_dir, merge_base_sha, resolved_since):
+                return (
+                    "",
+                    None,
+                    prev_summary,
+                    f"Invalid --since ref '{since_raw}' ({resolved_since[:12]}): commit predates or diverges "
+                    f"from merge_base_sha ({merge_base_sha[:12]}). Pass a commit on the current PR/range "
+                    "or use --only-files <paths>.",
+                )
+            if (
+                resolved_since != merge_base_sha
+                and base_sha
+                and _is_git_ancestor(repo_dir, resolved_since, base_sha)
+                and not _is_git_ancestor(repo_dir, resolved_since, head_sha)
+            ):
+                return (
+                    "",
+                    None,
+                    prev_summary,
+                    f"Invalid --since ref '{since_raw}' ({resolved_since[:12]}): commit is on the base branch "
+                    f"ahead of merge_base_sha ({merge_base_sha[:12]}), which would invert base commits. "
+                    "Pass a commit on the target branch or use --only-files <paths>.",
+                )
+        source = explicit_source if explicit_source != "auto" else "commit_diff"
+        return resolved_since, source, prev_summary, None
+
+    if mode in {"pr", "range"}:
+        if rereview_flag and valid_prev_head:
+            source = explicit_source if explicit_source != "auto" else "run_history"
+            return valid_prev_head, source, prev_summary, None
+        if only_files:
+            source = explicit_source if explicit_source != "auto" else "user_instruction"
+            return merge_base_sha, source, prev_summary, None
+        if rebased_pr_entry is not None:
+            err_msg = (
+                f"Re-review scope could not be narrowed automatically: PR base commit changed since the "
+                f"previous review (rebase or base merge; merge_base_sha is now {merge_base_sha[:12]}). "
+                "Pass --since <commit> or --only-files <paths> to avoid mixing base commits."
+            )
+        elif same_head_entry is not None:
+            err_msg = (
+                f"Re-review scope could not be narrowed automatically: HEAD ({head_sha[:12]}) matches "
+                "the previously reviewed commit in run history. Pass --since <commit>, --only-files <paths>, "
+                "or use --local for uncommitted edits."
+            )
+        else:
+            err_msg = (
+                "Re-review scope could not be determined automatically: no applicable newer commit was found "
+                "in run history. Pass --since <commit>, --only-files <paths>, or use --local for uncommitted edits."
+            )
+        return "", None, prev_summary, err_msg
+
+    if mode == "local":
+        has_dirty = _has_uncommitted_local_changes(repo_dir, bool(merge_base_sha))
+        if rereview_flag and valid_prev_head:
+            source = explicit_source if explicit_source != "auto" else "run_history"
+            return valid_prev_head, source, prev_summary, None
+        if only_files:
+            source = explicit_source if explicit_source != "auto" else "user_instruction"
+            return merge_base_sha, source, prev_summary, None
+        if has_dirty:
+            source = explicit_source if explicit_source != "auto" else "commit_diff"
+            return merge_base_sha, source, prev_summary, None
+        return (
+            "",
+            None,
+            prev_summary,
+            "Re-review scope could not be determined in --local mode: working tree has no uncommitted changes "
+            "and no newer commit vs. run history. Pass --since <commit> or --only-files <paths>.",
+        )
+
+    # audit mode
+    if only_files:
+        source = explicit_source if explicit_source != "auto" else "user_instruction"
+        return merge_base_sha, source, prev_summary, None
+    return (
+        "",
+        None,
+        prev_summary,
+        "Re-review in --audit mode requires --only-files <paths> (or use --pr/--range/--local with --since).",
+    )
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
     repo_dir = Path(str(args.repo)).expanduser().resolve()
     if not repo_dir.is_dir():
@@ -863,6 +1176,11 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     offline_meta = load_pr_meta(args.pr_meta)
     skip_test = bool(args.skip_test)
+    rereview_flag = bool(args.rereview)
+    since_raw = str(args.since or "").strip()
+    only_files = normalize_only_files(args.only_files)
+    explicit_rereview_source = str(args.rereview_source or "auto")
+    is_rereview = rereview_flag or bool(since_raw) or bool(only_files)
     is_fork_pr = bool(args.untrusted)
     untrusted_reason: str | None = "cli_untrusted_flag" if is_fork_pr else None
     untrusted_pr_meta: dict[str, object] | None = None
@@ -923,6 +1241,36 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         scope=str(args.session_scope),
         repo_dir=repo_dir,
     )
+    review_base_sha, rereview_source, previous_review_summary, rereview_err = _resolve_rereview_scope(
+        repo_dir=repo_dir,
+        mode=mode,
+        is_git_repo=is_git_repo,
+        base_sha=base_sha,
+        merge_base_sha=merge_base_sha,
+        head_sha=head_sha,
+        session_root=session_root,
+        effective_scope=effective_scope,
+        pr_number=pr_number,
+        rereview_flag=rereview_flag,
+        since_raw=since_raw,
+        only_files=only_files,
+        explicit_source=explicit_rereview_source,
+    )
+    if rereview_err is not None:
+        _cleanup_failed_prepare(
+            repo_dir=repo_dir,
+            session_root=session_root,
+            created_project_dirs=created_project_dirs,
+        )
+        fail_with_code(
+            rereview_err,
+            2,
+            extra={
+                "is_rereview": is_rereview,
+                "previous_review": previous_review_summary,
+            },
+        )
+
     slug = sanitize_slug(f"{repo_dir.name}-{mode}")
     session_id = secrets.token_hex(6)
     session_dir = session_root / f"{SESSION_PREFIX}{slug}-{session_id}"
@@ -938,9 +1286,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             is_git_repo=is_git_repo,
         )
     except RuntimeError as exc:
-        delete_session_hmac_key(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
-        prune_created_project_dirs(session_root, created_project_dirs)
+        _cleanup_failed_prepare(
+            repo_dir=repo_dir,
+            session_root=session_root,
+            created_project_dirs=created_project_dirs,
+            session_dir=session_dir,
+            worktree_created=False,
+        )
         fail_with_code(str(exc), 2)
 
     audit_paths = list(audit_paths_raw) if audit_paths_raw is not None else []
@@ -952,14 +1304,57 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         head_sha=head_sha,
         audit_paths=audit_paths,
         is_git_repo=is_git_repo,
+        review_base_sha=review_base_sha,
+        only_files=only_files,
     )
+    if is_rereview and not changed_files:
+        _cleanup_failed_prepare(
+            repo_dir=repo_dir,
+            session_root=session_root,
+            created_project_dirs=created_project_dirs,
+            session_dir=session_dir,
+            worktree_created=worktree_created,
+        )
+        fail_with_code(
+            "Re-review matched 0 modified files in the specified scope. "
+            "Check --since / --only-files or confirm there are new edits to review.",
+            2,
+            extra={
+                "is_rereview": True,
+                "rereview_source": rereview_source,
+                "review_base_sha": review_base_sha,
+                "only_files": only_files,
+                "previous_review": previous_review_summary,
+            },
+        )
 
     if mode == "audit":
         ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_files(workdir)
+        full_changed_files = changed_files
+    elif is_rereview and mode in ("pr", "range") and (review_base_sha != merge_base_sha or bool(only_files)):
+        full_patch_res = run_cmd(["git", "diff", "-U0", merge_base_sha, head_sha], cwd=repo_dir)
+        full_names_res = run_cmd(["git", "diff", "--name-only", "-z", merge_base_sha, head_sha], cwd=repo_dir)
+        full_changed_files = split_nul_paths(full_names_res.stdout)
+        hazard_diff = full_patch_res.stdout + ("\n" + diff_text if diff_text else "")
+        ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_diff(hazard_diff)
+    elif is_rereview and mode == "local" and bool(only_files):
+        full_changed_files, _, _, full_local_diff = collect_diff_stats(
+            repo_dir=repo_dir,
+            workdir=workdir,
+            mode=mode,
+            merge_base_sha=merge_base_sha,
+            head_sha=head_sha,
+            audit_paths=audit_paths,
+            is_git_repo=is_git_repo,
+            review_base_sha=review_base_sha,
+            only_files=None,
+        )
+        ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_diff(full_local_diff)
     else:
+        full_changed_files = changed_files
         ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_diff(diff_text)
 
-    lockfile_modified = any(Path(f).name in LOCKFILE_NAMES for f in changed_files)
+    lockfile_modified = any(Path(f).name in LOCKFILE_NAMES for f in full_changed_files)
     risk_signals, recommended_guidelines = detect_signals_and_guidelines(
         changed_files=changed_files,
         testable_code_files=testable_code_files,
@@ -969,12 +1364,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         lockfile_modified=lockfile_modified,
         code_diff_lines=code_diff_lines,
     )
+    effective_review_md_base = review_base_sha if (mode == "local" and review_base_sha) else base_sha
     base_review_md = extract_base_review_md(
         repo_dir=repo_dir,
         workdir=workdir,
         session_dir=session_dir,
         mode=mode,
-        base_sha=base_sha,
+        base_sha=effective_review_md_base,
     )
 
     draft_findings_path = str(session_dir / "draft_findings.json")
@@ -999,6 +1395,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "review_output_path": review_output_path,
         "mode": mode,
         "skip_test": skip_test,
+        "skip_test_revoked": False,
+        "skip_test_revoked_reason": "",
+        "is_rereview": is_rereview,
+        "rereview_source": rereview_source,
+        "review_base_sha": review_base_sha,
+        "only_files": only_files,
+        "previous_review": previous_review_summary,
         "pr_number": pr_number,
         "audit_paths": audit_paths,
         "base_sha": base_sha,
@@ -1087,9 +1490,14 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "review_output_path": review_output_path,
         "mode": mode,
         "skip_test": skip_test,
+        "is_rereview": is_rereview,
+        "rereview_source": rereview_source,
         "base_sha": base_sha,
         "head_sha": head_sha,
         "merge_base_sha": merge_base_sha,
+        "review_base_sha": review_base_sha,
+        "only_files": only_files,
+        "previous_review": previous_review_summary,
         "is_fork_pr": is_fork_pr,
         "untrusted_reason": untrusted_reason,
         "ci_script_hazard": ci_script_hazard,
@@ -1154,6 +1562,14 @@ def cmd_gate_stage1(args: argparse.Namespace) -> int:
             2,
         )
 
+    if bool(state.get("skip_test_revoked", False)):
+        fail_with_code(
+            "Stage 1 gate locked: --skip-test was revoked because Stage 2 tests are failing "
+            "(failing tests cannot be skipped; stop with stage1_ng output).",
+            2,
+            extra={"skip_test_revoked": True},
+        )
+
     workdir = Path(str(state.get("workdir") or "")).resolve()
     mode = str(state.get("mode") or "")
     testable_raw = state.get("testable_code_files")
@@ -1167,6 +1583,12 @@ def cmd_gate_stage1(args: argparse.Namespace) -> int:
         fail_with_code(f"Invalid --verdict '{args.verdict}': expected OK, NG, EXEMPT, or SKIP.", 2)
     if verdict == "SKIP" and not skip_test:
         fail_with_code("verdict SKIP requires --skip-test.", 2)
+    if has_stage2_test_failure(state) and skip_test and verdict in {"NG", "SKIP", "EXEMPT"}:
+        fail_with_code(
+            "Cannot bypass Stage 1 with --skip-test because Stage 2 tests are failing.",
+            2,
+            extra={"skip_test_revoked": True},
+        )
 
     if verdict == "OK":
         raw_csv = str(args.verified_tests or "").strip()
@@ -1269,6 +1691,7 @@ def cmd_gate_stage1(args: argparse.Namespace) -> int:
             }
 
     state["stage1"] = stage1_obj
+    state["stage5"] = reset_stage5_state()
     write_sealed_gate_state(session_dir, state)
     emit_json({"status": "ok", "session_dir": str(session_dir), "skip_test": skip_test, "stage1": stage1_obj})
     return 0
@@ -1464,7 +1887,17 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
     stage1 = state.get("stage1")
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
     if not is_stage1_passed_or_skipped(state):
-        fail_with_code(f"Cannot prepare Stage 4: Stage 1 status is '{s1_status}'.", 2)
+        revoked = bool(state.get("skip_test_revoked", False))
+        detail = (
+            f" (--skip-test revoked: {state.get('skip_test_revoked_reason')})"
+            if revoked
+            else ""
+        )
+        fail_with_code(
+            f"Cannot prepare Stage 4: Stage 1 status is '{s1_status}'{detail}.",
+            2,
+            extra={"stage1_status": s1_status, "skip_test_revoked": revoked},
+        )
 
     stage2 = state.get("stage2")
     if not isinstance(stage2, dict) or stage2.get("executed") is not True:
@@ -1536,6 +1969,13 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
     challenge_nonce = secrets.token_hex(16)
     nonce_sha256 = sha256_bytes(challenge_nonce.encode("utf-8"))
 
+    review_base_sha_val = str(state.get("review_base_sha") or state.get("merge_base_sha") or "")
+    is_rereview_val = bool(state.get("is_rereview", False))
+    rereview_source_val = state.get("rereview_source")
+    only_files_raw = state.get("only_files")
+    only_files_list = [str(x) for x in only_files_raw] if isinstance(only_files_raw, list) else []
+    prev_review_raw = state.get("previous_review")
+
     md_lines: list[str] = [
         "# Stage 4 Adversarial Verification Input (Reasoning-Stripped)",
         "",
@@ -1547,13 +1987,38 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
         f"- Mode: `{state.get('mode')}`",
         f"- Workdir: `{state.get('workdir')}`",
         f"- Merge Base SHA: `{state.get('merge_base_sha')}`",
+        f"- Review Base SHA: `{review_base_sha_val}`",
         f"- Head SHA: `{state.get('head_sha')}`",
+        f"- Re-review Mode: `{is_rereview_val}`" + (f" (source=`{rereview_source_val}`)" if is_rereview_val else ""),
         f"- Fork PR: `{state.get('is_fork_pr')}`",
         f"- CI Script Hazard: `{state.get('ci_script_hazard')}`",
         f"- Stage 1 Status: `{s1_status}` (skip_test=`{bool(state.get('skip_test', False))}`)",
-        "",
-        "### Changed Files",
     ]
+    if is_rereview_val:
+        if only_files_list:
+            md_lines.append(f"- Only Files Filter: `{', '.join(only_files_list)}`")
+        if isinstance(prev_review_raw, dict) and prev_review_raw.get("head_sha"):
+            md_lines.append(
+                f"- Previous Reviewed Commit: `{str(prev_review_raw.get('head_sha'))}` "
+                f"(verdict=`{prev_review_raw.get('verdict')}`, reviewed_at=`{prev_review_raw.get('reviewed_at')}`)"
+            )
+        mode_str = str(state.get("mode") or "")
+        head_sha_val = str(state.get("head_sha") or "")
+        scope_expr = (
+            f"git diff {review_base_sha_val} + untracked files in workdir"
+            if mode_str == "local"
+            else f"{review_base_sha_val}..{head_sha_val}"
+        )
+        md_lines.append(
+            f"- Re-review Scope Rule: Audit ONLY the modified scope (`{scope_expr}` / `Changed Files` below). "
+            "Verify prior fix completeness and new regressions/side effects; do NOT re-raise unrelated findings in untouched files."
+        )
+    md_lines.extend(
+        [
+            "",
+            "### Changed Files",
+        ]
+    )
     md_lines.extend([f"- `{f}`" for f in changed_files] or ["- (none)"])
     md_lines.extend(["", "### Testable Code Files (Must Be Covered in `checked_files`)"])
     md_lines.extend([f"- `{f}`" for f in testable_files] or ["- (none)"])
@@ -1657,6 +2122,18 @@ def _validate_and_record_stage4_response(
     resp_obj: Mapping[str, object],
     resp_src_path: Path | None,
 ) -> dict[str, object]:
+    if not is_stage1_passed_or_skipped(state):
+        stage1 = state.get("stage1")
+        s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+        revoked = bool(state.get("skip_test_revoked", False))
+        fail_with_code(
+            f"Cannot record Stage 4: Stage 1 status is '{s1_status}'"
+            + (f" (--skip-test revoked: {state.get('skip_test_revoked_reason')})" if revoked else "")
+            + ".",
+            2,
+            extra={"stage1_status": s1_status, "skip_test_revoked": revoked},
+        )
+
     stage2 = state.get("stage2")
     if not isinstance(stage2, dict) or stage2.get("executed") is not True:
         fail_with_code("Cannot record Stage 4: Stage 2 was not executed.", 2)
@@ -1874,6 +2351,18 @@ def cmd_run_stage4_cli(args: argparse.Namespace) -> int:
     session_dir = Path(str(args.session)).expanduser().resolve()
     state = read_verified_gate_state(session_dir)
 
+    if not is_stage1_passed_or_skipped(state):
+        stage1 = state.get("stage1")
+        s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+        revoked = bool(state.get("skip_test_revoked", False))
+        fail_with_code(
+            f"Cannot run Stage 4 CLI: Stage 1 status is '{s1_status}'"
+            + (f" (--skip-test revoked: {state.get('skip_test_revoked_reason')})" if revoked else "")
+            + ".",
+            2,
+            extra={"stage1_status": s1_status, "skip_test_revoked": revoked},
+        )
+
     adv_input_path = session_dir / "adversarial_input.md"
     if not adv_input_path.is_file():
         fail_with_code("Cannot run Stage 4 CLI: prepare-stage4 must be run first.", 2)
@@ -2042,7 +2531,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_prep.add_argument(
         "--skip-test",
         action="store_true",
-        help="Continue full review through Stage 2-5 even when Stage 1 Test Gate verdict is NG.",
+        help="Continue past Stage 1 test-sufficiency NG/SKIP when tests pass (revoked if Stage 2 tests fail).",
+    )
+    p_prep.add_argument(
+        "--rereview",
+        "--again",
+        dest="rereview",
+        action="store_true",
+        help="Re-review only newly modified parts using --since, --only-files, or previous run history.",
+    )
+    p_prep.add_argument(
+        "--since",
+        default=None,
+        help="Explicit git commit/ref to diff from during re-review (narrows review scope to <since>..HEAD/head).",
+    )
+    p_prep.add_argument(
+        "--only-files",
+        action="append",
+        default=None,
+        help="Comma-separated or repeatable repo-relative file paths to restrict review scope.",
+    )
+    p_prep.add_argument(
+        "--rereview-source",
+        choices=["auto", "user_instruction", "chat_history", "run_history", "commit_diff"],
+        default="auto",
+        help="Source used to determine the re-review scope (default: auto).",
     )
 
     p_s1 = sub.add_parser("gate-stage1", help="Record Stage 1 Test Sufficiency Gate verdict.")
@@ -2055,7 +2568,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_s1.add_argument(
         "--skip-test",
         action="store_true",
-        help="Continue full review through Stage 2-5 regardless of Stage 1 test verdict.",
+        help="Continue past Stage 1 test-sufficiency NG/SKIP when tests pass (revoked if Stage 2 tests fail).",
     )
 
     p_p4 = sub.add_parser("prepare-stage4", help="Generate reasoning-stripped adversarial_input.md with challenge_nonce.")
