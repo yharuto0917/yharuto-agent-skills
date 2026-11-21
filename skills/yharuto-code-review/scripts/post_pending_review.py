@@ -25,7 +25,11 @@ from _lib import (  # noqa: E402
     emit_json,
     fail_with_code,
     find_fenced_lines,
+    has_stage2_test_failure,
+    is_stage1_passed_or_skipped,
+    normalize_rel_path,
     read_verified_gate_state,
+    run_subproc,
     sha256_file,
     split_markdown_table_row,
     write_json_atomic,
@@ -50,10 +54,7 @@ class SectionRange:
 
 
 def strip_dot_slash(raw_path: str) -> str:
-    cleaned = raw_path.replace("\\", "/")
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    return cleaned
+    return normalize_rel_path(raw_path)
 
 
 def convert_relative_links_to_blob(
@@ -216,24 +217,12 @@ def extract_primary_location(subsection_lines: Sequence[str]) -> tuple[str, int 
 def compute_diff_hunks(repo_dir: Path, merge_base_sha: str, head_sha: str) -> dict[str, list[set[int]]]:
     if not merge_base_sha or not head_sha:
         return {}
-    env = dict(os.environ)
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    try:
-        proc = subprocess.run(
-            ["git", "diff", "-U3", merge_base_sha, head_sha],
-            cwd=str(repo_dir),
-            env=env,
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if proc.returncode != 0:
+    proc = run_subproc(
+        ["git", "diff", "-U3", merge_base_sha, head_sha],
+        cwd=repo_dir,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if proc is None or proc.returncode != 0:
         return {}
 
     hunks_by_file: dict[str, list[set[int]]] = {}
@@ -549,9 +538,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stage1 = raw_state.get("stage1")
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-    if s1_status == "NG":
-        review_mode = "stage1_ng"
-    elif s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+    if is_stage1_passed_or_skipped(raw_state):
         stage2 = raw_state.get("stage2")
         stage3 = raw_state.get("stage3")
         stage4 = raw_state.get("stage4")
@@ -566,8 +553,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         ):
             fail_with_code("Cannot post review: Stage 4 adversarial verification was not completed.", 2)
         review_mode = "full"
+    elif s1_status == "NG" or (
+        s1_status == "SKIPPED_BY_FLAG"
+        and (bool(raw_state.get("skip_test_revoked", False)) or has_stage2_test_failure(raw_state))
+    ):
+        review_mode = "stage1_ng"
     else:
         fail_with_code(f"Cannot post review: invalid Stage 1 status '{s1_status}'.", 2)
+
+    stage5_mode = str(stage5.get("mode") or "").strip()
+    if (stage5_mode == "stage1_ng") != (review_mode == "stage1_ng"):
+        fail_with_code(
+            f"Cannot post review: stage5 validated mode '{stage5_mode}' does not match current session review mode '{review_mode}'. "
+            "Re-run validate_review_output.py --session.",
+            2,
+        )
 
     repo_dir = Path(str(raw_state.get("repo_dir") or ".")).resolve()
     merge_base_sha = str(raw_state.get("merge_base_sha") or raw_state.get("base_sha") or "")

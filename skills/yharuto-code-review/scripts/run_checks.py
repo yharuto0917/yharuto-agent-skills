@@ -23,11 +23,16 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from _lib import (  # noqa: E402
+    ALLOWED_STAGE1_SKIP_STATUSES,
     detect_ci_script_hazard_in_files,
     emit_json,
+    extract_failed_gh_check_names,
     fail_with_code,
+    find_stage2_test_failures,
+    is_stage1_passed_or_skipped,
     prune_created_project_dirs,
     read_verified_gate_state,
+    reset_stage5_state,
     resolve_session_root,
     run_subproc,
     sha256_file,
@@ -307,6 +312,7 @@ def evaluate_pr_meta_checks(
         checks_raw = untrusted_pr_meta.get("checks")
         if isinstance(checks_raw, list) and len(checks_raw) > 0:
             summary_lines: list[str] = []
+            failed_checks: list[str] = []
             any_failed = False
             any_pending = False
             for entry in checks_raw:
@@ -316,6 +322,7 @@ def evaluate_pr_meta_checks(
                     summary_lines.append(f"{cname}: {disp}")
                     if cls == "failed":
                         any_failed = True
+                        failed_checks.append(cname)
                     elif cls == "pending":
                         any_pending = True
                 else:
@@ -338,6 +345,8 @@ def evaluate_pr_meta_checks(
                 "exit_code": exit_code,
                 "summary_lines": summary_lines[:SUMMARY_TAIL_LINES],
             }
+            if failed_checks:
+                chk["failed_checks"] = failed_checks
             return chk, "[gh_pr_checks (from pr_meta)]\n" + "\n".join(summary_lines) + "\n"
 
     if pr_number is not None and not is_offline and shutil.which("gh") is not None:
@@ -376,14 +385,19 @@ def evaluate_pr_meta_checks(
                 status = "pending"
             else:
                 status = "failed"
+            live_chk: dict[str, object] = {
+                "tool": "gh_pr_checks",
+                "cmd": ["gh", "pr", "checks", str(pr_number)],
+                "status": status,
+                "exit_code": res.returncode,
+                "summary_lines": lines[-SUMMARY_TAIL_LINES:],
+            }
+            if status == "failed":
+                live_failed_checks = extract_failed_gh_check_names(lines)
+                if live_failed_checks:
+                    live_chk["failed_checks"] = live_failed_checks
             return (
-                {
-                    "tool": "gh_pr_checks",
-                    "cmd": ["gh", "pr", "checks", str(pr_number)],
-                    "status": status,
-                    "exit_code": res.returncode,
-                    "summary_lines": lines[-SUMMARY_TAIL_LINES:],
-                },
+                live_chk,
                 f"[gh pr checks {pr_number}] exit={res.returncode} status={status}\n{combined}\n",
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -465,6 +479,205 @@ def run_static_syntax_checks(workdir: Path, changed_files: Sequence[str]) -> tup
     )
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+UNITTEST_FAIL_ID_RE = re.compile(r"^(?:FAIL|ERROR):\s+(.+)$", re.MULTILINE)
+PYTEST_SUMMARY_FAIL_ID_RE = re.compile(
+    r"^(?:FAILED|ERROR)\s+([^\r\n]+?::[^\r\n]+?)(?:\s+-\s+.*)?$",
+    re.MULTILINE,
+)
+PYTEST_COLLECT_ERR_ID_RE = re.compile(r"^ERROR\s+(\S+\.py)\b", re.MULTILINE)
+PYTEST_INLINE_FAIL_ID_RE = re.compile(r"^(\S+\.py::\S+)\s+(?:FAILED|ERROR)\b", re.MULTILINE)
+TAP_FAIL_ID_RE = re.compile(r"^\s*not ok\s+\d+(?:\s+-\s+|\s+)([^\r\n]+?)\s*$", re.MULTILINE)
+TAP_SKIP_TODO_RE = re.compile(r"#\s*(?:SKIP|TODO)\b", re.IGNORECASE)
+TAP_TIME_COMMENT_RE = re.compile(r"\s*#\s*time=[0-9.]+m?s.*$", re.IGNORECASE)
+JEST_FAIL_ID_RE = re.compile(r"^\s*●\s+(.+?)\s*$", re.MULTILINE)
+SPEC_CROSS_FAIL_ID_RE = re.compile(
+    r"^\s*[✖✕×]\s+(.+?)(?:\s+\(?[0-9.]+\s*m?s\)?)?\s*$",
+    re.MULTILINE,
+)
+VITEST_FAIL_ID_RE = re.compile(r"^\s*FAIL\s+(\S+\s+>\s+.+?)(?:\s+\[[^\]]*\])?\s*$", re.MULTILINE)
+GO_FAIL_ID_RE = re.compile(r"^\s*---\s*FAIL:\s+(\S+)", re.MULTILINE)
+CARGO_FAIL_ID_RE = re.compile(r"^test\s+(.+?)\s+\.\.\.\s+FAILED\s*$", re.MULTILINE)
+
+UNITTEST_SUMMARY_COUNT_RE = re.compile(r"^FAILED\s*\(([^)]+)\)\s*$", re.MULTILINE)
+PYTEST_SUMMARY_LINE_RE = re.compile(
+    r"(?:^|=+\s*)([^\n=]*\b\d+\s+(?:failed|errors?)\b[^\n=]*)\s+in\s+[0-9.]+s",
+    re.MULTILINE,
+)
+TAP_SUMMARY_COUNT_RE = re.compile(r"^(?:#|ℹ)\s*(?:fail|failed)\s+(\d+)\b", re.MULTILINE)
+JEST_SUMMARY_COUNT_RE = re.compile(r"Tests:?\s+(?:[^\n]*?,\s*)?(\d+)\s+failed\b")
+MOCHA_SUMMARY_COUNT_RE = re.compile(r"^\s*(\d+)\s+failing\b", re.MULTILINE)
+CARGO_SUMMARY_COUNT_RE = re.compile(r"test result:\s*FAILED\.\s*\d+\s+passed;\s*(\d+)\s+failed\b")
+DIAGNOSTIC_ERROR_LINE_RE = re.compile(
+    r"^(?:(?:Assertion)?Error:|error(?:\[[A-Z0-9]+\])?:|FAIL\b|[✗✘]\s+|"
+    r"\S+:\d+(?::\d+)?:\s*(?:[A-Z]\d+\s+|error\b)|.*\berror\s+TS\d+:)",
+    re.MULTILINE,
+)
+
+
+def extract_failure_signature(raw_output: str, workdir: Path) -> tuple[list[str], int | None]:
+    """Extract normalized failed test/check identifiers and total failure count from runner output."""
+    cleaned = ANSI_ESCAPE_RE.sub("", raw_output)
+    for prefix in dict.fromkeys((str(workdir.resolve()), str(workdir))):
+        if prefix:
+            cleaned = cleaned.replace(prefix, "<WORKDIR>")
+
+    failed_ids: set[str] = set()
+    for m in UNITTEST_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"unittest:{m.group(1).strip()}")
+    for m in PYTEST_SUMMARY_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"pytest:{m.group(1).strip()}")
+    for m in PYTEST_COLLECT_ERR_ID_RE.finditer(cleaned):
+        failed_ids.add(f"pytest_collect:{m.group(1).strip()}")
+    for m in PYTEST_INLINE_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"pytest:{m.group(1).strip()}")
+    for m in TAP_FAIL_ID_RE.finditer(cleaned):
+        raw_label = m.group(1).strip()
+        if raw_label and not TAP_SKIP_TODO_RE.search(raw_label):
+            label = TAP_TIME_COMMENT_RE.sub("", raw_label).strip()
+            if label:
+                failed_ids.add(f"tap:{label}")
+    for m in JEST_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"jest:{m.group(1).strip()}")
+    for m in SPEC_CROSS_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"spec:{m.group(1).strip()}")
+    for m in VITEST_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"vitest:{m.group(1).strip()}")
+    for m in GO_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"go:{m.group(1).strip()}")
+    for m in CARGO_FAIL_ID_RE.finditer(cleaned):
+        failed_ids.add(f"cargo:{m.group(1).strip()}")
+
+    failure_count: int | None = None
+    ut_matches = list(UNITTEST_SUMMARY_COUNT_RE.finditer(cleaned))
+    pt_matches = list(PYTEST_SUMMARY_LINE_RE.finditer(cleaned))
+    tap_matches = list(TAP_SUMMARY_COUNT_RE.finditer(cleaned))
+    jest_matches = list(JEST_SUMMARY_COUNT_RE.finditer(cleaned))
+    mocha_matches = list(MOCHA_SUMMARY_COUNT_RE.finditer(cleaned))
+    cargo_matches = list(CARGO_SUMMARY_COUNT_RE.finditer(cleaned))
+
+    if ut_matches:
+        failure_count = sum(
+            int(x)
+            for m_ut in ut_matches
+            for x in re.findall(r"\b(?:failures|errors)=(\d+)\b", m_ut.group(1))
+        )
+    elif pt_matches:
+        failure_count = sum(
+            int(x)
+            for m_pt in pt_matches
+            for x in re.findall(r"\b(\d+)\s+(?:failed|errors?)\b", m_pt.group(1))
+        )
+    elif tap_matches:
+        failure_count = sum(int(m_t.group(1)) for m_t in tap_matches)
+    elif jest_matches:
+        failure_count = sum(int(m_j.group(1)) for m_j in jest_matches)
+    elif mocha_matches:
+        failure_count = sum(int(m_m.group(1)) for m_m in mocha_matches)
+    elif cargo_matches:
+        failure_count = sum(int(m_c.group(1)) for m_c in cargo_matches)
+    elif failed_ids:
+        failure_count = len(failed_ids)
+    else:
+        diag_hits = DIAGNOSTIC_ERROR_LINE_RE.findall(cleaned)
+        if diag_hits:
+            failure_count = len(diag_hits)
+
+    return sorted(failed_ids), failure_count
+
+
+def _as_optional_int(val: object) -> int | None:
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    return None
+
+
+def _compare_head_and_base_failures(
+    head_chk: Mapping[str, object],
+    base_chk: Mapping[str, object],
+) -> tuple[bool, list[str]]:
+    """Return (is_regression, newly_failed_ids) comparing head vs merge_base failure details."""
+    raw_head_ids = head_chk.get("failed_tests")
+    raw_base_ids = base_chk.get("failed_tests")
+    head_ids = {str(x) for x in raw_head_ids} if isinstance(raw_head_ids, list) else set()
+    base_ids = {str(x) for x in raw_base_ids} if isinstance(raw_base_ids, list) else set()
+
+    head_count = _as_optional_int(head_chk.get("failure_count"))
+    base_count = _as_optional_int(base_chk.get("failure_count"))
+
+    if head_ids:
+        new_ids = sorted(head_ids - base_ids)
+        if new_ids:
+            return True, new_ids
+        if head_count is not None and base_count is not None and head_count > base_count:
+            return True, []
+        return False, []
+
+    if base_ids:
+        # Base executed identifiable tests while head collapsed before test execution (e.g. import/collection crash)
+        return True, []
+
+    if head_count is not None and base_count is not None:
+        return head_count > base_count, []
+    if head_count is not None and head_count > 0 and base_count is None:
+        return True, []
+
+    head_lines = head_chk.get("summary_lines")
+    base_lines = base_chk.get("summary_lines")
+    if isinstance(head_lines, list) and isinstance(base_lines, list):
+        return head_lines != base_lines, []
+    return False, []
+
+
+def _apply_base_comparison_result(
+    chk: dict[str, object],
+    base_chk: Mapping[str, object],
+    tool_name: str,
+    merge_base_sha: str,
+    log_chunks: list[str],
+) -> None:
+    base_st = str(base_chk.get("status") or "")
+    if base_st in {"passed", "timed_out"}:
+        chk["status"] = "failed"
+        chk["failure_origin"] = "regression"
+        log_chunks.append(
+            f"[base_worktree:{tool_name}] Status '{base_st}' on merge_base_sha -> regression ('failed').\n"
+        )
+        return
+    if base_st != "failed":
+        chk["failure_origin"] = "unknown"
+        return
+
+    is_reg, new_failed_ids = _compare_head_and_base_failures(chk, base_chk)
+    summary_existing = chk.get("summary_lines")
+    if is_reg:
+        chk["status"] = "failed"
+        chk["failure_origin"] = "regression"
+        if new_failed_ids:
+            chk["new_failed_tests"] = new_failed_ids[:50]
+        detail = (
+            f"new failed tests {new_failed_ids[:5]}"
+            if new_failed_ids
+            else f"failure count increased ({base_chk.get('failure_count')} -> {chk.get('failure_count')})"
+        )
+        note = f"Note: '{tool_name}' introduced regression on top of preexisting base failures ({detail})."
+        if isinstance(summary_existing, list):
+            summary_existing.append(note)
+        log_chunks.append(
+            f"[base_worktree:{tool_name}] {detail} compared to merge_base_sha -> regression ('failed').\n"
+        )
+        return
+
+    chk["status"] = "failed_preexisting"
+    chk["failure_origin"] = "preexisting"
+    note = f"Note: '{tool_name}' failed identically on merge_base_sha ({merge_base_sha[:12]}) -> failed_preexisting."
+    if isinstance(summary_existing, list):
+        summary_existing.append(note)
+    log_chunks.append(
+        f"[base_worktree:{tool_name}] Identical failures ({base_st}) on merge_base_sha -> 'failed_preexisting'.\n"
+    )
+
+
 def execute_single_command(
     tool: str,
     cmd: Sequence[str],
@@ -522,20 +735,25 @@ def execute_single_command(
     else:
         status = "failed"
 
+    entry: dict[str, object] = {
+        "tool": tool,
+        "cmd": list(cmd),
+        "status": status,
+        "exit_code": proc.returncode,
+        "summary_lines": lines[-SUMMARY_TAIL_LINES:] if lines else [f"Exited with code {proc.returncode}"],
+    }
+    if status == "failed":
+        failed_ids, failure_count = extract_failure_signature(combined, workdir)
+        if failed_ids:
+            entry["failed_tests"] = failed_ids[:200]
+        if failure_count is not None:
+            entry["failure_count"] = failure_count
+
     log_section = (
         f"=== [{tool}] cmd={' '.join(cmd)} exit={proc.returncode} status={status} ===\n"
         f"{combined}\n\n"
     )
-    return (
-        {
-            "tool": tool,
-            "cmd": list(cmd),
-            "status": status,
-            "exit_code": proc.returncode,
-            "summary_lines": lines[-SUMMARY_TAIL_LINES:] if lines else [f"Exited with code {proc.returncode}"],
-        },
-        log_section,
-    )
+    return entry, log_section
 
 
 def reverify_failures_against_base(
@@ -620,25 +838,7 @@ def reverify_failures_against_base(
                 timeout_seconds=timeout_seconds,
             )
             log_chunks.append(base_log)
-            base_st = str(base_chk.get("status") or "")
-            if base_st == "passed":
-                chk["status"] = "failed"
-                chk["failure_origin"] = "regression"
-                log_chunks.append(
-                    f"[base_worktree:{tool_name}] Passed on merge_base_sha -> regression ('failed').\n"
-                )
-            elif base_st in {"failed", "timed_out"}:
-                chk["status"] = "failed_preexisting"
-                chk["failure_origin"] = "preexisting"
-                summary_existing = chk.get("summary_lines")
-                note = f"Note: '{tool_name}' also failed on merge_base_sha ({merge_base_sha[:12]}) -> failed_preexisting."
-                if isinstance(summary_existing, list):
-                    summary_existing.append(note)
-                log_chunks.append(
-                    f"[base_worktree:{tool_name}] Also {base_st} on merge_base_sha -> 'failed_preexisting'.\n"
-                )
-            else:
-                chk["failure_origin"] = "unknown"
+            _apply_base_comparison_result(chk, base_chk, tool_name, merge_base_sha, log_chunks)
     finally:
         for link_p in base_links:
             try:
@@ -724,17 +924,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         stage1 = state.get("stage1")
         s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-        if s1_status not in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+        if not is_stage1_passed_or_skipped(state):
+            revoked = bool(state.get("skip_test_revoked", False))
+            reason_suffix = (
+                f" (--skip-test revoked: {state.get('skip_test_revoked_reason')})"
+                if revoked
+                else ""
+            )
             fail_with_code(
-                f"Stage 2 blocked: Stage 1 gate status must be OK or EXEMPT_NO_TESTABLE_CODE (current: '{s1_status}').",
+                f"Stage 2 blocked: Stage 1 gate status must be OK or EXEMPT_NO_TESTABLE_CODE "
+                f"(or NG/SKIPPED_BY_FLAG with active --skip-test; current: '{s1_status}'){reason_suffix}.",
                 2,
-                extra={"stage1_status": s1_status},
+                extra={
+                    "stage1_status": s1_status,
+                    "skip_test": bool(state.get("skip_test", False)),
+                    "skip_test_revoked": revoked,
+                },
             )
 
         mode = str(state.get("mode") or "")
         workdir = Path(str(state.get("workdir") or "")).resolve()
         repo_dir = Path(str(state.get("repo_dir") or workdir)).resolve()
         merge_base_sha = str(state.get("merge_base_sha") or "")
+        review_base_sha = str(state.get("review_base_sha") or "")
+        head_sha = str(state.get("head_sha") or "")
         is_fork_pr = bool(state.get("is_fork_pr", False))
         ci_script_hazard = bool(state.get("ci_script_hazard", False))
         lockfile_modified = bool(state.get("lockfile_modified", False))
@@ -752,6 +965,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         mode = "standalone"
         repo_dir = workdir
         merge_base_sha = ""
+        review_base_sha = ""
+        head_sha = ""
         is_fork_pr = False
         ci_script_hazard, _ = detect_ci_script_hazard_in_files(workdir)
         lockfile_modified = False
@@ -894,16 +1109,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                         checks_out.append(chk_entry)
                         log_chunks.append(chk_log)
 
+                reverify_base_sha = (
+                    review_base_sha
+                    if (mode == "local" and review_base_sha and review_base_sha != head_sha)
+                    else merge_base_sha
+                )
                 if (
                     session_dir is not None
                     and mode in {"pr", "range", "local"}
-                    and merge_base_sha
+                    and reverify_base_sha
                     and any(c.get("status") == "failed" for c in checks_out)
                 ):
                     reverify_failures_against_base(
                         session_dir=session_dir,
                         repo_dir=repo_dir,
-                        merge_base_sha=merge_base_sha,
+                        merge_base_sha=reverify_base_sha,
                         checks_out=checks_out,
                         env=env,
                         bind_repo_deps=bind_repo_deps,
@@ -933,6 +1153,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     write_sealed_gate_state(session_dir, state)
 
         overall_status = compute_overall_status(checks_out, block_status=block_status)
+
+        skip_test_revoked = False
+        skip_test_revoked_reason = ""
+        if session_dir is not None:
+            s1_state = state.get("stage1")
+            was_stage1_bypassed = isinstance(s1_state, dict) and (
+                s1_state.get("bypassed_by_skip_test") is True
+                or (bool(state.get("skip_test", False)) and s1_state.get("status") in ALLOWED_STAGE1_SKIP_STATUSES)
+            )
+            failed_test_tools = find_stage2_test_failures(checks_out)
+            if was_stage1_bypassed and failed_test_tools:
+                skip_test_revoked = True
+                tools_csv = ", ".join(failed_test_tools)
+                skip_test_revoked_reason = (
+                    f"Stage 2 test check(s) failed ({tools_csv}); --skip-test cannot bypass failing tests."
+                )
+                log_chunks.append(f"[skip_test_guard] REVOKED: {skip_test_revoked_reason}\n")
+
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text("".join(log_chunks), encoding="utf-8")
         log_sha = sha256_file(log_path)
@@ -947,6 +1185,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "log_sha256": log_sha,
                 "updated_at": utc_now_iso(),
             }
+            state["stage5"] = reset_stage5_state()
+            if skip_test_revoked:
+                state["skip_test_revoked"] = True
+                state["skip_test_revoked_reason"] = skip_test_revoked_reason
+                s1_prev = state.get("stage1")
+                if isinstance(s1_prev, dict):
+                    s1_next = dict(s1_prev)
+                    s1_next["bypassed_by_skip_test"] = False
+                    s1_next["status"] = "NG"
+                    prev_gaps = s1_next.get("gaps_count")
+                    if not isinstance(prev_gaps, int) or isinstance(prev_gaps, bool) or prev_gaps < 1:
+                        s1_next["gaps_count"] = 1
+                    prev_summary = str(s1_next.get("summary") or "").strip()
+                    s1_next["summary"] = (
+                        f"{prev_summary} / {skip_test_revoked_reason}"
+                        if prev_summary
+                        else skip_test_revoked_reason
+                    )
+                    s1_next["updated_at"] = utc_now_iso()
+                    state["stage1"] = s1_next
             write_sealed_gate_state(session_dir, state)
     finally:
         if args.workdir is not None:
@@ -958,15 +1216,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             if standalone_root is not None and standalone_created_dirs:
                 prune_created_project_dirs(standalone_root, standalone_created_dirs)
 
-    emit_json(
-        {
-            "overall_status": overall_status,
-            "execution_policy": execution_policy,
-            "checks": checks_out,
-            "log_sha256": log_sha,
-        }
-    )
-    # Stage 2 MUST return exit 0 even when checks fail so the pipeline always advances to Stage 3.
+    result_payload: dict[str, object] = {
+        "overall_status": overall_status,
+        "execution_policy": execution_policy,
+        "checks": checks_out,
+        "log_sha256": log_sha,
+    }
+    if skip_test_revoked:
+        result_payload["skip_test_revoked"] = True
+        result_payload["skip_test_revoked_reason"] = skip_test_revoked_reason
+        result_payload["required_output_mode"] = "stage1_ng"
+    emit_json(result_payload)
+    # Stage 2 returns exit 0 even when checks fail (when skip_test_revoked is true, Stage 3-5 gates enforce stage1_ng).
     return 0
 
 
