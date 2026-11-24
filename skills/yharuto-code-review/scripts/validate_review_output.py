@@ -461,7 +461,7 @@ def validate_gate_state(
     if not state_path.is_file():
         return "full", {}, [f"gate_state.json does not exist in session_dir: {session_dir}"], False, False
 
-    with session_state_lock(session_dir):
+    with session_state_lock(session_dir, create_dir=False):
         try:
             raw_state: object = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -1281,80 +1281,88 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     passed = len(gate_errors) == 0 and len(structural_errors) == 0 and len(prose_warnings) == 0
 
-    if (
-        session_dir is not None
-        and (session_dir / "gate_state.json").is_file()
-        and state
-        and hmac_ok
-        and load_session_hmac_key(session_dir) is not None
-    ):
-        with session_state_lock(session_dir):
-            state_path = session_dir / "gate_state.json"
-            state_changed_concurrently = False
-            concurrent_err = ""
-            try:
-                latest_raw: object = json.loads(state_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                state_changed_concurrently = True
-                concurrent_err = f"Failed to re-read gate_state.json before Stage 5 commit: {exc}"
-                latest_raw = None
-
-            if not state_changed_concurrently:
-                if not isinstance(latest_raw, dict):
+    if session_dir is not None and state and hmac_ok:
+        state_path = session_dir / "gate_state.json"
+        if not session_dir.is_dir() or not state_path.is_file() or load_session_hmac_key(session_dir) is None:
+            gate_errors.append(
+                "Stage 5 validation aborted: session gate_state.json or HMAC key is missing before commit "
+                "(session may have been cleaned up concurrently); cannot record Stage 5 validation."
+            )
+            passed = False
+        else:
+            with session_state_lock(session_dir, create_dir=False):
+                state_changed_concurrently = False
+                concurrent_err = ""
+                if not state_path.is_file() or load_session_hmac_key(session_dir) is None:
                     state_changed_concurrently = True
-                    concurrent_err = "gate_state.json is no longer a valid JSON object before Stage 5 commit."
-                else:
-                    latest_state = {str(k): v for k, v in latest_raw.items()}
-                    latest_hmac_ok, latest_hmac_err = verify_state_hmac(session_dir, latest_state)
-                    latest_ver = get_state_version(latest_state)
-                    if not latest_hmac_ok:
-                        state_changed_concurrently = True
-                        concurrent_err = f"gate_state.json HMAC invalid before Stage 5 commit: {latest_hmac_err}"
-                    elif latest_ver != initial_state_version:
-                        state_changed_concurrently = True
-                        concurrent_err = (
-                            f"Stage 5 validation aborted: gate_state.json changed concurrently "
-                            f"(expected state_version={initial_state_version}, current={latest_ver}); "
-                            "re-run validate_review_output.py against the latest session state."
-                        )
-                    else:
-                        for guarded_key in ("stage1", "stage2", "skip_test_revoked", "skip_test_revoked_reason"):
-                            if latest_state.get(guarded_key) != state.get(guarded_key):
-                                state_changed_concurrently = True
-                                concurrent_err = (
-                                    f"Stage 5 validation aborted: '{guarded_key}' changed while validation was running; "
-                                    "re-run validate_review_output.py against the latest session state."
-                                )
-                                break
-                        if not state_changed_concurrently:
-                            current_review_sha = sha256_file(review_path) if review_path.is_file() else ""
-                            if current_review_sha != initial_review_sha256:
-                                state_changed_concurrently = True
-                                concurrent_err = (
-                                    "Stage 5 validation aborted: review file was modified while validation was running; "
-                                    "re-run validate_review_output.py against the latest review file."
-                                )
-
-            if state_changed_concurrently:
-                gate_errors.append(concurrent_err)
-                passed = False
-            else:
-                state["stage5"] = {
-                    "validated": passed,
-                    "review_file": str(review_path),
-                    "review_sha256": initial_review_sha256 if passed else None,
-                    "mode": expected_mode,
-                    "verdict": parsed_verdict,
-                    "validated_at": utc_now_iso(),
-                }
-                write_sealed_gate_state(session_dir, state, expected_version=initial_state_version)
-                if passed and expected_mode == "full" and should_advance_review_history(session_dir, state):
-                    save_review_history(
-                        session_dir=session_dir,
-                        state=state,
-                        expected_mode=expected_mode,
-                        verdict=parsed_verdict,
+                    concurrent_err = (
+                        "Stage 5 validation aborted: session gate_state.json or HMAC key disappeared before commit."
                     )
+                    latest_raw: object = None
+                else:
+                    try:
+                        latest_raw = json.loads(state_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as exc:
+                        state_changed_concurrently = True
+                        concurrent_err = f"Failed to re-read gate_state.json before Stage 5 commit: {exc}"
+                        latest_raw = None
+
+                if not state_changed_concurrently:
+                    if not isinstance(latest_raw, dict):
+                        state_changed_concurrently = True
+                        concurrent_err = "gate_state.json is no longer a valid JSON object before Stage 5 commit."
+                    else:
+                        latest_state = {str(k): v for k, v in latest_raw.items()}
+                        latest_hmac_ok, latest_hmac_err = verify_state_hmac(session_dir, latest_state)
+                        latest_ver = get_state_version(latest_state)
+                        if not latest_hmac_ok:
+                            state_changed_concurrently = True
+                            concurrent_err = f"gate_state.json HMAC invalid before Stage 5 commit: {latest_hmac_err}"
+                        elif latest_ver != initial_state_version:
+                            state_changed_concurrently = True
+                            concurrent_err = (
+                                f"Stage 5 validation aborted: gate_state.json changed concurrently "
+                                f"(expected state_version={initial_state_version}, current={latest_ver}); "
+                                "re-run validate_review_output.py against the latest session state."
+                            )
+                        else:
+                            for guarded_key in ("stage1", "stage2", "skip_test_revoked", "skip_test_revoked_reason"):
+                                if latest_state.get(guarded_key) != state.get(guarded_key):
+                                    state_changed_concurrently = True
+                                    concurrent_err = (
+                                        f"Stage 5 validation aborted: '{guarded_key}' changed while validation was running; "
+                                        "re-run validate_review_output.py against the latest session state."
+                                    )
+                                    break
+                            if not state_changed_concurrently:
+                                current_review_sha = sha256_file(review_path) if review_path.is_file() else ""
+                                if current_review_sha != initial_review_sha256:
+                                    state_changed_concurrently = True
+                                    concurrent_err = (
+                                        "Stage 5 validation aborted: review file was modified while validation was running; "
+                                        "re-run validate_review_output.py against the latest review file."
+                                    )
+
+                if state_changed_concurrently:
+                    gate_errors.append(concurrent_err)
+                    passed = False
+                else:
+                    state["stage5"] = {
+                        "validated": passed,
+                        "review_file": str(review_path),
+                        "review_sha256": initial_review_sha256 if passed else None,
+                        "mode": expected_mode,
+                        "verdict": parsed_verdict,
+                        "validated_at": utc_now_iso(),
+                    }
+                    write_sealed_gate_state(session_dir, state, expected_version=initial_state_version)
+                    if passed and expected_mode == "full" and should_advance_review_history(session_dir, state):
+                        save_review_history(
+                            session_dir=session_dir,
+                            state=state,
+                            expected_mode=expected_mode,
+                            verdict=parsed_verdict,
+                        )
 
     result: dict[str, object] = {
         "passed": passed,

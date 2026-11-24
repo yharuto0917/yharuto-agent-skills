@@ -830,7 +830,13 @@ def session_state_lock(session_dir: Path, *, create_dir: bool = True) -> Iterato
             yield
             return
         lock_path = resolved / ".gate_state.lock"
-        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        except FileNotFoundError:
+            if not create_dir:
+                yield
+                return
+            raise
         try:
             if _fcntl is not None:
                 _fcntl.flock(fd, _fcntl.LOCK_EX)
@@ -1137,18 +1143,57 @@ def is_non_test_check_name(check_name: str) -> bool:
     return GH_NON_TEST_CHECK_WORD_RE.search(stripped_runners) is not None
 
 
-def is_potential_test_check(name: str, workflow: str = "") -> bool:
-    """Return True when a CI check is a test job or a generic CI job that may run tests (fail-closed)."""
+def _find_last_top_level_delim(text: str, delim: str) -> int:
+    """Return index of rightmost delim outside parentheses, or -1 if absent."""
+    depth = 0
+    last_idx = -1
+    for idx, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth > 0:
+            depth -= 1
+        elif depth == 0 and text.startswith(delim, idx):
+            last_idx = idx
+    return last_idx
+
+
+def _split_check_workflow_and_job(name: str, workflow: str = "") -> tuple[str, str]:
+    """Split workflow prefix and explicit job name outside parentheses (handling 'wf / job' and 'wf/job')."""
     cleaned_name = name.strip()
     cleaned_wf = workflow.strip()
+    if cleaned_name:
+        sep_idx = _find_last_top_level_delim(cleaned_name, " / ")
+        if sep_idx >= 0:
+            wf_prefix = cleaned_name[:sep_idx].strip()
+            job_part = cleaned_name[sep_idx + 3 :].strip()
+            if job_part:
+                if wf_prefix:
+                    cleaned_wf = f"{cleaned_wf} / {wf_prefix}" if cleaned_wf else wf_prefix
+                cleaned_name = job_part
+        elif not cleaned_wf:
+            slash_idx = _find_last_top_level_delim(cleaned_name, "/")
+            if slash_idx > 0 and slash_idx + 1 < len(cleaned_name):
+                wf_prefix = cleaned_name[:slash_idx].strip()
+                job_part = cleaned_name[slash_idx + 1 :].strip()
+                if wf_prefix and job_part:
+                    cleaned_wf = wf_prefix
+                    cleaned_name = job_part
+    return cleaned_wf, cleaned_name
+
+
+def is_potential_test_check(name: str, workflow: str = "") -> bool:
+    """Return True when a CI check is a test job or a generic CI job that may run tests (fail-closed)."""
+    cleaned_wf, cleaned_name = _split_check_workflow_and_job(name, workflow)
     if not cleaned_name and not cleaned_wf:
         return False
-    combined = f"{cleaned_wf} / {cleaned_name}" if cleaned_wf and cleaned_name else (cleaned_wf or cleaned_name)
-    if is_test_check_name(cleaned_name) or is_test_check_name(cleaned_wf) or is_test_check_name(combined):
-        return True
-    if is_non_test_check_name(cleaned_name):
-        return False
-    if cleaned_wf and not is_test_check_name(cleaned_wf):
+    if cleaned_name:
+        if is_test_check_name(cleaned_name):
+            return True
+        if is_non_test_check_name(cleaned_name):
+            return False
+    if cleaned_wf:
+        if is_test_check_name(cleaned_wf):
+            return True
         wf_no_runners = GH_OS_RUNNER_TOKEN_RE.sub(" ", cleaned_wf)
         if GH_NON_TEST_WORKFLOW_WORD_RE.search(wf_no_runners) is not None:
             return False
@@ -1344,6 +1389,16 @@ def evaluate_skip_test_stage2_status(state: Mapping[str, object]) -> tuple[str, 
     local_tests = [c for c in checks if str(c.get("tool") or "").strip() in TEST_CHECK_TOOLS]
     gh_checks = [c for c in checks if str(c.get("tool") or "").strip() == "gh_pr_checks"]
 
+    for gh_chk in gh_checks:
+        if gh_chk.get("head_sha_mismatch") is True:
+            expected_sha = str(gh_chk.get("expected_head_sha") or "")[:12]
+            live_sha = str(gh_chk.get("live_head_sha") or "")[:12]
+            return (
+                "unverified",
+                f"Live PR head commit changed ({expected_sha} -> {live_sha}); "
+                "re-run prepare_worktree.py for the new head before continuing.",
+            )
+
     gh_test_pending = False
     gh_test_passed = False
     for gh_chk in gh_checks:
@@ -1352,14 +1407,15 @@ def evaluate_skip_test_stage2_status(state: Mapping[str, object]) -> tuple[str, 
         if entries:
             if any(e["status"] == "pending" and is_potential_test_check(e["name"], e["workflow"]) for e in entries):
                 gh_test_pending = True
-            # Fail-closed confirmation: require an explicit test check name/workflow to have passed
-            # (generic bot/deployment checks like Vercel or authentication alone cannot confirm tests passed).
-            if any(
-                e["status"] == "passed"
-                and (is_test_check_name(e["name"]) or is_test_check_name(e["workflow"]))
-                for e in entries
-            ):
-                gh_test_passed = True
+            # Fail-closed confirmation: require an explicit test check name/workflow to have passed,
+            # while rejecting known non-test jobs (e.g. eslint) even inside a Tests workflow.
+            for e in entries:
+                if e["status"] != "passed":
+                    continue
+                wf, nm = _split_check_workflow_and_job(e["name"], e["workflow"])
+                if is_test_check_name(nm) or (not is_non_test_check_name(nm) and is_test_check_name(wf)):
+                    gh_test_passed = True
+                    break
         elif gh_st == "pending":
             gh_test_pending = True
 

@@ -700,15 +700,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    # Re-verify session state, ci_checks.log, and review.md immediately before posting to GitHub.
-    _verify_post_gates_locked(
-        session_dir,
-        review_path,
-        expected_version=initial_version,
-        expected_review_sha=actual_sha,
-    )
-
-    resp = post_pending_via_gh(repo_slug, pr_number, payload, repo_dir)
+    # Keep session lock held across final verification and bounded GitHub POST so a concurrent
+    # Stage 2 revocation cannot race between validation and submission.
+    with session_state_lock(session_dir, create_dir=False):
+        _verify_post_gates_locked(
+            session_dir,
+            review_path,
+            expected_version=initial_version,
+            expected_review_sha=actual_sha,
+        )
+        resp = post_pending_via_gh(repo_slug, pr_number, payload, repo_dir)
     emit_json(
         {
             "status": "created_pending",

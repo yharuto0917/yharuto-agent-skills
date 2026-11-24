@@ -378,10 +378,47 @@ def _try_parse_gh_checks_json(stdout_text: str) -> list[dict[str, str]] | None:
     return entries
 
 
+def _fetch_live_pr_head_oid(
+    pr_number: int,
+    repo_dir: Path,
+    env: Mapping[str, str],
+) -> tuple[str | None, str]:
+    """Query GitHub for the PR's current headRefOid so live check results stay bound to session head_sha."""
+    try:
+        view_res = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "headRefOid"],
+            cwd=str(repo_dir),
+            env=dict(env),
+            shell=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"gh pr view unavailable: {exc}"
+    if view_res.returncode != 0:
+        err_msg = (view_res.stderr or view_res.stdout or f"exit={view_res.returncode}").strip()
+        return None, err_msg[:200]
+    try:
+        raw: object = json.loads(view_res.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON from gh pr view: {exc}"
+    if not isinstance(raw, dict):
+        return None, "gh pr view returned non-object JSON"
+    oid = str(raw.get("headRefOid") or "").strip().lower()
+    if not oid:
+        return None, "gh pr view did not include headRefOid"
+    return oid, ""
+
+
 def evaluate_pr_meta_checks(
     untrusted_pr_meta: Mapping[str, object] | None,
     repo_dir: Path,
     pr_number: int | None,
+    expected_head_sha: str = "",
 ) -> tuple[dict[str, object] | None, str]:
     meta_source = ""
     if isinstance(untrusted_pr_meta, dict):
@@ -389,8 +426,10 @@ def evaluate_pr_meta_checks(
     is_offline = meta_source == "offline_file" or (
         meta_source == "" and isinstance(untrusted_pr_meta, dict) and pr_number is None
     )
+    norm_expected_head_sha = expected_head_sha.strip().lower()
 
     snapshot_result: tuple[dict[str, object], str] | None = None
+    snapshot_diag_lines: list[str] = []
     if isinstance(untrusted_pr_meta, dict) and "checks" in untrusted_pr_meta:
         checks_raw = untrusted_pr_meta.get("checks")
         if isinstance(checks_raw, list) and len(checks_raw) > 0:
@@ -407,6 +446,7 @@ def evaluate_pr_meta_checks(
                 else:
                     summary_lines.append(str(entry))
 
+            snapshot_diag_lines = list(summary_lines)
             chk = _build_gh_pr_checks_record(
                 cmd=["pr_meta.checks"],
                 entries=check_entries,
@@ -416,20 +456,95 @@ def evaluate_pr_meta_checks(
             )
             snapshot_result = (chk, "[gh_pr_checks (from pr_meta)]\n" + "\n".join(summary_lines) + "\n")
 
-    # For offline --pr-meta files (or direct unit calls without gh_pr_view), trust the snapshot directly.
-    # For live --pr sessions (meta_source == 'gh_pr_view'), query live `gh pr checks` first so
-    # re-running Stage 2 after IN_PROGRESS checks complete observes fresh SUCCESS/FAILURE transitions.
-    should_query_live = (
-        pr_number is not None
-        and not is_offline
-        and shutil.which("gh") is not None
-        and (snapshot_result is None or meta_source == "gh_pr_view")
+    # Explicit offline --pr-meta sessions (and direct unit calls without gh_pr_view) evaluate the snapshot directly.
+    # Live --pr sessions (meta_source == 'gh_pr_view') MUST query live GitHub checks bound to expected_head_sha
+    # and MUST NOT fall back to the preparation snapshot if live refresh fails.
+    is_live_session = not is_offline and (
+        meta_source == "gh_pr_view" or (pr_number is not None and snapshot_result is None)
     )
 
-    if should_query_live and pr_number is not None:
+    if is_live_session:
         env = dict(os.environ)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        base_cmd = ["gh", "pr", "checks", str(pr_number)]
+        base_cmd = ["gh", "pr", "checks", str(pr_number)] if pr_number is not None else ["gh", "pr", "checks"]
+        stale_log_suffix = (
+            "[gh_pr_checks (stale prepare snapshot retained for diagnostics only)]\n"
+            + "\n".join(snapshot_diag_lines)
+            + "\n"
+            if snapshot_diag_lines
+            else ""
+        )
+
+        def _make_live_unavailable(
+            reason: str,
+            *,
+            exit_code: int | None = None,
+            extra_summary: Sequence[str] = (),
+            extra_fields: Mapping[str, object] | None = None,
+        ) -> tuple[dict[str, object], str]:
+            summary = [reason, *[s for s in extra_summary if s]][:SUMMARY_TAIL_LINES]
+            rec: dict[str, object] = {
+                "tool": "gh_pr_checks",
+                "cmd": base_cmd,
+                "status": "env_unavailable",
+                "refresh_failed": True,
+                "exit_code": exit_code,
+                "summary_lines": summary,
+            }
+            if extra_fields:
+                rec.update(extra_fields)
+            log_text = f"[gh pr checks {pr_number}] refresh_failed status=env_unavailable\n{reason}\n{stale_log_suffix}"
+            return rec, log_text
+
+        def _make_head_mismatch(live_oid: str) -> tuple[dict[str, object], str]:
+            msg = (
+                f"PR #{pr_number} head advanced from {norm_expected_head_sha[:12]} to {live_oid[:12]}; "
+                "live checks do not match sealed session head_sha — re-run prepare_worktree.py for the new head."
+            )
+            return _make_live_unavailable(
+                msg,
+                extra_fields={
+                    "head_sha_mismatch": True,
+                    "expected_head_sha": norm_expected_head_sha,
+                    "live_head_sha": live_oid,
+                },
+            )
+
+        if pr_number is None:
+            return _make_live_unavailable("Live gh_pr_view session is missing pr_number; cannot refresh checks.")
+        if meta_source == "gh_pr_view" and not norm_expected_head_sha:
+            return _make_live_unavailable(
+                f"Live PR #{pr_number} session is missing sealed head_sha; refusing unbound live checks."
+            )
+        if shutil.which("gh") is None:
+            return _make_live_unavailable(
+                f"gh CLI not found on PATH; cannot refresh live PR #{pr_number} checks."
+            )
+
+        if norm_expected_head_sha:
+            pre_oid, pre_err = _fetch_live_pr_head_oid(pr_number, repo_dir, env)
+            if pre_oid is None:
+                return _make_live_unavailable(
+                    f"Cannot verify live PR #{pr_number} head commit ({pre_err}); refusing stale or unbound checks."
+                )
+            if pre_oid != norm_expected_head_sha:
+                return _make_head_mismatch(pre_oid)
+
+        def _finalize_bound_result(
+            record: dict[str, object],
+            log_text: str,
+        ) -> tuple[dict[str, object], str]:
+            if norm_expected_head_sha:
+                post_oid, post_err = _fetch_live_pr_head_oid(pr_number, repo_dir, env)
+                if post_oid is None:
+                    return _make_live_unavailable(
+                        f"Cannot re-verify live PR #{pr_number} head commit after check query ({post_err})."
+                    )
+                if post_oid != norm_expected_head_sha:
+                    return _make_head_mismatch(post_oid)
+                record["verified_head_sha"] = norm_expected_head_sha
+            return record, log_text
+
         try:
             json_res = subprocess.run(
                 [*base_cmd, "--json", "name,workflow,bucket,state"],
@@ -466,7 +581,7 @@ def evaluate_pr_meta_checks(
                         exit_code=json_res.returncode,
                         fallback_status=fallback_st,
                     )
-                    return (
+                    return _finalize_bound_result(
                         live_chk,
                         f"[gh pr checks {pr_number}] exit={json_res.returncode} status={live_chk['status']}\n"
                         + "\n".join(json_summary)
@@ -480,7 +595,7 @@ def evaluate_pr_meta_checks(
                         exit_code=0,
                         fallback_status="not_configured",
                     )
-                    return (
+                    return _finalize_bound_result(
                         empty_chk,
                         f"[gh pr checks {pr_number}] exit=0 status=not_configured\nno checks reported\n",
                     )
@@ -524,7 +639,7 @@ def evaluate_pr_meta_checks(
                     exit_code=res.returncode,
                     fallback_status=fallback_st,
                 )
-                return (
+                return _finalize_bound_result(
                     live_chk,
                     f"[gh pr checks {pr_number}] exit={res.returncode} status={live_chk['status']}\n{combined}\n",
                 )
@@ -538,7 +653,11 @@ def evaluate_pr_meta_checks(
                 or "not logged into" in diag_lower
                 or "authentication" in diag_lower
             ):
-                status = "env_unavailable"
+                return _make_live_unavailable(
+                    f"gh pr checks {pr_number} failed to authenticate or resolve PR.",
+                    exit_code=res.returncode,
+                    extra_summary=lines[-SUMMARY_TAIL_LINES:],
+                )
             elif res.returncode == 0:
                 status = "not_configured"
             elif res.returncode == 8 or (
@@ -548,8 +667,6 @@ def evaluate_pr_meta_checks(
                 status = "pending"
             else:
                 status = "failed"
-            if status == "env_unavailable" and snapshot_result is not None:
-                return snapshot_result
             live_chk = {
                 "tool": "gh_pr_checks",
                 "cmd": base_cmd,
@@ -557,23 +674,12 @@ def evaluate_pr_meta_checks(
                 "exit_code": res.returncode,
                 "summary_lines": lines[-SUMMARY_TAIL_LINES:],
             }
-            return (
+            return _finalize_bound_result(
                 live_chk,
                 f"[gh pr checks {pr_number}] exit={res.returncode} status={status}\n{combined}\n",
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            if snapshot_result is not None:
-                return snapshot_result
-            return (
-                {
-                    "tool": "gh_pr_checks",
-                    "cmd": base_cmd,
-                    "status": "env_unavailable",
-                    "exit_code": None,
-                    "summary_lines": [f"gh pr checks unavailable: {exc}"],
-                },
-                f"[gh pr checks] unavailable: {exc}\n",
-            )
+            return _make_live_unavailable(f"gh pr checks unavailable: {exc}")
 
     if snapshot_result is not None:
         return snapshot_result
@@ -677,19 +783,26 @@ JEST_SUMMARY_COUNT_RE = re.compile(r"Tests:?\s+(?:[^\n]*?,\s*)?(\d+)\s+failed\b"
 MOCHA_SUMMARY_COUNT_RE = re.compile(r"^\s*(\d+)\s+failing\b", re.MULTILINE)
 CARGO_SUMMARY_COUNT_RE = re.compile(r"test result:\s*FAILED\.\s*\d+\s+passed;\s*(\d+)\s+failed\b")
 DIAGNOSTIC_ERROR_LINE_RE = re.compile(
-    r"^(?:(?:Assertion)?Error:|error(?:\[[A-Z0-9]+\])?:|FAIL\b|[✗✘]\s+|"
+    r"^(?:(?:E\s+)?[A-Z][A-Za-z0-9_]*Error:|error(?:\[[A-Z0-9]+\])?:|FAIL\b|[✗✘]\s+|"
+    r"ERROR\s+\S+\.py\s+-\s+\S+|"
     r"\S+\.go:\d+(?::\d+)?:\s+\S+|"
     r"\S+:\d+(?::\d+)?:\s*(?:[A-Z]\d+\s+|error\b)|.*\berror\s+TS\d+:)",
     re.MULTILINE,
 )
 RUST_CARGO_LOCATION_RE = re.compile(r"^\s*-->\s*(\S+:\d+(?::\d+)?)")
-PYTHON_TRACEBACK_FILE_RE = re.compile(r'^\s*File\s+"([^"]+)",\s+line\s+(\d+)')
+PYTHON_TRACEBACK_FILE_RE = re.compile(r'^\s*(?:E\s+)?File\s+"([^"]+)",\s+line\s+(\d+)')
+PYTEST_FRAME_LOCATION_RE = re.compile(r"^([^\s:]+\.py):(\d+):\s+in\s+")
+PYTEST_ERROR_COLLECTING_RE = re.compile(r"^_*\s*ERROR\s+collecting\s+(\S+\.py)\b")
 ESLINT_FILE_HEADER_RE = re.compile(r"^([^\s].*\.[A-Za-z0-9]{1,8})\s*$")
 ESLINT_STYLISH_ERROR_RE = re.compile(r"^\s+(\d+:\d+)\s+error\s+(.+)$")
 DIAGNOSTIC_LOCATION_RE = re.compile(
     r"(?:-->\s*\S+:\d+|File\s+\"[^\"]+\",\s+line\s+\d+|"
+    r"^ERROR\s+\S+\.py\s+-\s+\S+|"
+    r"@\s+(?:<WORKDIR>|[A-Za-z0-9_./-]+)\.py(?::\d+)?$|"
     r"(?:<WORKDIR>|[A-Za-z0-9_./-]+)\.[A-Za-z0-9]{1,8}(?:\(\d+,\d+\)|:\d+))"
 )
+PY_EXCEPTION_PREFIX_RE = re.compile(r"^[A-Z][A-Za-z0-9_]*Error:")
+PYTEST_E_PREFIX_RE = re.compile(r"^E\s+")
 MAX_STORED_FAILED_TESTS = 200
 
 
@@ -772,6 +885,16 @@ def extract_diagnostic_signatures(raw_output: str, workdir: Path) -> list[str]:
     last_py_location = ""
 
     for idx, raw_line in enumerate(lines):
+        m_py_collect = PYTEST_ERROR_COLLECTING_RE.match(raw_line)
+        if m_py_collect is not None:
+            last_py_location = m_py_collect.group(1)
+            continue
+
+        m_py_frame = PYTEST_FRAME_LOCATION_RE.match(raw_line)
+        if m_py_frame is not None:
+            last_py_location = f"{m_py_frame.group(1)}:{m_py_frame.group(2)}"
+            continue
+
         m_py = PYTHON_TRACEBACK_FILE_RE.match(raw_line)
         if m_py is not None:
             last_py_location = f'File "{m_py.group(1)}", line {m_py.group(2)}'
@@ -792,6 +915,8 @@ def extract_diagnostic_signatures(raw_output: str, workdir: Path) -> list[str]:
 
         if DIAGNOSTIC_ERROR_LINE_RE.match(raw_line):
             normalized = " ".join(raw_line.strip().split())
+            if PYTEST_E_PREFIX_RE.match(normalized):
+                normalized = PYTEST_E_PREFIX_RE.sub("", normalized, count=1)
             if not normalized:
                 continue
             # Attach trailing rustc/cargo location line (` --> path:line:col`) when present.
@@ -804,10 +929,10 @@ def extract_diagnostic_signatures(raw_output: str, workdir: Path) -> list[str]:
                         break
                 if attached_loc:
                     normalized = f"{normalized} @ {attached_loc}"
-                elif last_py_location and normalized.startswith(("Error:", "AssertionError:")):
+                elif last_py_location and PY_EXCEPTION_PREFIX_RE.match(normalized):
                     normalized = f"{normalized} @ {last_py_location}"
             diagnostics.append(normalized)
-            if not raw_line.startswith(" "):
+            if not raw_line.startswith((" ", "E ")):
                 last_py_location = ""
 
     return sorted(diagnostics)
@@ -921,7 +1046,10 @@ def _classify_head_vs_base_failure(
 
     head_count = _as_optional_int(head_chk.get("failure_count"))
     base_count = _as_optional_int(base_chk.get("failure_count"))
-    has_coarse_id = any(fid.endswith(":<package_fail>") for fid in head_ids)
+    has_coarse_id = any(
+        fid.endswith(":<package_fail>") or fid.startswith("pytest_collect:")
+        for fid in head_ids
+    )
 
     if head_ids:
         new_ids = sorted(head_ids - base_ids)
@@ -937,8 +1065,8 @@ def _classify_head_vs_base_failure(
             )
         if not has_coarse_id:
             return "preexisting", [], ""
-        # Coarse package-level failures (e.g. Go [build failed] / [setup failed]) must also match
-        # diagnostic signatures or full normalized output before being treated as preexisting.
+        # Coarse package/file-level failures (Go [build failed] / [setup failed] or pytest_collect:)
+        # must also match diagnostic signatures or full normalized output before being treated as preexisting.
 
     if base_ids and not head_ids:
         # Base executed identifiable tests while head collapsed before test execution (e.g. import/collection crash)
@@ -1434,6 +1562,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     untrusted_pr_meta=untrusted_pr_meta,
                     repo_dir=repo_dir,
                     pr_number=pr_number,
+                    expected_head_sha=head_sha,
                 )
                 if pr_chk is not None:
                     checks_out.append(pr_chk)
@@ -1540,6 +1669,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         untrusted_pr_meta=untrusted_pr_meta,
                         repo_dir=repo_dir,
                         pr_number=pr_number,
+                        expected_head_sha=head_sha,
                     )
                     if pr_chk is not None:
                         checks_out.append(pr_chk)

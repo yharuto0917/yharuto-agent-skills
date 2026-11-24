@@ -741,9 +741,19 @@ def collect_diff_stats(
             acmr_res = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", "HEAD"], cwd=repo_dir)
             patch_res = run_cmd(build_git_diff_cmd("-U0", "HEAD"), cwd=repo_dir)
         else:
-            tracked_res = run_cmd(["git", "diff", "--cached", "--name-only", "-z"], cwd=repo_dir)
-            acmr_res = run_cmd(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], cwd=repo_dir)
-            patch_res = run_cmd(build_git_diff_cmd("--cached", "-U0"), cwd=repo_dir)
+            empty_tree_res = run_cmd(["git", "hash-object", "-t", "tree", os.devnull], cwd=repo_dir)
+            empty_tree = empty_tree_res.stdout.strip() if empty_tree_res.returncode == 0 else ""
+            if empty_tree:
+                tracked_res = run_cmd(["git", "diff", "--name-only", "-z", empty_tree], cwd=repo_dir)
+                acmr_res = run_cmd(
+                    ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", empty_tree],
+                    cwd=repo_dir,
+                )
+                patch_res = run_cmd(build_git_diff_cmd("-U0", empty_tree), cwd=repo_dir)
+            else:
+                tracked_res = run_cmd(["git", "diff", "--cached", "--name-only", "-z"], cwd=repo_dir)
+                acmr_res = run_cmd(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], cwd=repo_dir)
+                patch_res = run_cmd(build_git_diff_cmd("--cached", "-U0"), cwd=repo_dir)
 
         untracked_res = run_cmd(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=repo_dir)
         untracked = [p for p in split_nul_paths(untracked_res.stdout) if not p.startswith(".gemini/")]
@@ -1407,8 +1417,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         full_changed_files = split_nul_paths(full_names_res.stdout)
         hazard_diff = full_patch_res.stdout + ("\n" + diff_text if diff_text else "")
         ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_diff(hazard_diff)
-    elif is_rereview and mode == "local" and bool(only_files):
-        full_changed_files, _, _, full_local_diff = collect_diff_stats(
+    elif mode == "local" and ((review_base_sha and review_base_sha != head_sha) or bool(only_files)):
+        head_changed_files, _, _, head_local_diff = collect_diff_stats(
             repo_dir=repo_dir,
             workdir=workdir,
             mode=mode,
@@ -1416,10 +1426,33 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             head_sha=head_sha,
             audit_paths=audit_paths,
             is_git_repo=is_git_repo,
-            review_base_sha=review_base_sha,
+            review_base_sha="",
             only_files=None,
         )
-        ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_diff(full_local_diff)
+        safety_changed: list[str] = list(head_changed_files)
+        safety_diffs: list[str] = [head_local_diff]
+        if review_base_sha and review_base_sha != head_sha:
+            if bool(only_files):
+                since_changed_files, _, _, since_local_diff = collect_diff_stats(
+                    repo_dir=repo_dir,
+                    workdir=workdir,
+                    mode=mode,
+                    merge_base_sha=merge_base_sha,
+                    head_sha=head_sha,
+                    audit_paths=audit_paths,
+                    is_git_repo=is_git_repo,
+                    review_base_sha=review_base_sha,
+                    only_files=None,
+                )
+                safety_changed.extend(since_changed_files)
+                safety_diffs.append(since_local_diff)
+            else:
+                safety_changed.extend(changed_files)
+                safety_diffs.append(diff_text)
+        full_changed_files = list(dict.fromkeys(safety_changed))
+        ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_diff(
+            "\n".join(part for part in safety_diffs if part)
+        )
     else:
         full_changed_files = changed_files
         ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_diff(diff_text)
@@ -2055,9 +2088,11 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
     if not draft_path.is_file():
         fail_with_code(f"Draft findings file does not exist: {draft_path}", 2)
     try:
-        raw_draft: object = json.loads(draft_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        draft_bytes = draft_path.read_bytes()
+        raw_draft: object = json.loads(draft_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         fail_with_code(f"Invalid JSON in draft findings file ({draft_path}): {exc}", 2)
+    draft_sha = sha256_bytes(draft_bytes)
 
     stripped_findings, dismissed_smells = parse_draft_payload(raw_draft)
     smell_count_val = stage3.get("smell_count", 0)
@@ -2207,7 +2242,6 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
     adv_input_path = session_dir / "adversarial_input.md"
     adv_input_content = "\n".join(md_lines)
     canonical_draft = session_dir / "draft_findings.json"
-    draft_bytes = draft_path.read_bytes()
 
     with session_state_lock(session_dir):
         latest_state = read_verified_gate_state(session_dir)
@@ -2225,14 +2259,28 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
             )
         _enforce_stage4_stage1_gate(latest_state, "prepare Stage 4")
 
+        if draft_path == canonical_draft:
+            try:
+                current_draft_sha = sha256_file(canonical_draft) if canonical_draft.is_file() else ""
+            except OSError as exc:
+                fail_with_code(f"Failed to verify draft_findings.json ({canonical_draft}): {exc}", 2)
+            if current_draft_sha != draft_sha:
+                fail_with_code(
+                    "Concurrent edit detected on draft_findings.json while preparing Stage 4; "
+                    "re-run prepare-stage4 against the latest draft file.",
+                    2,
+                )
+        else:
+            tmp_draft = canonical_draft.with_name(f".{canonical_draft.name}.{secrets.token_hex(4)}.tmp")
+            try:
+                tmp_draft.write_bytes(draft_bytes)
+                os.replace(tmp_draft, canonical_draft)
+            except OSError as exc:
+                tmp_draft.unlink(missing_ok=True)
+                fail_with_code(f"Failed to write canonical draft_findings.json ({canonical_draft}): {exc}", 2)
+
         write_text_atomic(adv_input_path, adv_input_content)
         input_sha = sha256_file(adv_input_path)
-
-        if draft_path != canonical_draft:
-            tmp_draft = canonical_draft.with_name(f".{canonical_draft.name}.{secrets.token_hex(4)}.tmp")
-            tmp_draft.write_bytes(draft_bytes)
-            os.replace(tmp_draft, canonical_draft)
-        draft_sha = sha256_file(canonical_draft)
 
         latest_state["stage4"] = {
             "prepared": True,
