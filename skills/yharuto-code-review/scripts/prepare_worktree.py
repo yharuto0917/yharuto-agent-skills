@@ -27,17 +27,23 @@ from _lib import (  # noqa: E402
     CMD_TIMEOUT_SECONDS,
     SESSION_PREFIX,
     TEST_PATH_RE,
+    build_git_diff_cmd,
     cleanup_stale_sessions,
     collect_repo_porcelain,
     delete_session_hmac_key,
     detect_ci_script_hazard_in_diff,
     detect_ci_script_hazard_in_files,
     emit_json,
+    evaluate_skip_test_stage2_status,
     fail_with_code,
     filter_diff_by_files,
     get_current_git_branch,
+    get_state_version,
     has_stage2_test_failure,
+    has_surviving_changed_files,
     init_session_hmac_key,
+    is_deleted_changed_file_in_base,
+    is_git_metadata_rel_path,
     is_safe_session_dir,
     is_stage1_passed_or_skipped,
     load_review_history_candidates,
@@ -53,6 +59,7 @@ from _lib import (  # noqa: E402
     run_cmd,
     run_subproc,
     sanitize_slug,
+    session_state_lock,
     sha256_bytes,
     sha256_file,
     split_nul_paths,
@@ -61,6 +68,7 @@ from _lib import (  # noqa: E402
     verify_state_hmac,
     write_json_atomic,
     write_sealed_gate_state,
+    write_text_atomic,
 )
 
 LOCKFILE_NAMES: frozenset[str] = frozenset(
@@ -198,6 +206,35 @@ SNAPSHOT_IGNORED_DIRS: frozenset[str] = frozenset(
     }
 )
 
+NON_TESTABLE_EXCLUDED_DIRS: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".gemini",
+        ".claude",
+        ".codex",
+        ".agents",
+        ".venv",
+        ".tox",
+        ".nox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".cache",
+        ".next",
+        ".nuxt",
+        ".astro",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
+        ".yarn",
+        ".pnpm-store",
+        ".vscode",
+        ".idea",
+        "node_modules",
+        "__pycache__",
+    }
+)
+
 EMOJI_HEADING_STRIP_RE = re.compile(r"[\r\n]+")
 ALLOWED_FINDING_SEVERITIES: tuple[str, str, str, str] = ("Bug", "Risk", "Nit", "Question")
 
@@ -206,7 +243,7 @@ def is_testable_code_file(rel_path: str) -> bool:
     norm = normalize_rel_path(rel_path)
     p = Path(norm)
     name = p.name
-    if not name or name.startswith(".") or any(part.startswith(".") for part in p.parts[:-1]):
+    if not name or name.startswith(".") or any(part in NON_TESTABLE_EXCLUDED_DIRS for part in p.parts[:-1]):
         return False
     if name in LOCKFILE_NAMES or name in MANIFEST_NAMES or name in {"LICENSE", "Dockerfile", "Makefile"}:
         return False
@@ -523,7 +560,7 @@ def _copy_snapshot_files(src_root: Path, dst_root: Path, rel_paths: Sequence[str
 def _overlay_uncommitted_changes(repo_dir: Path, worktree_path: Path) -> None:
     """Apply uncommitted tracked diff and untracked files from repo_dir onto isolated worktree_path."""
     diff_proc = subprocess.run(
-        ["git", "diff", "--binary", "HEAD"],
+        build_git_diff_cmd("--binary", "HEAD"),
         cwd=str(repo_dir),
         shell=False,
         capture_output=True,
@@ -685,7 +722,7 @@ def collect_diff_stats(
             ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", effective_base, head_sha],
             cwd=repo_dir,
         )
-        patch_res = run_cmd(["git", "diff", "-U0", effective_base, head_sha], cwd=repo_dir)
+        patch_res = run_cmd(build_git_diff_cmd("-U0", effective_base, head_sha), cwd=repo_dir)
         changed_files = split_nul_paths(all_res.stdout)
         active_files = split_nul_paths(acmr_res.stdout)
         diff_text = patch_res.stdout
@@ -698,15 +735,15 @@ def collect_diff_stats(
                 ["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", review_base_sha],
                 cwd=repo_dir,
             )
-            patch_res = run_cmd(["git", "diff", "-U0", review_base_sha], cwd=repo_dir)
+            patch_res = run_cmd(build_git_diff_cmd("-U0", review_base_sha), cwd=repo_dir)
         elif has_head:
             tracked_res = run_cmd(["git", "diff", "--name-only", "-z", "HEAD"], cwd=repo_dir)
             acmr_res = run_cmd(["git", "diff", "--name-only", "--diff-filter=ACMR", "-z", "HEAD"], cwd=repo_dir)
-            patch_res = run_cmd(["git", "diff", "-U0", "HEAD"], cwd=repo_dir)
+            patch_res = run_cmd(build_git_diff_cmd("-U0", "HEAD"), cwd=repo_dir)
         else:
             tracked_res = run_cmd(["git", "diff", "--cached", "--name-only", "-z"], cwd=repo_dir)
             acmr_res = run_cmd(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], cwd=repo_dir)
-            patch_res = run_cmd(["git", "diff", "--cached", "-U0"], cwd=repo_dir)
+            patch_res = run_cmd(build_git_diff_cmd("--cached", "-U0"), cwd=repo_dir)
 
         untracked_res = run_cmd(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=repo_dir)
         untracked = [p for p in split_nul_paths(untracked_res.stdout) if not p.startswith(".gemini/")]
@@ -976,6 +1013,7 @@ def _resolve_rereview_scope(
     matched_entry: dict[str, object] | None = None
     same_head_entry: dict[str, object] | None = None
     rebased_pr_entry: dict[str, object] | None = None
+    rewritten_pr_entry: dict[str, object] | None = None
 
     if candidates and is_git_repo and head_sha:
         if mode == "pr" and exact_pr_match:
@@ -987,8 +1025,13 @@ def _resolve_rereview_scope(
             elif cand_prev and cand_prev != head_sha and git_ref_exists(repo_dir, cand_prev):
                 if prev_mb:
                     if prev_mb == merge_base_sha:
-                        valid_prev_head = cand_prev
-                        matched_entry = entry
+                        if _is_git_ancestor(repo_dir, merge_base_sha, cand_prev) and _is_git_ancestor(
+                            repo_dir, cand_prev, head_sha
+                        ):
+                            valid_prev_head = cand_prev
+                            matched_entry = entry
+                        else:
+                            rewritten_pr_entry = entry
                     else:
                         rebased_pr_entry = entry
                 elif _is_git_ancestor(repo_dir, merge_base_sha, cand_prev) and _is_git_ancestor(
@@ -1048,7 +1091,11 @@ def _resolve_rereview_scope(
                     break
 
     prev_summary = _summarize_history_entry(
-        matched_entry or same_head_entry or rebased_pr_entry or (candidates[0] if (mode == "pr" and exact_pr_match and candidates) else None)
+        matched_entry
+        or same_head_entry
+        or rewritten_pr_entry
+        or rebased_pr_entry
+        or (candidates[0] if (mode == "pr" and exact_pr_match and candidates) else None)
     )
 
     if since_raw:
@@ -1079,6 +1126,22 @@ def _resolve_rereview_scope(
                     f"ahead of merge_base_sha ({merge_base_sha[:12]}), which would invert base commits. "
                     "Pass a commit on the target branch or use --only-files <paths>.",
                 )
+        if not head_sha:
+            return (
+                "",
+                None,
+                prev_summary,
+                f"Invalid --since ref '{since_raw}': cannot use --since when HEAD has no commits yet.",
+            )
+        if not _is_git_ancestor(repo_dir, resolved_since, head_sha):
+            return (
+                "",
+                None,
+                prev_summary,
+                f"Invalid --since ref '{since_raw}' ({resolved_since[:12]}): commit is not an ancestor of "
+                f"the reviewed head ({head_sha[:12]}). Pass an ancestor commit in the reviewed history "
+                "or use --only-files <paths>.",
+            )
         source = explicit_source if explicit_source != "auto" else "commit_diff"
         return resolved_since, source, prev_summary, None
 
@@ -1089,7 +1152,14 @@ def _resolve_rereview_scope(
         if only_files:
             source = explicit_source if explicit_source != "auto" else "user_instruction"
             return merge_base_sha, source, prev_summary, None
-        if rebased_pr_entry is not None:
+        if rewritten_pr_entry is not None:
+            prev_head_short = str(rewritten_pr_entry.get("head_sha") or "")[:12]
+            err_msg = (
+                f"Re-review scope could not be narrowed automatically: previously reviewed PR head "
+                f"({prev_head_short}) is not an ancestor of current HEAD ({head_sha[:12]}) "
+                "(likely force-pushed or rolled back). Pass --since <commit> or --only-files <paths>."
+            )
+        elif rebased_pr_entry is not None:
             err_msg = (
                 f"Re-review scope could not be narrowed automatically: PR base commit changed since the "
                 f"previous review (rebase or base merge; merge_base_sha is now {merge_base_sha[:12]}). "
@@ -1332,7 +1402,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         ci_script_hazard, ci_hazard_reasons = detect_ci_script_hazard_in_files(workdir)
         full_changed_files = changed_files
     elif is_rereview and mode in ("pr", "range") and (review_base_sha != merge_base_sha or bool(only_files)):
-        full_patch_res = run_cmd(["git", "diff", "-U0", merge_base_sha, head_sha], cwd=repo_dir)
+        full_patch_res = run_cmd(build_git_diff_cmd("-U0", merge_base_sha, head_sha), cwd=repo_dir)
         full_names_res = run_cmd(["git", "diff", "--name-only", "-z", merge_base_sha, head_sha], cwd=repo_dir)
         full_changed_files = split_nul_paths(full_names_res.stdout)
         hazard_diff = full_patch_res.stdout + ("\n" + diff_text if diff_text else "")
@@ -1529,9 +1599,45 @@ def resolve_inside_workdir(workdir: Path, raw_path: str) -> tuple[str, Path]:
         rel = full.relative_to(workdir_resolved)
     except ValueError:
         fail_with_code(f"File path escapes workdir ({workdir_resolved}): {raw_path}", 2)
+    rel_posix = rel.as_posix()
+    if is_git_metadata_rel_path(rel_posix):
+        fail_with_code(f"Git metadata path is not a valid source file: {rel_posix}", 2)
     if not full.is_file():
-        fail_with_code(f"File does not exist in workdir: {rel.as_posix()}", 2)
-    return rel.as_posix(), full
+        fail_with_code(f"File does not exist in workdir: {rel_posix}", 2)
+    return rel_posix, full
+
+
+def resolve_stage4_checked_file(
+    state: Mapping[str, object],
+    workdir: Path,
+    raw_path: str,
+) -> tuple[str, bool]:
+    """Resolve a Stage 4 checked_files entry.
+
+    Returns (repo_relative_posix_path, is_live_file_in_workdir).
+    Accepts deleted changed_files that existed in base when they no longer exist in workdir.
+    """
+    cleaned = raw_path.strip()
+    cleaned = re.sub(r"#L\d+(?:-L?\d+)?$", "", cleaned)
+    cleaned = re.sub(r":L?\d+(?:-L?\d+)?$", "", cleaned)
+    if not cleaned:
+        fail_with_code("Empty file path provided.", 2)
+
+    workdir_resolved = workdir.resolve()
+    candidate = Path(cleaned)
+    full = candidate.resolve() if candidate.is_absolute() else (workdir_resolved / candidate).resolve()
+    try:
+        rel = full.relative_to(workdir_resolved)
+    except ValueError:
+        fail_with_code(f"File path escapes workdir ({workdir_resolved}): {raw_path}", 2)
+    rel_posix = rel.as_posix()
+    if is_git_metadata_rel_path(rel_posix):
+        fail_with_code(f"Git metadata path is not valid Stage 4 evidence: {rel_posix}", 2)
+    if full.is_file():
+        return rel_posix, True
+    if is_deleted_changed_file_in_base(state, workdir_resolved, rel_posix):
+        return rel_posix, False
+    fail_with_code(f"File does not exist in workdir: {rel_posix}", 2)
 
 
 def _normalize_rel_file_ref(raw_loc: str) -> str:
@@ -1547,152 +1653,154 @@ def _normalize_rel_file_ref(raw_loc: str) -> str:
 
 def cmd_gate_stage1(args: argparse.Namespace) -> int:
     session_dir = Path(str(args.session)).expanduser().resolve()
-    state = read_verified_gate_state(session_dir)
+    with session_state_lock(session_dir):
+        state = read_verified_gate_state(session_dir)
+        expected_version = get_state_version(state)
 
-    s1_scan = state.get("stage1_scan")
-    impact_path = session_dir / "impact_scan.json"
-    if (
-        not isinstance(s1_scan, dict)
-        or s1_scan.get("executed") is not True
-        or not impact_path.is_file()
-        or sha256_file(impact_path) != str(s1_scan.get("sha256") or "")
-    ):
-        fail_with_code(
-            "Stage 1 gate blocked: impact_scan.py --session must be executed before gate-stage1.",
-            2,
-        )
-
-    if bool(state.get("skip_test_revoked", False)):
-        fail_with_code(
-            "Stage 1 gate locked: --skip-test was revoked because Stage 2 tests are failing "
-            "(failing tests cannot be skipped; stop with stage1_ng output).",
-            2,
-            extra={"skip_test_revoked": True},
-        )
-
-    workdir = Path(str(state.get("workdir") or "")).resolve()
-    mode = str(state.get("mode") or "")
-    testable_raw = state.get("testable_code_files")
-    testable_files = [str(x) for x in testable_raw] if isinstance(testable_raw, list) else []
-    skip_test = bool(state.get("skip_test", False)) or bool(args.skip_test)
-    if bool(args.skip_test):
-        state["skip_test"] = True
-
-    verdict = str(args.verdict).strip().upper()
-    if verdict not in {"OK", "NG", "EXEMPT", "SKIP"}:
-        fail_with_code(f"Invalid --verdict '{args.verdict}': expected OK, NG, EXEMPT, or SKIP.", 2)
-    if verdict == "SKIP" and not skip_test:
-        fail_with_code("verdict SKIP requires --skip-test.", 2)
-    if has_stage2_test_failure(state) and skip_test and verdict in {"NG", "SKIP", "EXEMPT"}:
-        fail_with_code(
-            "Cannot bypass Stage 1 with --skip-test because Stage 2 tests are failing.",
-            2,
-            extra={"skip_test_revoked": True},
-        )
-
-    if verdict == "OK":
-        raw_csv = str(args.verified_tests or "").strip()
-        items = [part.strip() for part in raw_csv.split(",") if part.strip()]
-        if not items:
-            fail_with_code("verdict OK requires --verified-tests <csv> with at least 1 existing test file.", 2)
-        verified_records: list[dict[str, str]] = []
-        seen_paths: set[str] = set()
-        for item in items:
-            rel_posix, full_path = resolve_inside_workdir(workdir, item)
-            if TEST_PATH_RE.search(rel_posix) is None:
-                fail_with_code(
-                    f"Verified test path '{rel_posix}' does not match TEST_PATH_RE naming conventions "
-                    "(production code cannot be passed as --verified-tests).",
-                    2,
-                )
-            if rel_posix not in seen_paths:
-                seen_paths.add(rel_posix)
-                verified_records.append(
-                    {
-                        "path": rel_posix,
-                        "sha256": sha256_file(full_path),
-                    }
-                )
-        stage1_obj: dict[str, object] = {
-            "status": "OK",
-            "verified_tests": verified_records,
-            "gaps_count": 0,
-            "summary": str(args.summary or "").strip(),
-            "reason": str(args.reason or "").strip(),
-            "bypassed_by_skip_test": False,
-            "updated_at": utc_now_iso(),
-        }
-    elif verdict == "EXEMPT":
-        has_testable_in_diff = mode in {"pr", "range", "local"} and len(testable_files) >= 1
-        if has_testable_in_diff and not skip_test:
+        s1_scan = state.get("stage1_scan")
+        impact_path = session_dir / "impact_scan.json"
+        if (
+            not isinstance(s1_scan, dict)
+            or s1_scan.get("executed") is not True
+            or not impact_path.is_file()
+            or sha256_file(impact_path) != str(s1_scan.get("sha256") or "")
+        ):
             fail_with_code(
-                "EXEMPT is forbidden when testable_code_files is non-empty in pr/range/local mode. "
-                "Verify real tests (OK) or reject with NG.",
+                "Stage 1 gate blocked: impact_scan.py --session must be executed before gate-stage1.",
                 2,
-                extra={"mode": mode, "testable_code_files": testable_files},
             )
-        bypassed_exempt = has_testable_in_diff and skip_test
-        default_reason = (
-            "Skipped Stage 1 stop via --skip-test" if bypassed_exempt else "No testable code files in scope"
-        )
-        reason_str = str(args.reason or args.summary or default_reason).strip()
-        stage1_obj = {
-            "status": "SKIPPED_BY_FLAG" if bypassed_exempt else "EXEMPT_NO_TESTABLE_CODE",
-            "verified_tests": [],
-            "gaps_count": 0,
-            "summary": str(args.summary or "").strip(),
-            "reason": reason_str,
-            "bypassed_by_skip_test": bypassed_exempt,
-            "updated_at": utc_now_iso(),
-        }
-    elif verdict == "SKIP":
-        reason_str = str(args.reason or args.summary or "Skipped Stage 1 stop via --skip-test").strip()
-        stage1_obj = {
-            "status": "SKIPPED_BY_FLAG",
-            "verified_tests": [],
-            "gaps_count": 0,
-            "summary": str(args.summary or "").strip(),
-            "reason": reason_str,
-            "bypassed_by_skip_test": True,
-            "updated_at": utc_now_iso(),
-        }
-    else:
-        gaps_count = args.gaps_count
-        if skip_test:
-            if gaps_count is not None and (not isinstance(gaps_count, int) or gaps_count < 1):
-                fail_with_code("verdict NG requires --gaps-count <N> with N >= 1.", 2)
-            effective_gaps = gaps_count if isinstance(gaps_count, int) else 1
-            summary_str = str(
-                args.summary or args.reason or "Stage 1 test gate NG continued via --skip-test"
-            ).strip()
-            stage1_obj = {
-                "status": "NG",
-                "verified_tests": [],
-                "gaps_count": effective_gaps,
-                "summary": summary_str,
-                "reason": str(args.reason or "").strip(),
-                "bypassed_by_skip_test": True,
-                "updated_at": utc_now_iso(),
-            }
-        else:
-            if not isinstance(gaps_count, int) or gaps_count < 1:
-                fail_with_code("verdict NG requires --gaps-count <N> with N >= 1.", 2)
-            summary_str = str(args.summary or args.reason or "").strip()
-            if not summary_str:
-                fail_with_code("verdict NG requires non-empty --summary <txt>.", 2)
-            stage1_obj = {
-                "status": "NG",
-                "verified_tests": [],
-                "gaps_count": gaps_count,
-                "summary": summary_str,
+
+        if bool(state.get("skip_test_revoked", False)):
+            fail_with_code(
+                "Stage 1 gate locked: --skip-test was revoked because Stage 2 tests are failing "
+                "(failing tests cannot be skipped; stop with stage1_ng output).",
+                2,
+                extra={"skip_test_revoked": True},
+            )
+
+        workdir = Path(str(state.get("workdir") or "")).resolve()
+        mode = str(state.get("mode") or "")
+        testable_raw = state.get("testable_code_files")
+        testable_files = [str(x) for x in testable_raw] if isinstance(testable_raw, list) else []
+        skip_test = bool(state.get("skip_test", False)) or bool(args.skip_test)
+        if bool(args.skip_test):
+            state["skip_test"] = True
+
+        verdict = str(args.verdict).strip().upper()
+        if verdict not in {"OK", "NG", "EXEMPT", "SKIP"}:
+            fail_with_code(f"Invalid --verdict '{args.verdict}': expected OK, NG, EXEMPT, or SKIP.", 2)
+        if verdict == "SKIP" and not skip_test:
+            fail_with_code("verdict SKIP requires --skip-test.", 2)
+        if has_stage2_test_failure(state) and skip_test and verdict in {"NG", "SKIP", "EXEMPT"}:
+            fail_with_code(
+                "Cannot bypass Stage 1 with --skip-test because Stage 2 tests are failing.",
+                2,
+                extra={"skip_test_revoked": True},
+            )
+
+        if verdict == "OK":
+            raw_csv = str(args.verified_tests or "").strip()
+            items = [part.strip() for part in raw_csv.split(",") if part.strip()]
+            if not items:
+                fail_with_code("verdict OK requires --verified-tests <csv> with at least 1 existing test file.", 2)
+            verified_records: list[dict[str, str]] = []
+            seen_paths: set[str] = set()
+            for item in items:
+                rel_posix, full_path = resolve_inside_workdir(workdir, item)
+                if TEST_PATH_RE.search(rel_posix) is None:
+                    fail_with_code(
+                        f"Verified test path '{rel_posix}' does not match TEST_PATH_RE naming conventions "
+                        "(production code cannot be passed as --verified-tests).",
+                        2,
+                    )
+                if rel_posix not in seen_paths:
+                    seen_paths.add(rel_posix)
+                    verified_records.append(
+                        {
+                            "path": rel_posix,
+                            "sha256": sha256_file(full_path),
+                        }
+                    )
+            stage1_obj: dict[str, object] = {
+                "status": "OK",
+                "verified_tests": verified_records,
+                "gaps_count": 0,
+                "summary": str(args.summary or "").strip(),
                 "reason": str(args.reason or "").strip(),
                 "bypassed_by_skip_test": False,
                 "updated_at": utc_now_iso(),
             }
+        elif verdict == "EXEMPT":
+            has_testable_in_diff = mode in {"pr", "range", "local"} and len(testable_files) >= 1
+            if has_testable_in_diff and not skip_test:
+                fail_with_code(
+                    "EXEMPT is forbidden when testable_code_files is non-empty in pr/range/local mode. "
+                    "Verify real tests (OK) or reject with NG.",
+                    2,
+                    extra={"mode": mode, "testable_code_files": testable_files},
+                )
+            bypassed_exempt = has_testable_in_diff and skip_test
+            default_reason = (
+                "Skipped Stage 1 stop via --skip-test" if bypassed_exempt else "No testable code files in scope"
+            )
+            reason_str = str(args.reason or args.summary or default_reason).strip()
+            stage1_obj = {
+                "status": "SKIPPED_BY_FLAG" if bypassed_exempt else "EXEMPT_NO_TESTABLE_CODE",
+                "verified_tests": [],
+                "gaps_count": 0,
+                "summary": str(args.summary or "").strip(),
+                "reason": reason_str,
+                "bypassed_by_skip_test": bypassed_exempt,
+                "updated_at": utc_now_iso(),
+            }
+        elif verdict == "SKIP":
+            reason_str = str(args.reason or args.summary or "Skipped Stage 1 stop via --skip-test").strip()
+            stage1_obj = {
+                "status": "SKIPPED_BY_FLAG",
+                "verified_tests": [],
+                "gaps_count": 0,
+                "summary": str(args.summary or "").strip(),
+                "reason": reason_str,
+                "bypassed_by_skip_test": True,
+                "updated_at": utc_now_iso(),
+            }
+        else:
+            gaps_count = args.gaps_count
+            if skip_test:
+                if gaps_count is not None and (not isinstance(gaps_count, int) or gaps_count < 1):
+                    fail_with_code("verdict NG requires --gaps-count <N> with N >= 1.", 2)
+                effective_gaps = gaps_count if isinstance(gaps_count, int) else 1
+                summary_str = str(
+                    args.summary or args.reason or "Stage 1 test gate NG continued via --skip-test"
+                ).strip()
+                stage1_obj = {
+                    "status": "NG",
+                    "verified_tests": [],
+                    "gaps_count": effective_gaps,
+                    "summary": summary_str,
+                    "reason": str(args.reason or "").strip(),
+                    "bypassed_by_skip_test": True,
+                    "updated_at": utc_now_iso(),
+                }
+            else:
+                if not isinstance(gaps_count, int) or gaps_count < 1:
+                    fail_with_code("verdict NG requires --gaps-count <N> with N >= 1.", 2)
+                summary_str = str(args.summary or args.reason or "").strip()
+                if not summary_str:
+                    fail_with_code("verdict NG requires non-empty --summary <txt>.", 2)
+                stage1_obj = {
+                    "status": "NG",
+                    "verified_tests": [],
+                    "gaps_count": gaps_count,
+                    "summary": summary_str,
+                    "reason": str(args.reason or "").strip(),
+                    "bypassed_by_skip_test": False,
+                    "updated_at": utc_now_iso(),
+                }
 
-    state["stage1"] = stage1_obj
-    state["stage5"] = reset_stage5_state()
-    write_sealed_gate_state(session_dir, state)
+        state["stage1"] = stage1_obj
+        state["stage5"] = reset_stage5_state()
+        write_sealed_gate_state(session_dir, state, expected_version=expected_version)
     emit_json({"status": "ok", "session_dir": str(session_dir), "skip_test": skip_test, "stage1": stage1_obj})
     return 0
 
@@ -1876,28 +1984,52 @@ def extract_file_list_from_impact(raw_list: object) -> list[str]:
     return out
 
 
+def _enforce_stage4_stage1_gate(state: Mapping[str, object], action_label: str) -> None:
+    if is_stage1_passed_or_skipped(state, require_stage2_test_pass=True):
+        return
+    stage1 = state.get("stage1")
+    s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+    bypass_status, bypass_reason = evaluate_skip_test_stage2_status(state)
+    revoked = bool(state.get("skip_test_revoked", False)) or bypass_status == "revoked"
+    if revoked:
+        reason_txt = str(state.get("skip_test_revoked_reason") or bypass_reason).strip()
+        fail_with_code(
+            f"Cannot {action_label}: Stage 1 status is '{s1_status}' (--skip-test revoked: {reason_txt}).",
+            2,
+            extra={"stage1_status": s1_status, "skip_test_revoked": True},
+        )
+    if bypass_status in {"pending", "unverified"}:
+        fail_with_code(
+            f"Cannot {action_label}: {bypass_reason}",
+            2,
+            extra={
+                "stage1_status": s1_status,
+                "skip_test_revoked": False,
+                "skip_test_on_hold": True,
+                "skip_test_hold_status": bypass_status,
+            },
+        )
+    if bypass_status == "stage2_not_executed":
+        fail_with_code(f"Cannot {action_label}: Stage 2 (run_checks.py) has not been executed.", 2)
+    fail_with_code(
+        f"Cannot {action_label}: Stage 1 status is '{s1_status}'.",
+        2,
+        extra={"stage1_status": s1_status, "skip_test_revoked": False},
+    )
+
+
 def cmd_prepare_stage4(args: argparse.Namespace) -> int:
     session_dir = Path(str(args.session)).expanduser().resolve()
     state = read_verified_gate_state(session_dir)
+    expected_version = get_state_version(state)
 
     s1_scan = state.get("stage1_scan")
     if not isinstance(s1_scan, dict) or s1_scan.get("executed") is not True:
         fail_with_code("Cannot prepare Stage 4: impact_scan.py --session was not executed.", 2)
 
+    _enforce_stage4_stage1_gate(state, "prepare Stage 4")
     stage1 = state.get("stage1")
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-    if not is_stage1_passed_or_skipped(state):
-        revoked = bool(state.get("skip_test_revoked", False))
-        detail = (
-            f" (--skip-test revoked: {state.get('skip_test_revoked_reason')})"
-            if revoked
-            else ""
-        )
-        fail_with_code(
-            f"Cannot prepare Stage 4: Stage 1 status is '{s1_status}'{detail}.",
-            2,
-            extra={"stage1_status": s1_status, "skip_test_revoked": revoked},
-        )
 
     stage2 = state.get("stage2")
     if not isinstance(stage2, dict) or stage2.get("executed") is not True:
@@ -2073,34 +2205,56 @@ def cmd_prepare_stage4(args: argparse.Namespace) -> int:
     )
 
     adv_input_path = session_dir / "adversarial_input.md"
-    adv_input_path.write_text("\n".join(md_lines), encoding="utf-8")
-    input_sha = sha256_file(adv_input_path)
-
+    adv_input_content = "\n".join(md_lines)
     canonical_draft = session_dir / "draft_findings.json"
-    if draft_path != canonical_draft:
-        shutil.copy2(draft_path, canonical_draft)
-    draft_sha = sha256_file(canonical_draft)
+    draft_bytes = draft_path.read_bytes()
 
-    state["stage4"] = {
-        "prepared": True,
-        "input_path": str(adv_input_path),
-        "input_sha256": input_sha,
-        "challenge_nonce_sha256": nonce_sha256,
-        "challenge_nonce_verified": False,
-        "draft_sha256": draft_sha,
-        "draft_count": len(stripped_findings),
-        "draft_ids": draft_ids,
-        "draft_by_severity": draft_by_severity,
-        "dismissed_smells_count": len(dismissed_smells),
-        "executed": False,
-        "verifier_mode": None,
-        "response_path": None,
-        "response_sha256": None,
-        "checked_files": [],
-        "audit_notes_length": 0,
-        "updated_at": utc_now_iso(),
-    }
-    write_sealed_gate_state(session_dir, state)
+    with session_state_lock(session_dir):
+        latest_state = read_verified_gate_state(session_dir)
+        current_ver = get_state_version(latest_state)
+        if current_ver != expected_version:
+            fail_with_code(
+                f"Concurrent gate_state.json update detected before Stage 4 prepare commit "
+                f"(expected state_version={expected_version}, current={current_ver}); "
+                "re-run prepare-stage4 against the latest session state.",
+                2,
+                extra={
+                    "expected_state_version": expected_version,
+                    "current_state_version": current_ver,
+                },
+            )
+        _enforce_stage4_stage1_gate(latest_state, "prepare Stage 4")
+
+        write_text_atomic(adv_input_path, adv_input_content)
+        input_sha = sha256_file(adv_input_path)
+
+        if draft_path != canonical_draft:
+            tmp_draft = canonical_draft.with_name(f".{canonical_draft.name}.{secrets.token_hex(4)}.tmp")
+            tmp_draft.write_bytes(draft_bytes)
+            os.replace(tmp_draft, canonical_draft)
+        draft_sha = sha256_file(canonical_draft)
+
+        latest_state["stage4"] = {
+            "prepared": True,
+            "input_path": str(adv_input_path),
+            "input_sha256": input_sha,
+            "challenge_nonce_sha256": nonce_sha256,
+            "challenge_nonce_verified": False,
+            "draft_sha256": draft_sha,
+            "draft_count": len(stripped_findings),
+            "draft_ids": draft_ids,
+            "draft_by_severity": draft_by_severity,
+            "dismissed_smells_count": len(dismissed_smells),
+            "executed": False,
+            "verifier_mode": None,
+            "response_path": None,
+            "response_sha256": None,
+            "checked_files": [],
+            "audit_notes_length": 0,
+            "updated_at": utc_now_iso(),
+        }
+        write_sealed_gate_state(session_dir, latest_state, expected_version=expected_version)
+
     emit_json(
         {
             "status": "prepared",
@@ -2121,189 +2275,227 @@ def _validate_and_record_stage4_response(
     verifier_mode: str,
     resp_obj: Mapping[str, object],
     resp_src_path: Path | None,
+    *,
+    expected_version: int | None = None,
+    initial_snapshot: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    if not is_stage1_passed_or_skipped(state):
-        stage1 = state.get("stage1")
-        s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-        revoked = bool(state.get("skip_test_revoked", False))
-        fail_with_code(
-            f"Cannot record Stage 4: Stage 1 status is '{s1_status}'"
-            + (f" (--skip-test revoked: {state.get('skip_test_revoked_reason')})" if revoked else "")
-            + ".",
-            2,
-            extra={"stage1_status": s1_status, "skip_test_revoked": revoked},
-        )
-
-    stage2 = state.get("stage2")
-    if not isinstance(stage2, dict) or stage2.get("executed") is not True:
-        fail_with_code("Cannot record Stage 4: Stage 2 was not executed.", 2)
-
-    stage3 = state.get("stage3")
-    if not isinstance(stage3, dict) or stage3.get("smell_scan_executed") is not True:
-        fail_with_code("Cannot record Stage 4: Stage 3 (scan_diff_smells.py) was not executed.", 2)
-
-    stage4 = state.get("stage4")
-    if not isinstance(stage4, dict) or stage4.get("prepared") is not True:
-        fail_with_code("Cannot record Stage 4: prepare-stage4 must be run first.", 2)
-
-    adv_input_path = session_dir / "adversarial_input.md"
-    expected_input_sha = str(stage4.get("input_sha256") or "")
-    if not adv_input_path.is_file() or not expected_input_sha or sha256_file(adv_input_path) != expected_input_sha:
-        fail_with_code("Cannot record Stage 4: adversarial_input.md missing or SHA-256 mismatch.", 2)
-
-    # 1. Challenge nonce check
-    expected_nonce_sha = str(stage4.get("challenge_nonce_sha256") or "")
-    provided_nonce = resp_obj.get("challenge_nonce")
-    if not isinstance(provided_nonce, str) or not provided_nonce.strip():
-        fail_with_code(
-            "adversarial_response.json is missing required 'challenge_nonce' from adversarial_input.md.",
-            2,
-        )
-    actual_nonce_sha = sha256_bytes(provided_nonce.strip().encode("utf-8"))
-    if not expected_nonce_sha or not hmac.compare_digest(actual_nonce_sha, expected_nonce_sha):
-        fail_with_code(
-            "Stage 4 challenge_nonce mismatch (verifier must read adversarial_input.md and echo its challenge_nonce).",
-            2,
-        )
-
-    # 2. Structure & audit_notes check
-    challenged = resp_obj.get("challenged_findings")
-    missed = resp_obj.get("missed_findings")
-    checked_raw = resp_obj.get("checked_files")
-    audit_notes = resp_obj.get("audit_notes")
-
-    if not isinstance(challenged, list) or not isinstance(missed, list) or not isinstance(checked_raw, list):
-        fail_with_code(
-            "adversarial_response.json must contain lists: 'challenged_findings', 'missed_findings', 'checked_files'.",
-            2,
-        )
-    if not isinstance(audit_notes, str) or len(audit_notes.strip()) < 20:
-        fail_with_code(
-            "adversarial_response.json must contain 'audit_notes' string of at least 20 characters.",
-            2,
-        )
-    if len(checked_raw) < 1:
-        fail_with_code("adversarial_response.json 'checked_files' must contain at least 1 inspected file.", 2)
-
-    # 3. Draft findings ID coverage & concrete reason >= 10 chars
-    raw_draft_ids = stage4.get("draft_ids", [])
-    expected_draft_ids = [str(x) for x in raw_draft_ids] if isinstance(raw_draft_ids, list) else []
-    challenged_ids: set[str] = set()
-
-    for idx, c_entry in enumerate(challenged):
-        if not isinstance(c_entry, dict):
-            fail_with_code(f"challenged_findings[{idx}] must be a JSON object.", 2)
-        c_id = str(c_entry.get("id") or "").strip()
-        if not c_id:
-            fail_with_code(f"challenged_findings[{idx}] is missing 'id'.", 2)
-        challenged_ids.add(c_id)
-
-        c_verdict = str(c_entry.get("verdict") or "").strip().lower()
-        if c_verdict not in {"keep", "dismiss", "revise"}:
+    with session_state_lock(session_dir):
+        latest_state = read_verified_gate_state(session_dir)
+        latest_version = get_state_version(latest_state)
+        if expected_version is not None and latest_version != expected_version:
             fail_with_code(
-                f"challenged_findings[{idx}] has invalid verdict '{c_entry.get('verdict')}' "
-                "(expected keep, dismiss, or revise).",
+                f"Cannot record Stage 4: gate_state.json changed concurrently "
+                f"(expected state_version={expected_version}, current={latest_version}); "
+                "re-verify against the updated session state.",
+                2,
+                extra={
+                    "expected_state_version": expected_version,
+                    "current_state_version": latest_version,
+                    "skip_test_revoked": bool(latest_state.get("skip_test_revoked", False)),
+                },
+            )
+        if initial_snapshot is not None:
+            for guarded_key in ("stage1", "stage2", "skip_test_revoked", "skip_test_revoked_reason"):
+                if latest_state.get(guarded_key) != initial_snapshot.get(guarded_key):
+                    fail_with_code(
+                        f"Cannot record Stage 4: '{guarded_key}' changed while Stage 4 verifier was running; "
+                        "refusing to overwrite newer gate state.",
+                        2,
+                        extra={
+                            "changed_field": guarded_key,
+                            "skip_test_revoked": bool(latest_state.get("skip_test_revoked", False)),
+                        },
+                    )
+
+        _enforce_stage4_stage1_gate(latest_state, "record Stage 4")
+
+        stage2 = latest_state.get("stage2")
+        if not isinstance(stage2, dict) or stage2.get("executed") is not True:
+            fail_with_code("Cannot record Stage 4: Stage 2 was not executed.", 2)
+        expected_log_sha = str(stage2.get("log_sha256") or "")
+        ci_log_path = session_dir / "ci_checks.log"
+        if not ci_log_path.is_file() or not expected_log_sha or sha256_file(ci_log_path) != expected_log_sha:
+            fail_with_code("Cannot record Stage 4: ci_checks.log is missing or SHA-256 mismatch.", 2)
+
+        stage3 = latest_state.get("stage3")
+        if not isinstance(stage3, dict) or stage3.get("smell_scan_executed") is not True:
+            fail_with_code("Cannot record Stage 4: Stage 3 (scan_diff_smells.py) was not executed.", 2)
+
+        stage4 = latest_state.get("stage4")
+        if not isinstance(stage4, dict) or stage4.get("prepared") is not True:
+            fail_with_code("Cannot record Stage 4: prepare-stage4 must be run first.", 2)
+
+        adv_input_path = session_dir / "adversarial_input.md"
+        expected_input_sha = str(stage4.get("input_sha256") or "")
+        if not adv_input_path.is_file() or not expected_input_sha or sha256_file(adv_input_path) != expected_input_sha:
+            fail_with_code("Cannot record Stage 4: adversarial_input.md missing or SHA-256 mismatch.", 2)
+
+        # 1. Challenge nonce check
+        expected_nonce_sha = str(stage4.get("challenge_nonce_sha256") or "")
+        provided_nonce = resp_obj.get("challenge_nonce")
+        if not isinstance(provided_nonce, str) or not provided_nonce.strip():
+            fail_with_code(
+                "adversarial_response.json is missing required 'challenge_nonce' from adversarial_input.md.",
                 2,
             )
-        c_reason = c_entry.get("reason")
-        if not isinstance(c_reason, str) or len(c_reason.strip()) < 10:
+        actual_nonce_sha = sha256_bytes(provided_nonce.strip().encode("utf-8"))
+        if not expected_nonce_sha or not hmac.compare_digest(actual_nonce_sha, expected_nonce_sha):
             fail_with_code(
-                f"challenged_findings[{idx}] ('{c_id}') requires a concrete 'reason' of at least 10 characters.",
-                2,
-            )
-        for sev_key in ("severity", "revised_severity"):
-            raw_c_sev = c_entry.get(sev_key)
-            if raw_c_sev is not None and str(raw_c_sev).strip():
-                normalize_finding_severity(raw_c_sev, f"challenged_findings[{idx}].{sev_key}")
-
-    missing_draft_ids = [did for did in expected_draft_ids if did not in challenged_ids]
-    if missing_draft_ids:
-        fail_with_code(
-            f"Stage 4 challenged_findings is missing draft finding IDs: {missing_draft_ids}.",
-            2,
-        )
-
-    missed_by_severity: dict[str, int] = {sev_key: 0 for sev_key in ALLOWED_FINDING_SEVERITIES}
-    for idx, m_entry in enumerate(missed):
-        if not isinstance(m_entry, dict):
-            fail_with_code(f"missed_findings[{idx}] must be a JSON object.", 2)
-        m_sev_raw = m_entry.get("severity") if m_entry.get("severity") is not None else m_entry.get("category")
-        m_sev = normalize_finding_severity(m_sev_raw, f"missed_findings[{idx}]")
-        missed_by_severity[m_sev] += 1
-
-    # 4. checked_files resolution & testable_code_files coverage
-    workdir = Path(str(state.get("workdir") or "")).resolve()
-    normalized_checked: list[str] = []
-    for entry in checked_raw:
-        if not isinstance(entry, str) or not entry.strip():
-            fail_with_code("Every entry in 'checked_files' must be a non-empty file path string.", 2)
-        rel_posix, _ = resolve_inside_workdir(workdir, entry)
-        if rel_posix not in normalized_checked:
-            normalized_checked.append(rel_posix)
-
-    mode = str(state.get("mode") or "")
-    testable_raw = state.get("testable_code_files")
-    testable_files = [str(x) for x in testable_raw] if isinstance(testable_raw, list) else []
-    if mode in {"pr", "range", "local"} and len(testable_files) > 0:
-        checked_set = set(normalized_checked)
-        covered = [tf for tf in testable_files if tf in checked_set]
-        required_cov = len(testable_files) if len(testable_files) <= 10 else 10
-        if len(covered) < required_cov:
-            missing_tf = [tf for tf in testable_files if tf not in checked_set]
-            fail_with_code(
-                f"Stage 4 checked_files must cover testable_code_files ({len(covered)}/{required_cov} covered; "
-                f"missing: {missing_tf[:10]}).",
+                "Stage 4 challenge_nonce mismatch (verifier must read adversarial_input.md and echo its challenge_nonce).",
                 2,
             )
 
-    canonical_resp = session_dir / "adversarial_response.json"
-    if resp_src_path is not None and resp_src_path.resolve() == canonical_resp.resolve():
-        pass
-    elif resp_src_path is not None:
-        shutil.copy2(resp_src_path, canonical_resp)
-    else:
-        write_json_atomic(canonical_resp, resp_obj)
-    resp_sha = sha256_file(canonical_resp)
+        # 2. Structure & audit_notes check
+        challenged = resp_obj.get("challenged_findings")
+        missed = resp_obj.get("missed_findings")
+        checked_raw = resp_obj.get("checked_files")
+        audit_notes = resp_obj.get("audit_notes")
 
-    stage4_updated: dict[str, object] = {
-        "prepared": True,
-        "input_path": str(adv_input_path),
-        "input_sha256": expected_input_sha,
-        "challenge_nonce_sha256": expected_nonce_sha,
-        "challenge_nonce_verified": True,
-        "draft_sha256": stage4.get("draft_sha256"),
-        "draft_count": stage4.get("draft_count", 0),
-        "draft_ids": expected_draft_ids,
-        "draft_by_severity": stage4.get("draft_by_severity"),
-        "dismissed_smells_count": stage4.get("dismissed_smells_count", 0),
-        "executed": True,
-        "verifier_mode": verifier_mode,
-        "response_path": str(canonical_resp),
-        "response_sha256": resp_sha,
-        "checked_files": normalized_checked,
-        "audit_notes_length": len(audit_notes.strip()),
-        "challenged_count": len(challenged),
-        "missed_count": len(missed),
-        "missed_by_severity": missed_by_severity,
-        "updated_at": utc_now_iso(),
-    }
-    state["stage4"] = stage4_updated
-    write_sealed_gate_state(session_dir, state)
-    return {
-        "status": "recorded",
-        "verifier_mode": verifier_mode,
-        "challenge_nonce_verified": True,
-        "checked_files": normalized_checked,
-        "challenged_count": len(challenged),
-        "missed_count": len(missed),
-        "missed_by_severity": missed_by_severity,
-        "response_sha256": resp_sha,
-    }
+        if not isinstance(challenged, list) or not isinstance(missed, list) or not isinstance(checked_raw, list):
+            fail_with_code(
+                "adversarial_response.json must contain lists: 'challenged_findings', 'missed_findings', 'checked_files'.",
+                2,
+            )
+        if not isinstance(audit_notes, str) or len(audit_notes.strip()) < 20:
+            fail_with_code(
+                "adversarial_response.json must contain 'audit_notes' string of at least 20 characters.",
+                2,
+            )
+        if len(checked_raw) < 1:
+            fail_with_code("adversarial_response.json 'checked_files' must contain at least 1 inspected file.", 2)
+
+        # 3. Draft findings ID coverage & concrete reason >= 10 chars
+        raw_draft_ids = stage4.get("draft_ids", [])
+        expected_draft_ids = [str(x) for x in raw_draft_ids] if isinstance(raw_draft_ids, list) else []
+        challenged_ids: set[str] = set()
+
+        for idx, c_entry in enumerate(challenged):
+            if not isinstance(c_entry, dict):
+                fail_with_code(f"challenged_findings[{idx}] must be a JSON object.", 2)
+            c_id = str(c_entry.get("id") or "").strip()
+            if not c_id:
+                fail_with_code(f"challenged_findings[{idx}] is missing 'id'.", 2)
+            challenged_ids.add(c_id)
+
+            c_verdict = str(c_entry.get("verdict") or "").strip().lower()
+            if c_verdict not in {"keep", "dismiss", "revise"}:
+                fail_with_code(
+                    f"challenged_findings[{idx}] has invalid verdict '{c_entry.get('verdict')}' "
+                    "(expected keep, dismiss, or revise).",
+                    2,
+                )
+            c_reason = c_entry.get("reason")
+            if not isinstance(c_reason, str) or len(c_reason.strip()) < 10:
+                fail_with_code(
+                    f"challenged_findings[{idx}] ('{c_id}') requires a concrete 'reason' of at least 10 characters.",
+                    2,
+                )
+            for sev_key in ("severity", "revised_severity"):
+                raw_c_sev = c_entry.get(sev_key)
+                if raw_c_sev is not None and str(raw_c_sev).strip():
+                    normalize_finding_severity(raw_c_sev, f"challenged_findings[{idx}].{sev_key}")
+
+        missing_draft_ids = [did for did in expected_draft_ids if did not in challenged_ids]
+        if missing_draft_ids:
+            fail_with_code(
+                f"Stage 4 challenged_findings is missing draft finding IDs: {missing_draft_ids}.",
+                2,
+            )
+
+        missed_by_severity: dict[str, int] = {sev_key: 0 for sev_key in ALLOWED_FINDING_SEVERITIES}
+        for idx, m_entry in enumerate(missed):
+            if not isinstance(m_entry, dict):
+                fail_with_code(f"missed_findings[{idx}] must be a JSON object.", 2)
+            m_sev_raw = m_entry.get("severity") if m_entry.get("severity") is not None else m_entry.get("category")
+            m_sev = normalize_finding_severity(m_sev_raw, f"missed_findings[{idx}]")
+            missed_by_severity[m_sev] += 1
+
+        # 4. checked_files resolution (supporting base-side evidence for deletion-only reviews) & testable coverage
+        workdir = Path(str(latest_state.get("workdir") or "")).resolve()
+        normalized_checked: list[str] = []
+        live_checked_count = 0
+        for entry in checked_raw:
+            if not isinstance(entry, str) or not entry.strip():
+                fail_with_code("Every entry in 'checked_files' must be a non-empty file path string.", 2)
+            rel_posix, is_live = resolve_stage4_checked_file(latest_state, workdir, entry)
+            if is_live:
+                live_checked_count += 1
+            if rel_posix not in normalized_checked:
+                normalized_checked.append(rel_posix)
+
+        if has_surviving_changed_files(latest_state, workdir) and live_checked_count < 1:
+            fail_with_code(
+                "Stage 4 checked_files must include at least 1 inspected live file existing in workdir "
+                "when selected files survive in the head worktree.",
+                2,
+            )
+
+        mode = str(latest_state.get("mode") or "")
+        testable_raw = latest_state.get("testable_code_files")
+        testable_files = [str(x) for x in testable_raw] if isinstance(testable_raw, list) else []
+        if mode in {"pr", "range", "local"} and len(testable_files) > 0:
+            checked_set = set(normalized_checked)
+            covered = [tf for tf in testable_files if tf in checked_set]
+            required_cov = len(testable_files) if len(testable_files) <= 10 else 10
+            if len(covered) < required_cov:
+                missing_tf = [tf for tf in testable_files if tf not in checked_set]
+                fail_with_code(
+                    f"Stage 4 checked_files must cover testable_code_files ({len(covered)}/{required_cov} covered; "
+                    f"missing: {missing_tf[:10]}).",
+                    2,
+                )
+
+        canonical_resp = session_dir / "adversarial_response.json"
+        if resp_src_path is not None and resp_src_path.resolve() == canonical_resp.resolve():
+            pass
+        elif resp_src_path is not None:
+            shutil.copy2(resp_src_path, canonical_resp)
+        else:
+            write_json_atomic(canonical_resp, resp_obj)
+        resp_sha = sha256_file(canonical_resp)
+
+        stage4_updated: dict[str, object] = {
+            "prepared": True,
+            "input_path": str(adv_input_path),
+            "input_sha256": expected_input_sha,
+            "challenge_nonce_sha256": expected_nonce_sha,
+            "challenge_nonce_verified": True,
+            "draft_sha256": stage4.get("draft_sha256"),
+            "draft_count": stage4.get("draft_count", 0),
+            "draft_ids": expected_draft_ids,
+            "draft_by_severity": stage4.get("draft_by_severity"),
+            "dismissed_smells_count": stage4.get("dismissed_smells_count", 0),
+            "executed": True,
+            "verifier_mode": verifier_mode,
+            "response_path": str(canonical_resp),
+            "response_sha256": resp_sha,
+            "checked_files": normalized_checked,
+            "audit_notes_length": len(audit_notes.strip()),
+            "challenged_count": len(challenged),
+            "missed_count": len(missed),
+            "missed_by_severity": missed_by_severity,
+            "updated_at": utc_now_iso(),
+        }
+        latest_state["stage4"] = stage4_updated
+        write_sealed_gate_state(session_dir, latest_state, expected_version=latest_version)
+        state.clear()
+        state.update(latest_state)
+        return {
+            "status": "recorded",
+            "verifier_mode": verifier_mode,
+            "challenge_nonce_verified": True,
+            "checked_files": normalized_checked,
+            "challenged_count": len(challenged),
+            "missed_count": len(missed),
+            "missed_by_severity": missed_by_severity,
+            "response_sha256": resp_sha,
+        }
 
 
 def cmd_record_stage4(args: argparse.Namespace) -> int:
     session_dir = Path(str(args.session)).expanduser().resolve()
     state = read_verified_gate_state(session_dir)
+    initial_version = get_state_version(state)
 
     verifier_mode = str(args.verifier_mode).strip()
     if verifier_mode not in {"subagent", "cli_agent", "cold_pass"}:
@@ -2317,6 +2509,8 @@ def cmd_record_stage4(args: argparse.Namespace) -> int:
         verifier_mode=verifier_mode,
         resp_obj=resp_obj,
         resp_src_path=resp_src,
+        expected_version=initial_version,
+        initial_snapshot=state,
     )
     emit_json(summary)
     return 0
@@ -2350,18 +2544,9 @@ def _extract_json_object_from_cli_stdout(raw_stdout: str) -> dict[str, object]:
 def cmd_run_stage4_cli(args: argparse.Namespace) -> int:
     session_dir = Path(str(args.session)).expanduser().resolve()
     state = read_verified_gate_state(session_dir)
+    initial_version = get_state_version(state)
 
-    if not is_stage1_passed_or_skipped(state):
-        stage1 = state.get("stage1")
-        s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-        revoked = bool(state.get("skip_test_revoked", False))
-        fail_with_code(
-            f"Cannot run Stage 4 CLI: Stage 1 status is '{s1_status}'"
-            + (f" (--skip-test revoked: {state.get('skip_test_revoked_reason')})" if revoked else "")
-            + ".",
-            2,
-            extra={"stage1_status": s1_status, "skip_test_revoked": revoked},
-        )
+    _enforce_stage4_stage1_gate(state, "run Stage 4 CLI")
 
     adv_input_path = session_dir / "adversarial_input.md"
     if not adv_input_path.is_file():
@@ -2415,6 +2600,8 @@ def cmd_run_stage4_cli(args: argparse.Namespace) -> int:
         verifier_mode="cli_agent",
         resp_obj=resp_obj,
         resp_src_path=None,
+        expected_version=initial_version,
+        initial_snapshot=state,
     )
     emit_json(summary)
     return 0

@@ -20,13 +20,17 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from _lib import (  # noqa: E402
+    build_git_diff_cmd,
     emit_json,
+    evaluate_skip_test_stage2_status,
     fail_with_code,
+    get_state_version,
     is_stage1_passed_or_skipped,
     normalize_rel_path,
     parse_diff_header_file_path,
     read_verified_gate_state,
     run_subproc,
+    session_state_lock,
     sha256_file,
     split_nul_paths,
     utc_now_iso,
@@ -326,7 +330,7 @@ def collect_target_lines(
     only_set = {normalize_rel_path(f) for f in (only_files or ()) if f}
 
     if mode in ("pr", "range") and effective_base and head_sha:
-        res = run_git(["git", "diff", "-U0", effective_base, head_sha], cwd=repo_dir)
+        res = run_git(build_git_diff_cmd("-U0", effective_base, head_sha), cwd=repo_dir)
         diff_text = res.stdout if res and res.returncode == 0 else ""
         raw_map = parse_added_lines_by_file(diff_text)
         for rel, line_set in raw_map.items():
@@ -364,9 +368,9 @@ def collect_target_lines(
         head_chk = run_git(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=workdir)
         has_head = head_chk is not None and head_chk.returncode == 0
         if use_since_ref:
-            diff_cmd = ["git", "diff", "-U0", review_base_sha]
+            diff_cmd = build_git_diff_cmd("-U0", review_base_sha)
         else:
-            diff_cmd = ["git", "diff", "-U0", "HEAD"] if has_head else ["git", "diff", "--cached", "-U0"]
+            diff_cmd = build_git_diff_cmd("-U0", "HEAD") if has_head else build_git_diff_cmd("--cached", "-U0")
         res = run_git(diff_cmd, cwd=workdir)
         raw_map = parse_added_lines_by_file(res.stdout if res else "")
         for rel, line_set in raw_map.items():
@@ -678,6 +682,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     session_dir: Path | None = None
     state: dict[str, object] = {}
+    expected_version: int | None = None
     audit_paths: list[str] = []
     preset_changed: list[str] | None = None
     review_base_sha = ""
@@ -686,21 +691,44 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.session is not None:
         session_dir = Path(str(args.session)).expanduser().resolve()
         state = read_verified_gate_state(session_dir)
+        expected_version = get_state_version(state)
 
-        if not is_stage1_passed_or_skipped(state):
-            revoked = bool(state.get("skip_test_revoked", False))
+        if not is_stage1_passed_or_skipped(state, require_stage2_test_pass=True):
             stage1 = state.get("stage1")
             s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-            msg = (
-                f"Stage 3 blocked: --skip-test was revoked because Stage 2 tests failed "
-                f"({state.get('skip_test_revoked_reason') or 'test failure'}); stop with stage1_ng output."
-                if revoked
-                else f"Stage 3 blocked: Stage 1 gate is not passed (current status: '{s1_status}')."
-            )
+            bypass_status, bypass_reason = evaluate_skip_test_stage2_status(state)
+            revoked = bool(state.get("skip_test_revoked", False)) or bypass_status == "revoked"
+            if revoked:
+                msg = (
+                    f"Stage 3 blocked: --skip-test was revoked because Stage 2 tests failed "
+                    f"({state.get('skip_test_revoked_reason') or bypass_reason or 'test failure'}); "
+                    "stop with stage1_ng output."
+                )
+                fail_with_code(
+                    msg,
+                    2,
+                    extra={"stage1_status": s1_status, "skip_test_revoked": True},
+                )
+            if bypass_status in {"pending", "unverified"}:
+                fail_with_code(
+                    f"Stage 3 blocked: {bypass_reason}",
+                    2,
+                    extra={
+                        "stage1_status": s1_status,
+                        "skip_test_revoked": False,
+                        "skip_test_on_hold": True,
+                        "skip_test_hold_status": bypass_status,
+                    },
+                )
+            if bypass_status == "stage2_not_executed":
+                fail_with_code(
+                    "Stage 3 blocked: Stage 2 (run_checks.py --session) must be executed before scan_diff_smells.py.",
+                    2,
+                )
             fail_with_code(
-                msg,
+                f"Stage 3 blocked: Stage 1 gate is not passed (current status: '{s1_status}').",
                 2,
-                extra={"stage1_status": s1_status, "skip_test_revoked": revoked},
+                extra={"stage1_status": s1_status, "skip_test_revoked": False},
             )
 
         stage2 = state.get("stage2")
@@ -809,7 +837,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if session_dir is not None:
         smells_path = session_dir / "diff_smells.json"
-        write_json_atomic(smells_path, output)
         flagged_files = sorted(
             {
                 str(item["file"])
@@ -817,14 +844,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if isinstance(item, dict) and isinstance(item.get("file"), str) and item["file"]
             }
         )
-        state["stage3"] = {
-            "smell_scan_executed": True,
-            "smell_sha256": sha256_file(smells_path),
-            "smell_count": len(all_findings),
-            "flagged_files": flagged_files,
-            "updated_at": utc_now_iso(),
-        }
-        write_sealed_gate_state(session_dir, state)
+        with session_state_lock(session_dir):
+            latest_state = read_verified_gate_state(session_dir)
+            current_ver = get_state_version(latest_state)
+            if expected_version is not None and current_ver != expected_version:
+                fail_with_code(
+                    f"Concurrent gate_state.json update detected before Stage 3 commit "
+                    f"(expected state_version={expected_version}, current={current_ver}); "
+                    "re-run scan_diff_smells.py against the latest session state.",
+                    2,
+                    extra={
+                        "expected_state_version": expected_version,
+                        "current_state_version": current_ver,
+                    },
+                )
+            if not is_stage1_passed_or_skipped(latest_state, require_stage2_test_pass=True):
+                bypass_st, bypass_reason = evaluate_skip_test_stage2_status(latest_state)
+                fail_with_code(
+                    bypass_reason or "Stage 3 commit blocked: Stage 1 / Stage 2 gate is no longer satisfied.",
+                    2,
+                    extra={
+                        "skip_test_revoked": bool(latest_state.get("skip_test_revoked", False))
+                        or bypass_st == "revoked",
+                        "skip_test_on_hold": bypass_st in {"pending", "unverified"},
+                        "skip_test_hold_status": bypass_st if bypass_st in {"pending", "unverified"} else "",
+                    },
+                )
+            write_json_atomic(smells_path, output)
+            latest_state["stage3"] = {
+                "smell_scan_executed": True,
+                "smell_sha256": sha256_file(smells_path),
+                "smell_count": len(all_findings),
+                "flagged_files": flagged_files,
+                "updated_at": utc_now_iso(),
+            }
+            write_sealed_gate_state(session_dir, latest_state, expected_version=expected_version)
 
     emit_json(output)
     return 0

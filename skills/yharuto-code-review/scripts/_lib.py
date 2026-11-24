@@ -7,6 +7,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+from collections.abc import Iterator
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -19,8 +21,14 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Mapping, NoReturn, Sequence
+
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None  # type: ignore[assignment]
 
 CMD_TIMEOUT_SECONDS = 30
 SESSION_PREFIX = "yharuto-review-"
@@ -130,6 +138,13 @@ def write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     os.replace(tmp_path, path)
 
 
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def read_json_object(path: Path, label: str) -> dict[str, object]:
     if not path.is_file():
         fail_with_code(f"{label} does not exist: {path}", 2)
@@ -219,6 +234,90 @@ def run_subproc(
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
+
+
+def build_git_diff_cmd(*diff_args: str) -> list[str]:
+    """Build a git diff command immune to diff.noprefix, diff.mnemonicPrefix, color.diff, and diff.external."""
+    return ["git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", *diff_args]
+
+
+def is_git_ancestor(repo_dir: Path, ancestor_ref: str, descendant_ref: str) -> bool:
+    """Return True when ancestor_ref is an ancestor of (or equal to) descendant_ref."""
+    if not ancestor_ref or not descendant_ref:
+        return False
+    res = run_subproc(["git", "merge-base", "--is-ancestor", ancestor_ref, descendant_ref], cwd=repo_dir, timeout=15)
+    return res is not None and res.returncode == 0
+
+
+def is_git_metadata_rel_path(rel_posix: str) -> bool:
+    """Return True when a repo-relative path points to .git metadata (e.g., worktree .git pointer file)."""
+    norm = normalize_rel_path(rel_posix)
+    if not norm:
+        return False
+    return any(part == ".git" for part in Path(norm).parts)
+
+
+def has_surviving_changed_files(state: Mapping[str, object], workdir: Path) -> bool:
+    """Return True when at least one file in state['changed_files'] exists as a regular file in workdir."""
+    changed_raw = state.get("changed_files")
+    if not isinstance(changed_raw, list) or len(changed_raw) == 0:
+        return True
+    workdir_resolved = workdir.resolve()
+    for item in changed_raw:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        norm = normalize_rel_path(item)
+        if not norm or is_git_metadata_rel_path(norm):
+            continue
+        cand = (workdir_resolved / norm).resolve()
+        try:
+            cand.relative_to(workdir_resolved)
+        except ValueError:
+            continue
+        if cand.is_file():
+            return True
+    return False
+
+
+def is_deleted_changed_file_in_base(
+    state: Mapping[str, object],
+    workdir: Path,
+    rel_posix: str,
+) -> bool:
+    """Return True when rel_posix is a deleted file from changed_files that existed as a blob in the base commit."""
+    norm = normalize_rel_path(rel_posix)
+    if not norm or is_git_metadata_rel_path(norm):
+        return False
+    changed_raw = state.get("changed_files")
+    if not isinstance(changed_raw, list):
+        return False
+    changed_set = {normalize_rel_path(str(x)) for x in changed_raw if isinstance(x, str) and x.strip()}
+    if norm not in changed_set:
+        return False
+    workdir_resolved = workdir.resolve()
+    raw_cand = workdir_resolved / norm
+    cand = raw_cand.resolve()
+    try:
+        cand.relative_to(workdir_resolved)
+    except ValueError:
+        return False
+    if raw_cand.is_symlink() or cand.exists() or cand.is_symlink():
+        return False
+    repo_dir_str = str(state.get("repo_dir") or "").strip()
+    if not repo_dir_str:
+        return False
+    repo_dir = Path(repo_dir_str).resolve()
+    if not repo_dir.is_dir():
+        return False
+    base_candidates = [
+        str(state.get(k) or "").strip()
+        for k in ("review_base_sha", "merge_base_sha", "base_sha")
+    ]
+    for base_ref in dict.fromkeys(b for b in base_candidates if b):
+        res = run_subproc(["git", "cat-file", "-t", f"{base_ref}:{norm}"], cwd=repo_dir, timeout=10)
+        if res is not None and res.returncode == 0 and res.stdout.strip() == "blob":
+            return True
+    return False
 
 
 def sanitize_slug(raw: str) -> str:
@@ -692,25 +791,124 @@ def verify_state_hmac(session_dir: Path, state: Mapping[str, object]) -> tuple[b
     return True, "ok"
 
 
-def write_sealed_gate_state(session_dir: Path, state: dict[str, object]) -> None:
-    key_bytes = load_session_hmac_key(session_dir)
-    if key_bytes is None:
-        fail_with_code(f"Cannot seal gate_state.json: HMAC key missing for {session_dir}", 2)
-    state_copy: dict[str, object] = {
-        str(k): v for k, v in state.items() if str(k) not in {"state_hmac", "hmac_verified"}
-    }
-    state_copy["state_hmac"] = compute_state_hmac(key_bytes, state_copy)
-    write_json_atomic(session_dir / "gate_state.json", state_copy)
-    state["state_hmac"] = state_copy["state_hmac"]
+_LOCK_REGISTRY_GUARD = threading.Lock()
+_PATH_THREAD_LOCKS: dict[Path, threading.RLock] = {}
+_HELD_SESSION_LOCK_COUNTS: dict[Path, int] = {}
+
+
+def _get_path_thread_lock(resolved: Path) -> threading.RLock:
+    with _LOCK_REGISTRY_GUARD:
+        lock = _PATH_THREAD_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_THREAD_LOCKS[resolved] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def session_state_lock(session_dir: Path, *, create_dir: bool = True) -> Iterator[None]:
+    """Acquire an exclusive, reentrant thread- and process-safe advisory lock for gate_state.json updates."""
+    resolved = session_dir.resolve()
+    thread_lock = _get_path_thread_lock(resolved)
+    with thread_lock:
+        held = _HELD_SESSION_LOCK_COUNTS.get(resolved, 0)
+        if held > 0:
+            _HELD_SESSION_LOCK_COUNTS[resolved] = held + 1
+            try:
+                yield
+            finally:
+                remaining = _HELD_SESSION_LOCK_COUNTS.get(resolved, 1) - 1
+                if remaining <= 0:
+                    _HELD_SESSION_LOCK_COUNTS.pop(resolved, None)
+                else:
+                    _HELD_SESSION_LOCK_COUNTS[resolved] = remaining
+            return
+
+        if create_dir:
+            resolved.mkdir(parents=True, exist_ok=True)
+        elif not resolved.is_dir():
+            yield
+            return
+        lock_path = resolved / ".gate_state.lock"
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            _HELD_SESSION_LOCK_COUNTS[resolved] = 1
+            try:
+                yield
+            finally:
+                remaining = _HELD_SESSION_LOCK_COUNTS.get(resolved, 1) - 1
+                if remaining <= 0:
+                    _HELD_SESSION_LOCK_COUNTS.pop(resolved, None)
+                else:
+                    _HELD_SESSION_LOCK_COUNTS[resolved] = remaining
+        finally:
+            if _fcntl is not None:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+
+
+def get_state_version(state: Mapping[str, object]) -> int:
+    raw = state.get("state_version")
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return 0
+
+
+def write_sealed_gate_state(
+    session_dir: Path,
+    state: dict[str, object],
+    *,
+    expected_version: int | None = None,
+) -> None:
+    with session_state_lock(session_dir):
+        key_bytes = load_session_hmac_key(session_dir)
+        if key_bytes is None:
+            fail_with_code(f"Cannot seal gate_state.json: HMAC key missing for {session_dir}", 2)
+
+        state_path = session_dir / "gate_state.json"
+        if expected_version is not None:
+            if not state_path.is_file():
+                fail_with_code(f"Cannot update gate_state.json: state file missing in {session_dir}", 2)
+            current_state = read_verified_gate_state(session_dir)
+            current_ver = get_state_version(current_state)
+            if current_ver != expected_version:
+                fail_with_code(
+                    f"Concurrent gate_state.json update detected (expected state_version={expected_version}, "
+                    f"current={current_ver}); re-run against the latest session state.",
+                    2,
+                    extra={
+                        "expected_state_version": expected_version,
+                        "current_state_version": current_ver,
+                    },
+                )
+
+        base_ver = expected_version if expected_version is not None else get_state_version(state)
+        next_ver = base_ver + 1
+        state_copy: dict[str, object] = {
+            str(k): v for k, v in state.items() if str(k) not in {"state_hmac", "hmac_verified"}
+        }
+        state_copy["state_version"] = next_ver
+        state_copy["state_hmac"] = compute_state_hmac(key_bytes, state_copy)
+        write_json_atomic(state_path, state_copy)
+        state["state_version"] = next_ver
+        state["state_hmac"] = state_copy["state_hmac"]
 
 
 def read_verified_gate_state(session_dir: Path) -> dict[str, object]:
     state_path = session_dir / "gate_state.json"
-    state = read_json_object(state_path, "gate_state.json")
-    ok, err_msg = verify_state_hmac(session_dir, state)
-    if not ok:
-        fail_with_code(err_msg, 2)
-    return state
+    if not session_dir.is_dir() or not state_path.is_file():
+        fail_with_code(f"gate_state.json does not exist: {state_path}", 2)
+    with session_state_lock(session_dir, create_dir=False):
+        state = read_json_object(state_path, "gate_state.json")
+        ok, err_msg = verify_state_hmac(session_dir, state)
+        if not ok:
+            fail_with_code(err_msg, 2)
+        return state
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +1036,9 @@ def detect_ci_script_hazard_in_files(workdir: Path) -> tuple[bool, list[str]]:
 
 ALLOWED_STAGE1_SKIP_STATUSES: frozenset[str] = frozenset({"NG", "SKIPPED_BY_FLAG"})
 TEST_CHECK_TOOLS: frozenset[str] = frozenset({"test", "python_test"})
+BLOCKED_TEST_STATUSES: frozenset[str] = frozenset(
+    {"blocked_fork", "blocked_untrusted_script", "blocked_untrusted_code"}
+)
 GH_TEST_CHECK_WORD_RE = re.compile(
     r"(?:^|[^a-z0-9])"
     r"(?:tests?|testing|specs?|pytest|unittests?|jest|vitest|mocha|rspec|phpunit|junit|e2e|playwright|cypress|nextest)"
@@ -845,6 +1046,32 @@ GH_TEST_CHECK_WORD_RE = re.compile(
     re.IGNORECASE,
 )
 GH_TEST_CHECK_CAMEL_RE = re.compile(r"(?<=[a-z])(?:Tests?|Specs?)(?![a-z])")
+GH_OS_RUNNER_TOKEN_RE = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:ubuntu|macos|windows|linux)[-_](?:latest|[0-9]+(?:\.[0-9]+)?(?:-[a-z0-9]+)?)"
+    r"(?=[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+GH_NON_TEST_CHECK_WORD_RE = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:lint(?:er|ing)?|eslint|prettier|format(?:ter|ting)?|fmt|style(?:lint|check)?|markdownlint|shellcheck|hadolint|"
+    r"biome|oxlint|typecheck|type-check|tsc|mypy|pyright|ruff|flake8|pylint|black|isort|clippy|vet|staticcheck|"
+    r"build|compile|bundle|docker|image|deploy|release|publish|docs?|pages|storybook|chromatic|"
+    r"codecov|coveralls|sonar(?:cloud|qube)?|codeql|security|audit|dependabot|renovate|vercel|netlify|cloudflare|"
+    r"label(?:er)?|triage|cla|dco|license|attestation|provenance|sbom|check[-_ ]?latest|contest|coderabbit|"
+    r"commitlint|changelog|size|benchmark|perf)"
+    r"(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+GH_NON_TEST_WORKFLOW_WORD_RE = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:lint(?:er|ing)?|eslint|prettier|format(?:ter|ting)?|style(?:lint|check)?|markdownlint|shellcheck|"
+    r"typecheck|type-check|deploy|release|publish|docs?|pages|storybook|chromatic|"
+    r"codecov|coveralls|sonar(?:cloud|qube)?|codeql|security|dependabot|renovate|vercel|netlify|cloudflare|"
+    r"label(?:er)?|triage|cla|dco|license|attestation|provenance|sbom|coderabbit|commitlint|changelog)"
+    r"(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
 GH_FAIL_STATUS_TOKENS: frozenset[str] = frozenset(
     {
         "FAIL",
@@ -859,6 +1086,25 @@ GH_FAIL_STATUS_TOKENS: frozenset[str] = frozenset(
         "STARTUP_FAILURE",
         "STALE",
     }
+)
+GH_PENDING_STATUS_TOKENS: frozenset[str] = frozenset(
+    {
+        "PENDING",
+        "IN_PROGRESS",
+        "QUEUED",
+        "WAITING",
+        "REQUESTED",
+        "EXPECTED",
+    }
+)
+GH_CONFIRMED_PASS_STATUS_TOKENS: frozenset[str] = frozenset({"PASS", "PASSED", "SUCCESS"})
+GH_NEUTRAL_PASS_STATUS_TOKENS: frozenset[str] = frozenset({"NEUTRAL", "SKIPPED", "SKIPPING"})
+GH_ALL_STATUS_TOKENS: frozenset[str] = (
+    GH_FAIL_STATUS_TOKENS
+    | GH_PENDING_STATUS_TOKENS
+    | GH_CONFIRMED_PASS_STATUS_TOKENS
+    | GH_NEUTRAL_PASS_STATUS_TOKENS
+    | frozenset({"COMPLETED"})
 )
 
 
@@ -875,35 +1121,156 @@ def reset_stage5_state() -> dict[str, object]:
 
 
 def is_test_check_name(check_name: str) -> bool:
-    """Return True if a CI check name represents a test suite rather than lint/build/etc."""
+    """Return True if a CI check name explicitly names a test suite."""
     cleaned = check_name.strip()
     if not cleaned:
         return False
     return GH_TEST_CHECK_WORD_RE.search(cleaned) is not None or GH_TEST_CHECK_CAMEL_RE.search(cleaned) is not None
 
 
+def is_non_test_check_name(check_name: str) -> bool:
+    """Return True if a CI check name clearly identifies a non-test job (lint/typecheck/build/etc.)."""
+    cleaned = check_name.strip()
+    if not cleaned or is_test_check_name(cleaned):
+        return False
+    stripped_runners = GH_OS_RUNNER_TOKEN_RE.sub(" ", cleaned)
+    return GH_NON_TEST_CHECK_WORD_RE.search(stripped_runners) is not None
+
+
+def is_potential_test_check(name: str, workflow: str = "") -> bool:
+    """Return True when a CI check is a test job or a generic CI job that may run tests (fail-closed)."""
+    cleaned_name = name.strip()
+    cleaned_wf = workflow.strip()
+    if not cleaned_name and not cleaned_wf:
+        return False
+    combined = f"{cleaned_wf} / {cleaned_name}" if cleaned_wf and cleaned_name else (cleaned_wf or cleaned_name)
+    if is_test_check_name(cleaned_name) or is_test_check_name(cleaned_wf) or is_test_check_name(combined):
+        return True
+    if is_non_test_check_name(cleaned_name):
+        return False
+    if cleaned_wf and not is_test_check_name(cleaned_wf):
+        wf_no_runners = GH_OS_RUNNER_TOKEN_RE.sub(" ", cleaned_wf)
+        if GH_NON_TEST_WORKFLOW_WORD_RE.search(wf_no_runners) is not None:
+            return False
+    return True
+
+
+def classify_gh_status_token(raw_status: str) -> str | None:
+    """Classify a concise GitHub check status/conclusion token into 'failed'|'pending'|'passed'|'neutral'|None."""
+    upper = raw_status.strip().upper()
+    if not upper:
+        return None
+    normalized = (
+        upper.replace("IN PROGRESS", "IN_PROGRESS")
+        .replace("TIMED OUT", "TIMED_OUT")
+        .replace("ACTION REQUIRED", "ACTION_REQUIRED")
+        .replace("STARTUP FAILURE", "STARTUP_FAILURE")
+    )
+    tokens = [tok for tok in re.split(r"[\s()/,]+", normalized) if tok]
+    if not tokens or len(tokens) > 2:
+        return None
+    if not all(tok in GH_ALL_STATUS_TOKENS for tok in tokens):
+        return None
+    if any(tok in GH_FAIL_STATUS_TOKENS for tok in tokens):
+        return "failed"
+    if any(tok in GH_PENDING_STATUS_TOKENS for tok in tokens):
+        return "pending"
+    if any(tok in GH_CONFIRMED_PASS_STATUS_TOKENS for tok in tokens):
+        return "passed"
+    if any(tok in GH_NEUTRAL_PASS_STATUS_TOKENS for tok in tokens):
+        return "neutral"
+    return None
+
+
 def _is_gh_failed_status_token(raw_status: str) -> bool:
-    tokens = [tok for tok in re.split(r"[\s()/,]+", raw_status.strip().upper()) if tok]
-    return any(tok in GH_FAIL_STATUS_TOKENS for tok in tokens)
+    return classify_gh_status_token(raw_status) == "failed"
 
 
-def extract_failed_gh_check_names(lines: Sequence[str]) -> list[str]:
-    """Extract failing check names from `gh pr checks` TSV lines or `name: STATUS` summary lines."""
-    failed_names: list[str] = []
+def parse_gh_pr_check_rows(lines: Sequence[str], *, tsv_only: bool = False) -> list[dict[str, str]]:
+    """Parse structured check rows from `gh pr checks` TSV output or (unless tsv_only) `name: STATUS` summary lines."""
+    rows: list[dict[str, str]] = []
     for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
         if "\t" in line:
             cols = [c.strip() for c in line.split("\t")]
-            if len(cols) >= 2 and cols[0] and _is_gh_failed_status_token(cols[1]):
-                failed_names.append(cols[0])
+            if len(cols) >= 2 and cols[0]:
+                cls = classify_gh_status_token(cols[1])
+                if cls is not None:
+                    rows.append({"name": cols[0], "workflow": "", "status": cls})
             continue
-        if ": " in line:
+        if not tsv_only and ": " in line:
             name_part, status_part = line.rsplit(": ", 1)
-            if name_part.strip() and _is_gh_failed_status_token(status_part):
-                failed_names.append(name_part.strip())
-    return failed_names
+            cls = classify_gh_status_token(status_part)
+            if name_part.strip() and cls is not None:
+                rows.append({"name": name_part.strip(), "workflow": "", "status": cls})
+    return rows
+
+
+def extract_failed_gh_check_names(lines: Sequence[str]) -> list[str]:
+    """Extract failing check names from `gh pr checks` TSV lines or `name: STATUS` summary lines."""
+    return [row["name"] for row in parse_gh_pr_check_rows(lines) if row["status"] == "failed"]
+
+
+def _extract_gh_check_entries(chk: Mapping[str, object]) -> list[dict[str, str]]:
+    """Extract normalized {name, workflow, status} entries from a gh_pr_checks record."""
+    raw_entries = chk.get("check_entries")
+    if isinstance(raw_entries, list) and raw_entries:
+        parsed: list[dict[str, str]] = []
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            workflow = str(item.get("workflow") or "").strip()
+            status = str(item.get("status") or "").strip().lower()
+            if name and status in {"passed", "failed", "pending", "neutral"}:
+                parsed.append({"name": name, "workflow": workflow, "status": status})
+        if parsed:
+            return parsed
+
+    entries: list[dict[str, str]] = []
+    seen_failed: set[str] = set()
+    raw_failed = chk.get("failed_checks")
+    if isinstance(raw_failed, list):
+        for name_obj in raw_failed:
+            if isinstance(name_obj, str) and name_obj.strip():
+                nm = name_obj.strip()
+                seen_failed.add(nm)
+                entries.append({"name": nm, "workflow": "", "status": "failed"})
+
+    raw_pending = chk.get("pending_checks")
+    seen_pending: set[str] = set()
+    if isinstance(raw_pending, list):
+        for name_obj in raw_pending:
+            if isinstance(name_obj, str) and name_obj.strip():
+                nm = name_obj.strip()
+                seen_pending.add(nm)
+                entries.append({"name": nm, "workflow": "", "status": "pending"})
+
+    raw_passed = chk.get("passed_checks")
+    seen_passed: set[str] = set()
+    if isinstance(raw_passed, list):
+        for name_obj in raw_passed:
+            if isinstance(name_obj, str) and name_obj.strip():
+                nm = name_obj.strip()
+                seen_passed.add(nm)
+                entries.append({"name": nm, "workflow": "", "status": "passed"})
+
+    summary_lines = chk.get("summary_lines")
+    if isinstance(summary_lines, list):
+        str_lines = [ln for ln in summary_lines if isinstance(ln, str)]
+        for row in parse_gh_pr_check_rows(str_lines):
+            nm = row["name"]
+            st = row["status"]
+            if st == "failed" and (isinstance(raw_failed, list) or nm in seen_failed):
+                continue
+            if st == "pending" and (isinstance(raw_pending, list) or nm in seen_pending):
+                continue
+            if st == "passed" and (isinstance(raw_passed, list) or nm in seen_passed):
+                continue
+            entries.append(row)
+    return entries
 
 
 def find_stage2_test_failures(checks: object) -> list[str]:
@@ -919,16 +1286,14 @@ def find_stage2_test_failures(checks: object) -> list[str]:
             failed_tools.append(tool)
             continue
         if tool == "gh_pr_checks":
-            raw_failed_checks = chk.get("failed_checks")
-            if isinstance(raw_failed_checks, list):
-                if any(isinstance(name, str) and is_test_check_name(name) for name in raw_failed_checks):
+            entries = _extract_gh_check_entries(chk)
+            failed_entries = [e for e in entries if e["status"] == "failed"]
+            if failed_entries:
+                if any(is_potential_test_check(e["name"], e["workflow"]) for e in failed_entries):
                     failed_tools.append(tool)
-                continue
-            summary_lines = chk.get("summary_lines")
-            if isinstance(summary_lines, list):
-                str_lines = [ln for ln in summary_lines if isinstance(ln, str)]
-                if any(is_test_check_name(name) for name in extract_failed_gh_check_names(str_lines)):
-                    failed_tools.append(tool)
+            else:
+                # Failed gh_pr_checks with unparseable job names cannot prove tests passed -> fail-closed
+                failed_tools.append(tool)
     return failed_tools
 
 
@@ -940,18 +1305,108 @@ def has_stage2_test_failure(state: Mapping[str, object]) -> bool:
     return len(find_stage2_test_failures(stage2.get("checks"))) > 0
 
 
-def is_stage1_passed_or_skipped(state: Mapping[str, object]) -> bool:
+def evaluate_skip_test_stage2_status(state: Mapping[str, object]) -> tuple[str, str]:
+    """Evaluate --skip-test readiness against Stage 2 results.
+
+    Returns (status, reason) where status is one of:
+    - 'not_applicable': session is not using an active Stage 1 --skip-test bypass
+    - 'revoked': Stage 2 test failure permanently revoked --skip-test
+    - 'stage2_not_executed': Stage 2 has not run yet
+    - 'confirmed': required tests passed with no failing, pending, or unverified test checks
+    - 'pending': required remote/CI test checks are still running (bypass on hold, not revoked)
+    - 'unverified': no passing test result was confirmed (timed_out, env_unavailable, etc.)
+    """
+    stage1 = state.get("stage1")
+    s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+    if s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+        return "not_applicable", ""
+    if not bool(state.get("skip_test", False)) or s1_status not in ALLOWED_STAGE1_SKIP_STATUSES:
+        return "not_applicable", ""
+
+    if bool(state.get("skip_test_revoked", False)) or has_stage2_test_failure(state):
+        reason = str(state.get("skip_test_revoked_reason") or "").strip()
+        if not reason:
+            stage2_rev = state.get("stage2")
+            failed = find_stage2_test_failures(
+                stage2_rev.get("checks") if isinstance(stage2_rev, dict) else None
+            )
+            tools_csv = ", ".join(failed) if failed else "test"
+            reason = f"Stage 2 test check(s) failed ({tools_csv}); --skip-test cannot bypass failing tests."
+        return "revoked", reason
+
+    stage2 = state.get("stage2")
+    if not isinstance(stage2, dict) or stage2.get("executed") is not True:
+        return "stage2_not_executed", ""
+
+    checks_raw = stage2.get("checks")
+    checks = [c for c in checks_raw if isinstance(c, dict)] if isinstance(checks_raw, list) else []
+
+    local_tests = [c for c in checks if str(c.get("tool") or "").strip() in TEST_CHECK_TOOLS]
+    gh_checks = [c for c in checks if str(c.get("tool") or "").strip() == "gh_pr_checks"]
+
+    gh_test_pending = False
+    gh_test_passed = False
+    for gh_chk in gh_checks:
+        gh_st = str(gh_chk.get("status") or "").strip()
+        entries = _extract_gh_check_entries(gh_chk)
+        if entries:
+            if any(e["status"] == "pending" and is_potential_test_check(e["name"], e["workflow"]) for e in entries):
+                gh_test_pending = True
+            # Fail-closed confirmation: require an explicit test check name/workflow to have passed
+            # (generic bot/deployment checks like Vercel or authentication alone cannot confirm tests passed).
+            if any(
+                e["status"] == "passed"
+                and (is_test_check_name(e["name"]) or is_test_check_name(e["workflow"]))
+                for e in entries
+            ):
+                gh_test_passed = True
+        elif gh_st == "pending":
+            gh_test_pending = True
+
+    if gh_test_pending:
+        return (
+            "pending",
+            "Stage 2 remote test checks are still pending/in-progress; --skip-test bypass is on hold "
+            "(not revoked) until required tests finish passing.",
+        )
+
+    all_local_passed = len(local_tests) > 0 and all(c.get("status") == "passed" for c in local_tests)
+    if all_local_passed:
+        return "confirmed", ""
+
+    local_inconclusive = [
+        c
+        for c in local_tests
+        if str(c.get("status") or "").strip() not in ({"passed", "not_configured"} | BLOCKED_TEST_STATUSES)
+    ]
+    if gh_test_passed and not local_inconclusive:
+        return "confirmed", ""
+
+    local_statuses = [f"{c.get('tool')}={c.get('status')}" for c in local_tests]
+    gh_statuses = [f"gh_pr_checks={c.get('status')}" for c in gh_checks]
+    detail = ", ".join(local_statuses + gh_statuses) or "no test checks recorded"
+    return (
+        "unverified",
+        f"Stage 2 did not confirm a passing test run ({detail}); --skip-test requires a confirmed passing test.",
+    )
+
+
+def is_stage1_passed_or_skipped(
+    state: Mapping[str, object],
+    *,
+    require_stage2_test_pass: bool = False,
+) -> bool:
     """Return True when Stage 1 passed normally or is allowed to continue via --skip-test."""
     stage1 = state.get("stage1")
     s1_status = stage1.get("status") if isinstance(stage1, dict) else None
     if s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
         return True
-    if (
-        bool(state.get("skip_test", False))
-        and not bool(state.get("skip_test_revoked", False))
-        and not has_stage2_test_failure(state)
-        and s1_status in ALLOWED_STAGE1_SKIP_STATUSES
-    ):
+    if bool(state.get("skip_test", False)) and s1_status in ALLOWED_STAGE1_SKIP_STATUSES:
+        bypass_status, _ = evaluate_skip_test_stage2_status(state)
+        if bypass_status == "revoked":
+            return False
+        if require_stage2_test_pass:
+            return bypass_status == "confirmed"
         return True
     return False
 
@@ -1231,19 +1686,124 @@ def _history_repo_key(repo_dir: Path) -> str:
     return hashlib.sha256(str(repo_dir.resolve()).encode("utf-8")).hexdigest()[:16]
 
 
-def _read_history_file_entries(path: Path) -> list[dict[str, object]]:
+def _read_history_file_status(path: Path) -> tuple[list[dict[str, object]], bool]:
+    """Read history entries from path and report (entries, is_corrupt)."""
     if not path.is_file():
-        return []
+        return [], False
     try:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return [], True
     if not isinstance(raw, dict):
-        return []
+        return [], True
     entries_raw = raw.get("entries")
     if isinstance(entries_raw, list):
-        return [{str(k): v for k, v in item.items()} for item in entries_raw if isinstance(item, dict)]
-    return [{str(k): v for k, v in raw.items()}]
+        return [{str(k): v for k, v in item.items()} for item in entries_raw if isinstance(item, dict)], False
+    return [{str(k): v for k, v in raw.items()}], False
+
+
+def _read_history_file_entries(path: Path) -> list[dict[str, object]]:
+    entries, _ = _read_history_file_status(path)
+    return entries
+
+
+def should_advance_review_history(
+    session_dir: Path,
+    state: Mapping[str, object],
+) -> bool:
+    """Return True only when the reviewed scope continuously covers from merge_base or prior saved head."""
+    mode = str(state.get("mode") or "")
+    if mode not in {"pr", "range", "local"}:
+        return False
+
+    only_files_raw = state.get("only_files")
+    if isinstance(only_files_raw, list) and len(only_files_raw) > 0:
+        return False
+
+    is_rereview = bool(state.get("is_rereview", False))
+    if not is_rereview:
+        return True
+
+    repo_dir_str = str(state.get("repo_dir") or "").strip()
+    if not repo_dir_str:
+        return False
+    repo_dir = Path(repo_dir_str).resolve()
+    session_root = session_dir.resolve().parent
+    effective_scope = str(state.get("session_scope") or "global")
+    merge_base_sha = str(state.get("merge_base_sha") or "").strip()
+    review_base_sha = str(state.get("review_base_sha") or "").strip()
+
+    if mode in {"pr", "range"}:
+        if not review_base_sha or (merge_base_sha and review_base_sha == merge_base_sha):
+            return True
+        pr_raw = state.get("pr_number")
+        pr_number = pr_raw if isinstance(pr_raw, int) and not isinstance(pr_raw, bool) else None
+        candidates, exact_pr_match = load_review_history_candidates(
+            session_root=session_root,
+            effective_scope=effective_scope,
+            repo_dir=repo_dir,
+            pr_number=pr_number if mode == "pr" else None,
+        )
+        if mode == "pr":
+            if not (exact_pr_match and candidates):
+                return False
+            prev_entry = candidates[0]
+            prev_head = str(prev_entry.get("head_sha") or "").strip()
+            prev_mb = str(prev_entry.get("merge_base_sha") or "").strip()
+            if not prev_head or (prev_mb and merge_base_sha and prev_mb != merge_base_sha):
+                return False
+            return review_base_sha == prev_head or is_git_ancestor(repo_dir, review_base_sha, prev_head)
+
+        for entry in candidates:
+            commits_rev = entry.get("commits_reviewed")
+            is_commit_history = (
+                commits_rev is True
+                if isinstance(commits_rev, bool)
+                else str(entry.get("mode") or "") in {"pr", "range"}
+            )
+            if not is_commit_history:
+                continue
+            prev_head = str(entry.get("head_sha") or "").strip()
+            prev_mb = str(entry.get("merge_base_sha") or "").strip()
+            if not prev_head or (prev_mb and merge_base_sha and prev_mb != merge_base_sha):
+                continue
+            if review_base_sha == prev_head or is_git_ancestor(repo_dir, review_base_sha, prev_head):
+                return True
+        return False
+
+    # mode == "local"
+    if not review_base_sha:
+        return True
+    history_dir = resolve_history_dir(session_root, effective_scope, create_if_missing=False)
+    if history_dir is not None and history_dir.is_dir():
+        repo_key = _history_repo_key(repo_dir)
+        for hist_path in (history_dir / f"{repo_key}-runs.json", history_dir / f"{repo_key}-local.json"):
+            _, is_corrupt = _read_history_file_status(hist_path)
+            if is_corrupt:
+                return False
+    current_branch = get_current_git_branch(repo_dir)
+    candidates, _ = load_review_history_candidates(
+        session_root=session_root,
+        effective_scope=effective_scope,
+        repo_dir=repo_dir,
+        pr_number=None,
+    )
+    matching_prev_heads: list[str] = []
+    for entry in candidates:
+        entry_pr = entry.get("pr_number")
+        entry_branch = str(entry.get("branch") or "").strip()
+        if entry_pr is not None:
+            if not current_branch or entry_branch != current_branch:
+                continue
+        elif current_branch and entry_branch and entry_branch != current_branch:
+            continue
+        prev_head = str(entry.get("head_sha") or "").strip()
+        if prev_head:
+            matching_prev_heads.append(prev_head)
+    if not matching_prev_heads:
+        return True
+    latest_prev_head = matching_prev_heads[0]
+    return review_base_sha == latest_prev_head or is_git_ancestor(repo_dir, review_base_sha, latest_prev_head)
 
 
 def save_review_history(
@@ -1253,6 +1813,8 @@ def save_review_history(
     verdict: str | None,
 ) -> Path | None:
     """Persist lightweight review metadata outside the target repo for future --rereview runs."""
+    if not should_advance_review_history(session_dir, state):
+        return None
     repo_dir_str = str(state.get("repo_dir") or "").strip()
     if not repo_dir_str:
         return None
@@ -1273,6 +1835,7 @@ def save_review_history(
     ch_raw = state.get("changed_files")
     changed_files = [str(x) for x in ch_raw] if isinstance(ch_raw, list) else []
     head_sha = str(state.get("head_sha") or "")
+    review_base_sha = str(state.get("review_base_sha") or "")
     branch_name = ""
     if mode == "local":
         branch_name = get_current_git_branch(repo_dir)
@@ -1290,6 +1853,7 @@ def save_review_history(
         "pr_number": pr_number,
         "base_sha": str(state.get("base_sha") or ""),
         "merge_base_sha": str(state.get("merge_base_sha") or ""),
+        "review_base_sha": review_base_sha,
         "head_sha": head_sha,
         "changed_files": changed_files,
         "verdict": verdict,

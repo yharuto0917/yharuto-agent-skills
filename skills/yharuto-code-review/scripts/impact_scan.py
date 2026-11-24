@@ -19,13 +19,16 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from _lib import (  # noqa: E402
+    build_git_diff_cmd,
     emit_json,
     fail_with_code,
     filter_diff_by_files,
+    get_state_version,
     normalize_rel_path,
     parse_diff_header_file_path,
     read_verified_gate_state,
     run_subproc,
+    session_state_lock,
     sha256_file,
     split_nul_paths,
     utc_now_iso,
@@ -344,7 +347,7 @@ def get_diff_and_changed_files(
     only_set = {normalize_rel_path(f) for f in (only_files or ()) if f}
 
     if mode in ("pr", "range") and effective_base and head_sha:
-        diff_res = run_subproc(["git", "diff", "-U0", effective_base, head_sha], cwd=repo_dir, timeout=GIT_TIMEOUT_SECONDS)
+        diff_res = run_subproc(build_git_diff_cmd("-U0", effective_base, head_sha), cwd=repo_dir, timeout=GIT_TIMEOUT_SECONDS)
         diff_text = diff_res.stdout if diff_res and diff_res.returncode == 0 else ""
         if preset_changed is not None:
             changed = list(preset_changed)
@@ -379,10 +382,10 @@ def get_diff_and_changed_files(
         head_chk = run_subproc(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         has_head = head_chk is not None and head_chk.returncode == 0
         if use_since_ref:
-            diff_cmd = ["git", "diff", "-U0", review_base_sha]
+            diff_cmd = build_git_diff_cmd("-U0", review_base_sha)
             names_cmd = ["git", "diff", "--name-only", "-z", review_base_sha]
         else:
-            diff_cmd = ["git", "diff", "-U0", "HEAD"] if has_head else ["git", "diff", "--cached", "-U0"]
+            diff_cmd = build_git_diff_cmd("-U0", "HEAD") if has_head else build_git_diff_cmd("--cached", "-U0")
             names_cmd = ["git", "diff", "--name-only", "-z", "HEAD"] if has_head else ["git", "diff", "--cached", "--name-only", "-z"]
         diff_res = run_subproc(diff_cmd, cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
         names_res = run_subproc(names_cmd, cwd=workdir, timeout=GIT_TIMEOUT_SECONDS)
@@ -785,6 +788,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     session_dir: Path | None = None
     state: dict[str, object] = {}
+    expected_version: int | None = None
     preset_changed: list[str] | None = None
     audit_paths: list[str] = []
     review_base_sha = ""
@@ -793,6 +797,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.session is not None:
         session_dir = Path(str(args.session)).expanduser().resolve()
         state = read_verified_gate_state(session_dir)
+        expected_version = get_state_version(state)
 
         workdir = Path(str(state.get("workdir") or "")).resolve()
         repo_dir = Path(str(state.get("repo_dir") or workdir)).resolve()
@@ -886,13 +891,27 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if session_dir is not None:
         impact_path = session_dir / "impact_scan.json"
-        write_json_atomic(impact_path, result)
-        state["stage1_scan"] = {
-            "executed": True,
-            "sha256": sha256_file(impact_path),
-            "updated_at": utc_now_iso(),
-        }
-        write_sealed_gate_state(session_dir, state)
+        with session_state_lock(session_dir):
+            latest_state = read_verified_gate_state(session_dir)
+            current_ver = get_state_version(latest_state)
+            if expected_version is not None and current_ver != expected_version:
+                fail_with_code(
+                    f"Concurrent gate_state.json update detected before Stage 1 impact scan commit "
+                    f"(expected state_version={expected_version}, current={current_ver}); "
+                    "re-run impact_scan.py against the latest session state.",
+                    2,
+                    extra={
+                        "expected_state_version": expected_version,
+                        "current_state_version": current_ver,
+                    },
+                )
+            write_json_atomic(impact_path, result)
+            latest_state["stage1_scan"] = {
+                "executed": True,
+                "sha256": sha256_file(impact_path),
+                "updated_at": utc_now_iso(),
+            }
+            write_sealed_gate_state(session_dir, latest_state, expected_version=expected_version)
 
     emit_json(result)
     return 0
