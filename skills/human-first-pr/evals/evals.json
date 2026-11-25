@@ -1,0 +1,85 @@
+{
+  "skill_name": "human-first-pr",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "evals/files/setup_case1_size_s.sh を一時ディレクトリに対して実行してリポジトリを用意してください。すでに出されている fix/null-date-format ブランチの PR について、何のバグをどう直した PR なのかを人間向けに Chat でわかりやすく解説してください（採点用に同じ解説 Markdown を outputs/pr_briefing.md にも保存してください）。リポジトリのファイルは一切変更しないでください。",
+      "expected_output": "リポジトリを一切変更せず（100% Read-Only）、2ファイル14行の単一レイヤー修正を Size S と判定し、Mermaid図・Scopeバナー・表・<details> を出さずに、背景（None入力時の例外防止）と振る舞い変化・ユニットテスト確認結果を自然な言葉と箇条書きで解説して outputs/pr_briefing.md に出力する。",
+      "files": [
+        "evals/files/setup_case1_size_s.sh"
+      ],
+      "expectations": [
+        "対象リポジトリが完全に Read-Only のまま保たれている（git status --porcelain が空かつ HEAD コミットが不変）",
+        "pr_diff_triage.py を用いて fix/null-date-format と main の差分を Size S と判定している",
+        "outputs/pr_briefing.md に mermaid コードブロック、Markdown 表、<details> タグ、Scope バナーが含まれない（BR003 Pass）",
+        "機械的な行番号実況ではなく、None 入力時の挙動変化（format_iso_date が default、format_month_label が空文字を返す）と背景 Why を自然な言葉で説明している",
+        "pr_briefing_lint.py outputs/pr_briefing.md --size S --triage-json <path> --fail-on fail が終了コード 0 で通過する"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "evals/files/setup_case2_slop_and_gen.sh を一時ディレクトリに対して実行してリポジトリを用意してください。同僚（AI支援あり）が出した feat/order-validation ブランチの PR が 3,000 行を超えていてどこから読めばよいかわかりません。コードは一切書き換えず Read-Only のまま、ノイズや冗長ボイラープレートを整理した人間向けの図解つき PR 解説を Chat で提示し、同じ内容を outputs/pr_briefing.md に保存してください。",
+      "expected_output": "ソースコードや README.md を一切編集・restore せず（100% Read-Only）、uv.lock 等のノイズ（95%超）を <details> に隔離して Scope バナーと pie showData で実質読解範囲を明示し、order_service.py の本質箇所（create_order_summary）と流し読み可能な冗長ラッパー群の読み分け、pydantic 追加理由、client.gen.py の手動パッチ警告を含む Size M の Chat 解説を outputs/pr_briefing.md に出力する。",
+      "files": [
+        "evals/files/setup_case2_slop_and_gen.sh"
+      ],
+      "expectations": [
+        "src/services/order_service.py や README.md を一切編集・git restore せず、git status --porcelain が空かつ HEAD コミットが不変である",
+        "Scope バナーで総差分（8ファイル・3,100行超）と実質読むべき箇所（6ファイル）が明示され、uv.lock と pyproject.toml が <details> に折りたたまれている（BR004・BR011 Pass）",
+        "ノイズ率 95% 超（noise_ratio_pct >= 30% かつ safe_to_skip_lines >= 50 かつ非ゼロ区分 2 つ以上）に基づき、pie showData で変更行数の内訳を図示している",
+        "flowchart LR 図（10ノード以下・color:#000 規定4色）の前後に、図の内容を補足する言葉の説明が添えられている（BR007〜BR010 Pass）",
+        "src/services/order_service.py について、コードは触らずに「create_order_summary が金額集計と入力検証の核心であり、前半の補助ラッパー関数や冗長な防衛チェックは流し読みでよい」と解説側でボイラープレートを濾過している",
+        "pyproject.toml に追加された pydantic のパッケージ名と導入理由が明記されている（BR013 Pass）",
+        "src/api/client.gen.py（DO NOT EDIT 生成ファイル）への手動パッチ疑い（SUSPECTED_MANUAL_GEN_EDIT）が Must-Read かつ注意ポイントとして警告されている",
+        "pr_briefing_lint.py outputs/pr_briefing.md --size M --triage-json <path> --fail-on fail が終了コード 0 で通過する"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "evals/files/setup_case3_async_template.sh を一時ディレクトリに対して実行してリポジトリを用意してください。feat/async-outbox ブランチの PR について、なぜこの変更が必要でどういう仕組みで動くのか、どの順番でコードを読めば理解しやすいかを、図解と言葉で丁寧に Chat 解説してください（採点用に同じ内容を outputs/pr_briefing.md にも保存してください）。",
+      "expected_output": "リポジトリ内の .github/pull_request_template.md に引きずられて作成者用の自己申告テンプレートを埋めることなく、12ファイル351行の Size L 変更として背景ストーリー、構造図＋時系列/状態遷移図（言葉の補足つき）、◎/○/△/× の設計判断比較表、理解順の読むべきファイル表、DBマイグレーションとステータス変更の注意点を含む Chat 解説を outputs/pr_briefing.md に出力する。",
+      "files": [
+        "evals/files/setup_case3_async_template.sh"
+      ],
+      "expectations": [
+        "リポジトリを一切変更せず、かつ .github/pull_request_template.md の未記入 HTML コメントや作成者なりすましチェックリストを混入させていない（BR006 Pass）",
+        "同期書き込みから Transactional Outbox＋指数バックオフ再送＋Dead Letter テーブルへ移行した背景 Why と処理ストーリーが十分な言葉で説明されている",
+        "flowchart LR（color:#000 準拠）に加え、sequenceDiagram / stateDiagram-v2 / erDiagram のいずれかを各10ノード以下で出力し、各図の前後に言葉による補足説明がある（BR007〜BR010 Pass）",
+        "◎ / ○ / △ / × を用いた設計判断の比較表が含まれている",
+        "読む順番ガイドが must_read 全9ファイルを網羅し、単純アルファベット順（api/ 先頭）ではなく理解順（db/migrations/・value_objects/ → domain/・workers/ → api/・routes/ → tests/ 最下位）で案内している（BR012 Pass）",
+        "pr_briefing_lint.py outputs/pr_briefing.md --size L --triage-json <path> --fail-on fail が終了コード 0 で通過する"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "evals/files/setup_case4_readonly.sh を一時ディレクトリに対して実行してリポジトリを用意してください。この PR には作成者が書いた既存の説明文（evals/files/author_pr_description.md）が付いていますが、抽象的な表現が多く内容が信用できません。実際の main...feat/session-ttl のコード差分を一次根拠にして、本当に何が変わったのか、既存 PR 説明文とどこが食い違っているかを Chat で解説し、同じ内容を outputs/pr_briefing.md に保存してください。",
+      "expected_output": "リポジトリを一切変更せず、author_pr_description.md の AI クリシェ・分類太字ラベル・虚偽主張を鵜呑みにせず実 Diff に基づいて解説し、（1）最大有効期限は12時間ではなく24時間（86,400秒）、（2）Redis自動フェイルオーバー・JWTローテーション・レート制限テストや実DB結合試験は実コードに存在せずインメモリ辞書実装である、（3）SESSION_DB_DSN 未設定時は RuntimeError になる点、というギャップを明確に指摘した Size M の Chat 解説を outputs/pr_briefing.md に出力する。",
+      "files": [
+        "evals/files/setup_case4_readonly.sh",
+        "evals/files/author_pr_description.md"
+      ],
+      "expectations": [
+        "対象リポジトリ内のファイル変更や git commit を一切行っていない",
+        "実 Diff に基づき、アイドル30分（1,800秒）のスライディング延長と最大24時間（MAX_SESSION_TTL_SECONDS = 86400）の上限判定、期限切れ時の 401 応答への変更を正確に解説している",
+        "author_pr_description.md との具体的な食い違い（12時間=43,200秒という誤記、SESSION_DB_DSN 未設定時の RuntimeError、およびコード上に実 DB 結合試験・Redis フェイルオーバー試験・JWT ローテーション・レート制限テストが存在しない点）を明確に指摘している",
+        "author_pr_description.md にあった AI クリシェ（堅牢性を向上、包括的なエラーハンドリング、シームレスに統合等）や - **変更点**: のような分類太字ラベル、装飾絵文字（🚀✨）を引き継いでいない（BR005・BR014・BR015 Pass）",
+        "pr_briefing_lint.py outputs/pr_briefing.md --size M --triage-json <path> --fail-on fail が終了コード 0 で通過する"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "evals/files/setup_case5_docs_ci.sh を一時ディレクトリに対して実行してリポジトリを用意した上で、git diff main...docs/ci-and-arch-overview の unified diff を一時パッチファイル（例: /tmp/.../ci_arch.patch）に書き出し、pr_diff_triage.py の --patch-file モードを使って解析してください。リポジトリ内 CLAUDE.md の絵文字禁止ルールに従い、[SCOPE] / [TARGET] / [MUST] / [SKIM] のテキストバッジのみで Chat 解説を作成し、outputs/pr_briefing.md に保存してください。",
+      "expected_output": "pr_diff_triage.py --patch-file でパッチを解析し、CLAUDE.md の規約通り絵文字を 1 文字も使わない Text-Only モード（[SCOPE] / [TARGET] / [MUST] / [SKIM]）で、.github/workflows/ci.yml の同時実行キャンセル・Python 3.11/3.12 マトリクス追加と docs/architecture.md の Outbox フロー追記を Size M 構成で過不足なく解説して outputs/pr_briefing.md に出力する。",
+      "files": [
+        "evals/files/setup_case5_docs_ci.sh"
+      ],
+      "expectations": [
+        "pr_diff_triage.py --patch-file を実行して unified diff パッチからトリアージ JSON を取得している",
+        ".github/workflows/ci.yml を Safe-to-Skip に入れず [MUST] として扱い、concurrency キャンセル設定と Python 3.12 マトリクス追加の意味を言葉で説明している",
+        "2ファイル33行の変更を過剰に Size XL 扱いせず、簡潔な Size M 構成で出力している",
+        "outputs/pr_briefing.md 内に絵文字（🎯, 🧠, 👀, ⏭️, 🚀 等）が 0 件であり、[SCOPE] / [TARGET] / [MUST] / [SKIM] のテキストバッジに完全統一されている（BR014 Pass）",
+        "pr_briefing_lint.py outputs/pr_briefing.md --size M --badge-mode text --triage-json <path> --fail-on fail が終了コード 0 で通過する"
+      ]
+    }
+  ]
+}
