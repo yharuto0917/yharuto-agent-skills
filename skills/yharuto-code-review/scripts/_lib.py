@@ -7,6 +7,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+from collections.abc import Iterator
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -19,8 +21,14 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Mapping, NoReturn, Sequence
+
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None  # type: ignore[assignment]
 
 CMD_TIMEOUT_SECONDS = 30
 SESSION_PREFIX = "yharuto-review-"
@@ -57,13 +65,15 @@ CI_CONFIG_FILENAMES: frozenset[str] = frozenset(
 )
 
 CI_SCRIPT_HAZARD_RE = re.compile(
-    r"(?:\bnode\b[^\n]*(?:\s-e\b|\s--eval\b|--input-type\b)"
-    r"|\bpython3?\b[^\n]*\s-c\b"
-    r"|\b(?:sh|bash|zsh|dash|ksh)\b[^\n]*\s-c\b"
+    r"(?:\bnode\b[^\n]*(?:[\s\"']-(?:e\b|-eval\b)|--input-type\b)"
+    r"|\bpython3?\b[^\n]*[\s\"']-c\b"
+    r"|\b(?:sh|bash|zsh|dash|ksh)\b[^\n]*[\s\"']-c\b"
     r"|\b(?:curl|wget|nc|ncat|netcat|socat)\s"
     r"|\beval\s*(?:\(|[\"'`$])"
     r"|\b(?:writeFileSync|appendFileSync|child_process|execSync|spawnSync|execFileSync)\b"
     r"|\b(?:os\.system|subprocess\.(?:Popen|run|call|check_output|check_call)|urllib\.request|http\.client|socket\.connect)\b"
+    r"|(?:^|\n)\s*(?:script-shell|onload-script|node-options|rustc-wrapper|rustc-workspace-wrapper|runner)\s*="
+    r"|\b(?:RUSTC_WRAPPER|LD_PRELOAD|DYLD_INSERT_LIBRARIES)\b"
     r"|(?:/dev/tcp/|base64\s+-d|\|\s*(?:sh|bash)\b))"
 )
 
@@ -128,6 +138,13 @@ def write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
     os.replace(tmp_path, path)
 
 
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def read_json_object(path: Path, label: str) -> dict[str, object]:
     if not path.is_file():
         fail_with_code(f"{label} does not exist: {path}", 2)
@@ -146,15 +163,39 @@ def _child_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     return merged
 
 
+def normalize_rel_path(rel_path: str) -> str:
+    """Normalize path separators to '/' and strip only leading './' prefixes (preserving leading dotfile '.')."""
+    norm = rel_path.replace("\\", "/")
+    was_abs = norm.startswith("/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+        if not was_abs:
+            norm = norm.lstrip("/")
+    return norm
+
+
+def split_nul_paths(raw_stdout: str) -> list[str]:
+    """Parse NUL-delimited (`-z`) git path output without losing non-ASCII or space-containing paths."""
+    return [item for item in raw_stdout.split("\x00") if item]
+
+
+def _prepare_exec_argv(cmd: Sequence[str]) -> list[str]:
+    argv = list(cmd)
+    if argv and argv[0] == "git" and "core.quotepath=false" not in argv[:4]:
+        return ["git", "-c", "core.quotepath=false", *argv[1:]]
+    return argv
+
+
 def run_cmd(
     cmd: Sequence[str],
     cwd: Path,
     timeout: int = CMD_TIMEOUT_SECONDS,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    argv = _prepare_exec_argv(cmd)
     try:
         return subprocess.run(
-            list(cmd),
+            argv,
             cwd=str(cwd),
             env=_child_env(env),
             shell=False,
@@ -177,9 +218,10 @@ def run_subproc(
     timeout: int = 20,
     env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
+    argv = _prepare_exec_argv(cmd)
     try:
         return subprocess.run(
-            list(cmd),
+            argv,
             cwd=str(cwd),
             env=_child_env(env),
             shell=False,
@@ -192,6 +234,90 @@ def run_subproc(
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
+
+
+def build_git_diff_cmd(*diff_args: str) -> list[str]:
+    """Build a git diff command immune to diff.noprefix, diff.mnemonicPrefix, color.diff, and diff.external."""
+    return ["git", "diff", "--no-color", "--no-ext-diff", "--src-prefix=a/", "--dst-prefix=b/", *diff_args]
+
+
+def is_git_ancestor(repo_dir: Path, ancestor_ref: str, descendant_ref: str) -> bool:
+    """Return True when ancestor_ref is an ancestor of (or equal to) descendant_ref."""
+    if not ancestor_ref or not descendant_ref:
+        return False
+    res = run_subproc(["git", "merge-base", "--is-ancestor", ancestor_ref, descendant_ref], cwd=repo_dir, timeout=15)
+    return res is not None and res.returncode == 0
+
+
+def is_git_metadata_rel_path(rel_posix: str) -> bool:
+    """Return True when a repo-relative path points to .git metadata (e.g., worktree .git pointer file)."""
+    norm = normalize_rel_path(rel_posix)
+    if not norm:
+        return False
+    return any(part == ".git" for part in Path(norm).parts)
+
+
+def has_surviving_changed_files(state: Mapping[str, object], workdir: Path) -> bool:
+    """Return True when at least one file in state['changed_files'] exists as a regular file in workdir."""
+    changed_raw = state.get("changed_files")
+    if not isinstance(changed_raw, list) or len(changed_raw) == 0:
+        return True
+    workdir_resolved = workdir.resolve()
+    for item in changed_raw:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        norm = normalize_rel_path(item)
+        if not norm or is_git_metadata_rel_path(norm):
+            continue
+        cand = (workdir_resolved / norm).resolve()
+        try:
+            cand.relative_to(workdir_resolved)
+        except ValueError:
+            continue
+        if cand.is_file():
+            return True
+    return False
+
+
+def is_deleted_changed_file_in_base(
+    state: Mapping[str, object],
+    workdir: Path,
+    rel_posix: str,
+) -> bool:
+    """Return True when rel_posix is a deleted file from changed_files that existed as a blob in the base commit."""
+    norm = normalize_rel_path(rel_posix)
+    if not norm or is_git_metadata_rel_path(norm):
+        return False
+    changed_raw = state.get("changed_files")
+    if not isinstance(changed_raw, list):
+        return False
+    changed_set = {normalize_rel_path(str(x)) for x in changed_raw if isinstance(x, str) and x.strip()}
+    if norm not in changed_set:
+        return False
+    workdir_resolved = workdir.resolve()
+    raw_cand = workdir_resolved / norm
+    cand = raw_cand.resolve()
+    try:
+        cand.relative_to(workdir_resolved)
+    except ValueError:
+        return False
+    if raw_cand.is_symlink() or cand.exists() or cand.is_symlink():
+        return False
+    repo_dir_str = str(state.get("repo_dir") or "").strip()
+    if not repo_dir_str:
+        return False
+    repo_dir = Path(repo_dir_str).resolve()
+    if not repo_dir.is_dir():
+        return False
+    base_candidates = [
+        str(state.get(k) or "").strip()
+        for k in ("review_base_sha", "merge_base_sha", "base_sha")
+    ]
+    for base_ref in dict.fromkeys(b for b in base_candidates if b):
+        res = run_subproc(["git", "cat-file", "-t", f"{base_ref}:{norm}"], cwd=repo_dir, timeout=10)
+        if res is not None and res.returncode == 0 and res.stdout.strip() == "blob":
+            return True
+    return False
 
 
 def sanitize_slug(raw: str) -> str:
@@ -665,25 +791,130 @@ def verify_state_hmac(session_dir: Path, state: Mapping[str, object]) -> tuple[b
     return True, "ok"
 
 
-def write_sealed_gate_state(session_dir: Path, state: dict[str, object]) -> None:
-    key_bytes = load_session_hmac_key(session_dir)
-    if key_bytes is None:
-        fail_with_code(f"Cannot seal gate_state.json: HMAC key missing for {session_dir}", 2)
-    state_copy: dict[str, object] = {
-        str(k): v for k, v in state.items() if str(k) not in {"state_hmac", "hmac_verified"}
-    }
-    state_copy["state_hmac"] = compute_state_hmac(key_bytes, state_copy)
-    write_json_atomic(session_dir / "gate_state.json", state_copy)
-    state["state_hmac"] = state_copy["state_hmac"]
+_LOCK_REGISTRY_GUARD = threading.Lock()
+_PATH_THREAD_LOCKS: dict[Path, threading.RLock] = {}
+_HELD_SESSION_LOCK_COUNTS: dict[Path, int] = {}
+
+
+def _get_path_thread_lock(resolved: Path) -> threading.RLock:
+    with _LOCK_REGISTRY_GUARD:
+        lock = _PATH_THREAD_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_THREAD_LOCKS[resolved] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def session_state_lock(session_dir: Path, *, create_dir: bool = True) -> Iterator[None]:
+    """Acquire an exclusive, reentrant thread- and process-safe advisory lock for gate_state.json updates."""
+    resolved = session_dir.resolve()
+    thread_lock = _get_path_thread_lock(resolved)
+    with thread_lock:
+        held = _HELD_SESSION_LOCK_COUNTS.get(resolved, 0)
+        if held > 0:
+            _HELD_SESSION_LOCK_COUNTS[resolved] = held + 1
+            try:
+                yield
+            finally:
+                remaining = _HELD_SESSION_LOCK_COUNTS.get(resolved, 1) - 1
+                if remaining <= 0:
+                    _HELD_SESSION_LOCK_COUNTS.pop(resolved, None)
+                else:
+                    _HELD_SESSION_LOCK_COUNTS[resolved] = remaining
+            return
+
+        if create_dir:
+            resolved.mkdir(parents=True, exist_ok=True)
+        elif not resolved.is_dir():
+            yield
+            return
+        lock_path = resolved / ".gate_state.lock"
+        try:
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        except FileNotFoundError:
+            if not create_dir:
+                yield
+                return
+            raise
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            _HELD_SESSION_LOCK_COUNTS[resolved] = 1
+            try:
+                yield
+            finally:
+                remaining = _HELD_SESSION_LOCK_COUNTS.get(resolved, 1) - 1
+                if remaining <= 0:
+                    _HELD_SESSION_LOCK_COUNTS.pop(resolved, None)
+                else:
+                    _HELD_SESSION_LOCK_COUNTS[resolved] = remaining
+        finally:
+            if _fcntl is not None:
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            os.close(fd)
+
+
+def get_state_version(state: Mapping[str, object]) -> int:
+    raw = state.get("state_version")
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw
+    return 0
+
+
+def write_sealed_gate_state(
+    session_dir: Path,
+    state: dict[str, object],
+    *,
+    expected_version: int | None = None,
+) -> None:
+    with session_state_lock(session_dir):
+        key_bytes = load_session_hmac_key(session_dir)
+        if key_bytes is None:
+            fail_with_code(f"Cannot seal gate_state.json: HMAC key missing for {session_dir}", 2)
+
+        state_path = session_dir / "gate_state.json"
+        if expected_version is not None:
+            if not state_path.is_file():
+                fail_with_code(f"Cannot update gate_state.json: state file missing in {session_dir}", 2)
+            current_state = read_verified_gate_state(session_dir)
+            current_ver = get_state_version(current_state)
+            if current_ver != expected_version:
+                fail_with_code(
+                    f"Concurrent gate_state.json update detected (expected state_version={expected_version}, "
+                    f"current={current_ver}); re-run against the latest session state.",
+                    2,
+                    extra={
+                        "expected_state_version": expected_version,
+                        "current_state_version": current_ver,
+                    },
+                )
+
+        base_ver = expected_version if expected_version is not None else get_state_version(state)
+        next_ver = base_ver + 1
+        state_copy: dict[str, object] = {
+            str(k): v for k, v in state.items() if str(k) not in {"state_hmac", "hmac_verified"}
+        }
+        state_copy["state_version"] = next_ver
+        state_copy["state_hmac"] = compute_state_hmac(key_bytes, state_copy)
+        write_json_atomic(state_path, state_copy)
+        state["state_version"] = next_ver
+        state["state_hmac"] = state_copy["state_hmac"]
 
 
 def read_verified_gate_state(session_dir: Path) -> dict[str, object]:
     state_path = session_dir / "gate_state.json"
-    state = read_json_object(state_path, "gate_state.json")
-    ok, err_msg = verify_state_hmac(session_dir, state)
-    if not ok:
-        fail_with_code(err_msg, 2)
-    return state
+    if not session_dir.is_dir() or not state_path.is_file():
+        fail_with_code(f"gate_state.json does not exist: {state_path}", 2)
+    with session_state_lock(session_dir, create_dir=False):
+        state = read_json_object(state_path, "gate_state.json")
+        ok, err_msg = verify_state_hmac(session_dir, state)
+        if not ok:
+            fail_with_code(err_msg, 2)
+        return state
 
 
 # ---------------------------------------------------------------------------
@@ -714,11 +945,11 @@ def collect_repo_porcelain(repo_dir: Path, ignore_project_session: bool = False)
 
 
 def is_ci_config_path(rel_path: str) -> bool:
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     p = Path(norm)
     if p.name in CI_CONFIG_FILENAMES:
         return True
-    if norm.endswith(".cargo/config.toml") or norm.endswith(".cargo/config"):
+    if p.parts[-2:] in {(".cargo", "config.toml"), (".cargo", "config")}:
         return True
     return False
 
@@ -728,15 +959,28 @@ def detect_ci_script_hazard_in_diff(diff_text: str) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     current_file = ""
     in_ci_config = False
+    in_header = True
 
     for raw_line in diff_text.splitlines():
-        if raw_line.startswith("+++ b/"):
-            current_file = raw_line[6:].strip()
-            in_ci_config = is_ci_config_path(current_file)
-            continue
-        if raw_line.startswith("+++ /dev/null"):
+        if raw_line.startswith("diff --git "):
+            in_header = True
             current_file = ""
             in_ci_config = False
+            continue
+        if in_header:
+            plus_path = parse_diff_header_file_path(raw_line, "+++ ")
+            if plus_path is not None:
+                in_header = False
+                if plus_path == "/dev/null":
+                    current_file = ""
+                    in_ci_config = False
+                else:
+                    current_file = plus_path
+                    in_ci_config = is_ci_config_path(current_file)
+                continue
+            if raw_line.startswith("@@ "):
+                in_header = False
+                continue
             continue
         if not in_ci_config:
             continue
@@ -769,7 +1013,20 @@ def detect_ci_script_hazard_in_files(workdir: Path) -> tuple[bool, list[str]]:
         except (OSError, json.JSONDecodeError):
             pass
 
-    for rel_cand in ("Makefile", "GNUmakefile", "pyproject.toml", "setup.py", "build.rs", ".cargo/config.toml"):
+    for rel_cand in (
+        "Makefile",
+        "GNUmakefile",
+        "makefile",
+        "pyproject.toml",
+        "setup.py",
+        "build.rs",
+        "justfile",
+        "Taskfile.yml",
+        "Taskfile.yaml",
+        ".npmrc",
+        ".cargo/config.toml",
+        ".cargo/config",
+    ):
         cpath = workdir / rel_cand
         if cpath.is_file():
             try:
@@ -781,3 +1038,950 @@ def detect_ci_script_hazard_in_files(workdir: Path) -> tuple[bool, list[str]]:
                 reasons.append(f"{rel_cand}: hazardous payload '{m.group(0).strip()[:60]}'")
 
     return len(reasons) > 0, reasons
+
+
+ALLOWED_STAGE1_SKIP_STATUSES: frozenset[str] = frozenset({"NG", "SKIPPED_BY_FLAG"})
+TEST_CHECK_TOOLS: frozenset[str] = frozenset({"test", "python_test"})
+BLOCKED_TEST_STATUSES: frozenset[str] = frozenset(
+    {"blocked_fork", "blocked_untrusted_script", "blocked_untrusted_code"}
+)
+GH_TEST_CHECK_WORD_RE = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:tests?|testing|specs?|pytest|unittests?|jest|vitest|mocha|rspec|phpunit|junit|e2e|playwright|cypress|nextest)"
+    r"(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+GH_TEST_CHECK_CAMEL_RE = re.compile(r"(?<=[a-z])(?:Tests?|Specs?)(?![a-z])")
+GH_OS_RUNNER_TOKEN_RE = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:ubuntu|macos|windows|linux)[-_](?:latest|[0-9]+(?:\.[0-9]+)?(?:-[a-z0-9]+)?)"
+    r"(?=[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+GH_NON_TEST_CHECK_WORD_RE = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:lint(?:er|ing)?|eslint|prettier|format(?:ter|ting)?|fmt|style(?:lint|check)?|markdownlint|shellcheck|hadolint|"
+    r"biome|oxlint|typecheck|type-check|tsc|mypy|pyright|ruff|flake8|pylint|black|isort|clippy|vet|staticcheck|"
+    r"build|compile|bundle|docker|image|deploy|release|publish|docs?|pages|storybook|chromatic|"
+    r"codecov|coveralls|sonar(?:cloud|qube)?|codeql|security|audit|dependabot|renovate|vercel|netlify|cloudflare|"
+    r"label(?:er)?|triage|cla|dco|license|attestation|provenance|sbom|check[-_ ]?latest|contest|coderabbit|"
+    r"commitlint|changelog|size|benchmark|perf)"
+    r"(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+GH_NON_TEST_WORKFLOW_WORD_RE = re.compile(
+    r"(?:^|[^a-z0-9])"
+    r"(?:lint(?:er|ing)?|eslint|prettier|format(?:ter|ting)?|style(?:lint|check)?|markdownlint|shellcheck|"
+    r"typecheck|type-check|deploy|release|publish|docs?|pages|storybook|chromatic|"
+    r"codecov|coveralls|sonar(?:cloud|qube)?|codeql|security|dependabot|renovate|vercel|netlify|cloudflare|"
+    r"label(?:er)?|triage|cla|dco|license|attestation|provenance|sbom|coderabbit|commitlint|changelog)"
+    r"(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+GH_FAIL_STATUS_TOKENS: frozenset[str] = frozenset(
+    {
+        "FAIL",
+        "FAILED",
+        "FAILURE",
+        "ERROR",
+        "CANCEL",
+        "CANCELLED",
+        "CANCELED",
+        "TIMED_OUT",
+        "ACTION_REQUIRED",
+        "STARTUP_FAILURE",
+        "STALE",
+    }
+)
+GH_PENDING_STATUS_TOKENS: frozenset[str] = frozenset(
+    {
+        "PENDING",
+        "IN_PROGRESS",
+        "QUEUED",
+        "WAITING",
+        "REQUESTED",
+        "EXPECTED",
+    }
+)
+GH_CONFIRMED_PASS_STATUS_TOKENS: frozenset[str] = frozenset({"PASS", "PASSED", "SUCCESS"})
+GH_NEUTRAL_PASS_STATUS_TOKENS: frozenset[str] = frozenset({"NEUTRAL", "SKIPPED", "SKIPPING"})
+GH_ALL_STATUS_TOKENS: frozenset[str] = (
+    GH_FAIL_STATUS_TOKENS
+    | GH_PENDING_STATUS_TOKENS
+    | GH_CONFIRMED_PASS_STATUS_TOKENS
+    | GH_NEUTRAL_PASS_STATUS_TOKENS
+    | frozenset({"COMPLETED"})
+)
+
+
+def reset_stage5_state() -> dict[str, object]:
+    """Return a clean unvalidated Stage 5 state dictionary."""
+    return {
+        "validated": False,
+        "review_file": None,
+        "review_sha256": None,
+        "mode": None,
+        "verdict": None,
+        "validated_at": None,
+    }
+
+
+def is_test_check_name(check_name: str) -> bool:
+    """Return True if a CI check name explicitly names a test suite."""
+    cleaned = check_name.strip()
+    if not cleaned:
+        return False
+    return GH_TEST_CHECK_WORD_RE.search(cleaned) is not None or GH_TEST_CHECK_CAMEL_RE.search(cleaned) is not None
+
+
+def is_non_test_check_name(check_name: str) -> bool:
+    """Return True if a CI check name clearly identifies a non-test job (lint/typecheck/build/etc.)."""
+    cleaned = check_name.strip()
+    if not cleaned or is_test_check_name(cleaned):
+        return False
+    stripped_runners = GH_OS_RUNNER_TOKEN_RE.sub(" ", cleaned)
+    return GH_NON_TEST_CHECK_WORD_RE.search(stripped_runners) is not None
+
+
+def _find_last_top_level_delim(text: str, delim: str) -> int:
+    """Return index of rightmost delim outside parentheses, or -1 if absent."""
+    depth = 0
+    last_idx = -1
+    for idx, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth > 0:
+            depth -= 1
+        elif depth == 0 and text.startswith(delim, idx):
+            last_idx = idx
+    return last_idx
+
+
+def _split_check_workflow_and_job(name: str, workflow: str = "") -> tuple[str, str]:
+    """Split workflow prefix and explicit job name outside parentheses (handling 'wf / job' and 'wf/job')."""
+    cleaned_name = name.strip()
+    cleaned_wf = workflow.strip()
+    if cleaned_name:
+        sep_idx = _find_last_top_level_delim(cleaned_name, " / ")
+        if sep_idx >= 0:
+            wf_prefix = cleaned_name[:sep_idx].strip()
+            job_part = cleaned_name[sep_idx + 3 :].strip()
+            if job_part:
+                if wf_prefix:
+                    cleaned_wf = f"{cleaned_wf} / {wf_prefix}" if cleaned_wf else wf_prefix
+                cleaned_name = job_part
+        elif not cleaned_wf:
+            slash_idx = _find_last_top_level_delim(cleaned_name, "/")
+            if slash_idx > 0 and slash_idx + 1 < len(cleaned_name):
+                wf_prefix = cleaned_name[:slash_idx].strip()
+                job_part = cleaned_name[slash_idx + 1 :].strip()
+                if wf_prefix and job_part:
+                    cleaned_wf = wf_prefix
+                    cleaned_name = job_part
+    return cleaned_wf, cleaned_name
+
+
+def is_potential_test_check(name: str, workflow: str = "") -> bool:
+    """Return True when a CI check is a test job or a generic CI job that may run tests (fail-closed)."""
+    cleaned_wf, cleaned_name = _split_check_workflow_and_job(name, workflow)
+    if not cleaned_name and not cleaned_wf:
+        return False
+    if cleaned_name:
+        if is_test_check_name(cleaned_name):
+            return True
+        if is_non_test_check_name(cleaned_name):
+            return False
+    if cleaned_wf:
+        if is_test_check_name(cleaned_wf):
+            return True
+        wf_no_runners = GH_OS_RUNNER_TOKEN_RE.sub(" ", cleaned_wf)
+        if GH_NON_TEST_WORKFLOW_WORD_RE.search(wf_no_runners) is not None:
+            return False
+    return True
+
+
+def classify_gh_status_token(raw_status: str) -> str | None:
+    """Classify a concise GitHub check status/conclusion token into 'failed'|'pending'|'passed'|'neutral'|None."""
+    upper = raw_status.strip().upper()
+    if not upper:
+        return None
+    normalized = (
+        upper.replace("IN PROGRESS", "IN_PROGRESS")
+        .replace("TIMED OUT", "TIMED_OUT")
+        .replace("ACTION REQUIRED", "ACTION_REQUIRED")
+        .replace("STARTUP FAILURE", "STARTUP_FAILURE")
+    )
+    tokens = [tok for tok in re.split(r"[\s()/,]+", normalized) if tok]
+    if not tokens or len(tokens) > 2:
+        return None
+    if not all(tok in GH_ALL_STATUS_TOKENS for tok in tokens):
+        return None
+    if any(tok in GH_FAIL_STATUS_TOKENS for tok in tokens):
+        return "failed"
+    if any(tok in GH_PENDING_STATUS_TOKENS for tok in tokens):
+        return "pending"
+    if any(tok in GH_CONFIRMED_PASS_STATUS_TOKENS for tok in tokens):
+        return "passed"
+    if any(tok in GH_NEUTRAL_PASS_STATUS_TOKENS for tok in tokens):
+        return "neutral"
+    return None
+
+
+def _is_gh_failed_status_token(raw_status: str) -> bool:
+    return classify_gh_status_token(raw_status) == "failed"
+
+
+def parse_gh_pr_check_rows(lines: Sequence[str], *, tsv_only: bool = False) -> list[dict[str, str]]:
+    """Parse structured check rows from `gh pr checks` TSV output or (unless tsv_only) `name: STATUS` summary lines."""
+    rows: list[dict[str, str]] = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "\t" in line:
+            cols = [c.strip() for c in line.split("\t")]
+            if len(cols) >= 2 and cols[0]:
+                cls = classify_gh_status_token(cols[1])
+                if cls is not None:
+                    rows.append({"name": cols[0], "workflow": "", "status": cls})
+            continue
+        if not tsv_only and ": " in line:
+            name_part, status_part = line.rsplit(": ", 1)
+            cls = classify_gh_status_token(status_part)
+            if name_part.strip() and cls is not None:
+                rows.append({"name": name_part.strip(), "workflow": "", "status": cls})
+    return rows
+
+
+def extract_failed_gh_check_names(lines: Sequence[str]) -> list[str]:
+    """Extract failing check names from `gh pr checks` TSV lines or `name: STATUS` summary lines."""
+    return [row["name"] for row in parse_gh_pr_check_rows(lines) if row["status"] == "failed"]
+
+
+def _extract_gh_check_entries(chk: Mapping[str, object]) -> list[dict[str, str]]:
+    """Extract normalized {name, workflow, status} entries from a gh_pr_checks record."""
+    raw_entries = chk.get("check_entries")
+    if isinstance(raw_entries, list) and raw_entries:
+        parsed: list[dict[str, str]] = []
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            workflow = str(item.get("workflow") or "").strip()
+            status = str(item.get("status") or "").strip().lower()
+            if name and status in {"passed", "failed", "pending", "neutral"}:
+                parsed.append({"name": name, "workflow": workflow, "status": status})
+        if parsed:
+            return parsed
+
+    entries: list[dict[str, str]] = []
+    seen_failed: set[str] = set()
+    raw_failed = chk.get("failed_checks")
+    if isinstance(raw_failed, list):
+        for name_obj in raw_failed:
+            if isinstance(name_obj, str) and name_obj.strip():
+                nm = name_obj.strip()
+                seen_failed.add(nm)
+                entries.append({"name": nm, "workflow": "", "status": "failed"})
+
+    raw_pending = chk.get("pending_checks")
+    seen_pending: set[str] = set()
+    if isinstance(raw_pending, list):
+        for name_obj in raw_pending:
+            if isinstance(name_obj, str) and name_obj.strip():
+                nm = name_obj.strip()
+                seen_pending.add(nm)
+                entries.append({"name": nm, "workflow": "", "status": "pending"})
+
+    raw_passed = chk.get("passed_checks")
+    seen_passed: set[str] = set()
+    if isinstance(raw_passed, list):
+        for name_obj in raw_passed:
+            if isinstance(name_obj, str) and name_obj.strip():
+                nm = name_obj.strip()
+                seen_passed.add(nm)
+                entries.append({"name": nm, "workflow": "", "status": "passed"})
+
+    summary_lines = chk.get("summary_lines")
+    if isinstance(summary_lines, list):
+        str_lines = [ln for ln in summary_lines if isinstance(ln, str)]
+        for row in parse_gh_pr_check_rows(str_lines):
+            nm = row["name"]
+            st = row["status"]
+            if st == "failed" and (isinstance(raw_failed, list) or nm in seen_failed):
+                continue
+            if st == "pending" and (isinstance(raw_pending, list) or nm in seen_pending):
+                continue
+            if st == "passed" and (isinstance(raw_passed, list) or nm in seen_passed):
+                continue
+            entries.append(row)
+    return entries
+
+
+def find_stage2_test_failures(checks: object) -> list[str]:
+    """Return tool labels for Stage 2 checks that represent failing tests (status == 'failed')."""
+    if not isinstance(checks, list):
+        return []
+    failed_tools: list[str] = []
+    for chk in checks:
+        if not isinstance(chk, dict) or chk.get("status") != "failed":
+            continue
+        tool = str(chk.get("tool") or "").strip()
+        if tool in TEST_CHECK_TOOLS:
+            failed_tools.append(tool)
+            continue
+        if tool == "gh_pr_checks":
+            entries = _extract_gh_check_entries(chk)
+            failed_entries = [e for e in entries if e["status"] == "failed"]
+            if failed_entries:
+                if any(is_potential_test_check(e["name"], e["workflow"]) for e in failed_entries):
+                    failed_tools.append(tool)
+            else:
+                # Failed gh_pr_checks with unparseable job names cannot prove tests passed -> fail-closed
+                failed_tools.append(tool)
+    return failed_tools
+
+
+def has_stage2_test_failure(state: Mapping[str, object]) -> bool:
+    """Return True when recorded Stage 2 checks contain a regression test failure."""
+    stage2 = state.get("stage2")
+    if not isinstance(stage2, dict):
+        return False
+    return len(find_stage2_test_failures(stage2.get("checks"))) > 0
+
+
+def evaluate_skip_test_stage2_status(state: Mapping[str, object]) -> tuple[str, str]:
+    """Evaluate --skip-test readiness against Stage 2 results.
+
+    Returns (status, reason) where status is one of:
+    - 'not_applicable': session is not using an active Stage 1 --skip-test bypass
+    - 'revoked': Stage 2 test failure permanently revoked --skip-test
+    - 'stage2_not_executed': Stage 2 has not run yet
+    - 'confirmed': required tests passed with no failing, pending, or unverified test checks
+    - 'pending': required remote/CI test checks are still running (bypass on hold, not revoked)
+    - 'unverified': no passing test result was confirmed (timed_out, env_unavailable, etc.)
+    """
+    stage1 = state.get("stage1")
+    s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+    if s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+        return "not_applicable", ""
+    if not bool(state.get("skip_test", False)) or s1_status not in ALLOWED_STAGE1_SKIP_STATUSES:
+        return "not_applicable", ""
+
+    if bool(state.get("skip_test_revoked", False)) or has_stage2_test_failure(state):
+        reason = str(state.get("skip_test_revoked_reason") or "").strip()
+        if not reason:
+            stage2_rev = state.get("stage2")
+            failed = find_stage2_test_failures(
+                stage2_rev.get("checks") if isinstance(stage2_rev, dict) else None
+            )
+            tools_csv = ", ".join(failed) if failed else "test"
+            reason = f"Stage 2 test check(s) failed ({tools_csv}); --skip-test cannot bypass failing tests."
+        return "revoked", reason
+
+    stage2 = state.get("stage2")
+    if not isinstance(stage2, dict) or stage2.get("executed") is not True:
+        return "stage2_not_executed", ""
+
+    checks_raw = stage2.get("checks")
+    checks = [c for c in checks_raw if isinstance(c, dict)] if isinstance(checks_raw, list) else []
+
+    local_tests = [c for c in checks if str(c.get("tool") or "").strip() in TEST_CHECK_TOOLS]
+    gh_checks = [c for c in checks if str(c.get("tool") or "").strip() == "gh_pr_checks"]
+
+    for gh_chk in gh_checks:
+        if gh_chk.get("head_sha_mismatch") is True:
+            expected_sha = str(gh_chk.get("expected_head_sha") or "")[:12]
+            live_sha = str(gh_chk.get("live_head_sha") or "")[:12]
+            return (
+                "unverified",
+                f"Live PR head commit changed ({expected_sha} -> {live_sha}); "
+                "re-run prepare_worktree.py for the new head before continuing.",
+            )
+
+    gh_test_pending = False
+    gh_test_passed = False
+    for gh_chk in gh_checks:
+        gh_st = str(gh_chk.get("status") or "").strip()
+        entries = _extract_gh_check_entries(gh_chk)
+        if entries:
+            if any(e["status"] == "pending" and is_potential_test_check(e["name"], e["workflow"]) for e in entries):
+                gh_test_pending = True
+            # Fail-closed confirmation: require an explicit test check name/workflow to have passed,
+            # while rejecting known non-test jobs (e.g. eslint) even inside a Tests workflow.
+            for e in entries:
+                if e["status"] != "passed":
+                    continue
+                wf, nm = _split_check_workflow_and_job(e["name"], e["workflow"])
+                if is_test_check_name(nm) or (not is_non_test_check_name(nm) and is_test_check_name(wf)):
+                    gh_test_passed = True
+                    break
+        elif gh_st == "pending":
+            gh_test_pending = True
+
+    if gh_test_pending:
+        return (
+            "pending",
+            "Stage 2 remote test checks are still pending/in-progress; --skip-test bypass is on hold "
+            "(not revoked) until required tests finish passing.",
+        )
+
+    all_local_passed = len(local_tests) > 0 and all(c.get("status") == "passed" for c in local_tests)
+    if all_local_passed:
+        return "confirmed", ""
+
+    local_inconclusive = [
+        c
+        for c in local_tests
+        if str(c.get("status") or "").strip() not in ({"passed", "not_configured"} | BLOCKED_TEST_STATUSES)
+    ]
+    if gh_test_passed and not local_inconclusive:
+        return "confirmed", ""
+
+    local_statuses = [f"{c.get('tool')}={c.get('status')}" for c in local_tests]
+    gh_statuses = [f"gh_pr_checks={c.get('status')}" for c in gh_checks]
+    detail = ", ".join(local_statuses + gh_statuses) or "no test checks recorded"
+    return (
+        "unverified",
+        f"Stage 2 did not confirm a passing test run ({detail}); --skip-test requires a confirmed passing test.",
+    )
+
+
+def is_stage1_passed_or_skipped(
+    state: Mapping[str, object],
+    *,
+    require_stage2_test_pass: bool = False,
+) -> bool:
+    """Return True when Stage 1 passed normally or is allowed to continue via --skip-test."""
+    stage1 = state.get("stage1")
+    s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+    if s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+        return True
+    if bool(state.get("skip_test", False)) and s1_status in ALLOWED_STAGE1_SKIP_STATUSES:
+        bypass_status, _ = evaluate_skip_test_stage2_status(state)
+        if bypass_status == "revoked":
+            return False
+        if require_stage2_test_pass:
+            return bypass_status == "confirmed"
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Re-review Scope Filtering & Cross-Session Review History
+# ---------------------------------------------------------------------------
+
+MAX_HISTORY_ENTRIES = 30
+_C_ESCAPE_BYTES: Mapping[str, int] = {
+    "a": 0x07,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+    "v": 0x0B,
+    "\\": 0x5C,
+    '"': 0x22,
+}
+
+
+def normalize_only_files(raw_entries: Sequence[str] | None) -> list[str]:
+    """Normalize repeatable/comma-separated --only-files entries into unique repo-relative POSIX paths."""
+    if raw_entries is None:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw_item in raw_entries:
+        for part in str(raw_item).split(","):
+            cleaned = part.strip()
+            if not cleaned:
+                continue
+            raw_norm = normalize_rel_path(cleaned)
+            p = Path(raw_norm)
+            if not raw_norm or p.is_absolute() or ".." in p.parts:
+                fail_with_code(
+                    f"Invalid --only-files path '{cleaned}': must be a repository-relative path without '..'.",
+                    2,
+                )
+            canonical = normalize_rel_path(p.as_posix()).rstrip("/")
+            if not canonical or canonical == ".":
+                fail_with_code(
+                    f"Invalid --only-files path '{cleaned}': must be a repository-relative path without '..'.",
+                    2,
+                )
+            if canonical not in seen:
+                seen.add(canonical)
+                result.append(canonical)
+    if not result:
+        fail_with_code(
+            "Empty --only-files value: provide at least one repository-relative file path.",
+            2,
+        )
+    return result
+
+
+def _unquote_git_path(raw: str) -> str:
+    """Decode a Git C-quoted path (if wrapped in double quotes) into UTF-8 text."""
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        inner = raw[1:-1]
+        buf = bytearray()
+        i = 0
+        n = len(inner)
+        while i < n:
+            ch = inner[i]
+            if ch == "\\" and i + 1 < n:
+                nxt = inner[i + 1]
+                if nxt in _C_ESCAPE_BYTES:
+                    buf.append(_C_ESCAPE_BYTES[nxt])
+                    i += 2
+                    continue
+                if nxt in "01234567" and i + 3 < n and all(c in "01234567" for c in inner[i + 1 : i + 4]):
+                    buf.append(int(inner[i + 1 : i + 4], 8) & 0xFF)
+                    i += 4
+                    continue
+                buf.extend(nxt.encode("utf-8"))
+                i += 2
+                continue
+            buf.extend(ch.encode("utf-8"))
+            i += 1
+        return buf.decode("utf-8", errors="replace")
+    return raw
+
+
+def parse_diff_header_file_path(raw_line: str, prefix: str) -> str | None:
+    """Parse a unified diff file header line ('+++ ', '--- ', 'rename to ', 'rename from ')."""
+    if not raw_line.startswith(prefix):
+        return None
+    payload = raw_line[len(prefix) :].rstrip("\r\n")
+    if not payload:
+        return None
+    if payload == "/dev/null":
+        return "/dev/null"
+    if payload.startswith('"'):
+        # Extract up to closing unescaped double quote (ignoring optional trailing tab/timestamp)
+        i = 1
+        n = len(payload)
+        while i < n:
+            if payload[i] == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if payload[i] == '"':
+                payload = payload[: i + 1]
+                break
+            i += 1
+        decoded = _unquote_git_path(payload)
+    else:
+        if "\t" in payload:
+            payload = payload.split("\t", 1)[0]
+        decoded = payload
+    if prefix == "+++ ":
+        if decoded.startswith("b/"):
+            decoded = decoded[2:]
+        else:
+            return None
+    elif prefix == "--- ":
+        if decoded.startswith("a/"):
+            decoded = decoded[2:]
+        else:
+            return None
+    return normalize_rel_path(decoded)
+
+
+def _consume_git_quoted_token(text: str, start: int) -> tuple[str, int]:
+    i = start + 1
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if text[i] == '"':
+            return _unquote_git_path(text[start : i + 1]), i + 1
+        i += 1
+    return _unquote_git_path(text[start:]), n
+
+
+def _extract_git_diff_header_paths(diff_git_line: str) -> tuple[str, str]:
+    rest = diff_git_line[len("diff --git ") :].rstrip("\r\n")
+    if not rest:
+        return "", ""
+
+    def _strip_ab(val: str, pref: str) -> str:
+        return normalize_rel_path(val[len(pref) :] if val.startswith(pref) else val)
+
+    # Case 1: first token is C-quoted
+    if rest.startswith('"'):
+        tok1, idx = _consume_git_quoted_token(rest, 0)
+        rem = rest[idx:].lstrip(" ")
+        if rem.startswith('"'):
+            tok2, _ = _consume_git_quoted_token(rem, 0)
+        else:
+            tok2 = rem
+        return _strip_ab(tok1, "a/"), _strip_ab(tok2, "b/")
+
+    # Case 2: first token unquoted, second token C-quoted (e.g. `a/plain.py "b/tab\t.py"`)
+    q_marker = ' "b/'
+    q_idx = rest.find(q_marker)
+    if rest.startswith("a/") and q_idx > 2 and rest.endswith('"'):
+        tok1 = rest[:q_idx]
+        tok2, _ = _consume_git_quoted_token(rest, q_idx + 1)
+        return _strip_ab(tok1, "a/"), _strip_ab(tok2, "b/")
+
+    # Case 3: both unquoted — exact midpoint match handles paths containing ' b/' when old == new
+    if rest.startswith("a/") and (len(rest) - 1) % 2 == 0:
+        mid = (len(rest) - 1) // 2
+        if rest[mid] == " " and rest[mid + 1 :].startswith("b/") and rest[2:mid] == rest[mid + 3 :]:
+            path_val = normalize_rel_path(rest[2:mid])
+            return path_val, path_val
+
+    marker = " b/"
+    idx = rest.rfind(marker)
+    if rest.startswith("a/") and idx > 2:
+        return normalize_rel_path(rest[2:idx]), normalize_rel_path(rest[idx + 3 :])
+    return "", ""
+
+
+def filter_diff_by_files(diff_text: str, allowed_files: set[str]) -> str:
+    """Filter unified diff to files in allowed_files (matching git diff --name-only semantics)."""
+    if not diff_text or not allowed_files:
+        return ""
+    norm_allowed = {normalize_rel_path(f) for f in allowed_files if f}
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    in_git_block = False
+
+    for raw_line in diff_text.splitlines():
+        if raw_line.startswith("diff --git "):
+            if current:
+                blocks.append(current)
+            current = [raw_line]
+            in_git_block = True
+        elif not in_git_block and parse_diff_header_file_path(raw_line, "+++ ") is not None:
+            if current:
+                blocks.append(current)
+            current = [raw_line]
+        else:
+            if current:
+                current.append(raw_line)
+    if current:
+        blocks.append(current)
+
+    kept: list[str] = []
+    for blk in blocks:
+        old_h = ""
+        new_h = ""
+        if blk[0].startswith("diff --git "):
+            old_h, new_h = _extract_git_diff_header_paths(blk[0])
+
+        plus_path: str | None = None
+        minus_path: str | None = None
+        rename_to: str | None = None
+        for ln in blk:
+            # Stop header parsing as soon as the first hunk begins so diff body lines never forge headers
+            if ln.startswith("@@ "):
+                break
+            if plus_path is None:
+                p_cand = parse_diff_header_file_path(ln, "+++ ")
+                if p_cand is not None:
+                    plus_path = p_cand
+                    continue
+            if minus_path is None:
+                m_cand = parse_diff_header_file_path(ln, "--- ")
+                if m_cand is not None:
+                    minus_path = m_cand
+                    continue
+            if rename_to is None:
+                r_cand = parse_diff_header_file_path(ln, "rename to ")
+                if r_cand is not None:
+                    rename_to = r_cand
+
+        if plus_path == "/dev/null":
+            canonical_path = (minus_path if minus_path and minus_path != "/dev/null" else "") or old_h
+        else:
+            canonical_path = plus_path or rename_to or new_h
+
+        if canonical_path and canonical_path in norm_allowed:
+            kept.append("\n".join(blk))
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+def get_current_git_branch(repo_dir: Path) -> str:
+    """Return current checked-out git branch name, or empty string when detached / non-git."""
+    res = run_subproc(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=repo_dir, timeout=10)
+    if res is not None and res.returncode == 0:
+        return res.stdout.strip()
+    return ""
+
+
+def resolve_history_dir(
+    session_root: Path,
+    effective_scope: str,
+    *,
+    create_if_missing: bool = False,
+) -> Path | None:
+    """Resolve persistent history directory outside the target repository."""
+    if effective_scope == "global":
+        cand_dir = session_root.resolve() / ".history"
+        return cand_dir if (create_if_missing or cand_dir.is_dir()) else None
+
+    env_override = os.environ.get("YHARUTO_SESSION_ROOT", "").strip()
+    if env_override:
+        base_cand = Path(env_override).expanduser()
+    else:
+        base_cand = Path.home() / ".gemini" / "tmp" / "yharuto-code-review"
+
+    if not create_if_missing:
+        hist_cand = base_cand.resolve() / ".history"
+        return hist_cand if hist_cand.is_dir() else None
+
+    if _probe_writable_dir(base_cand):
+        return base_cand.resolve() / ".history"
+    return None
+
+
+def _history_repo_key(repo_dir: Path) -> str:
+    return hashlib.sha256(str(repo_dir.resolve()).encode("utf-8")).hexdigest()[:16]
+
+
+def _read_history_file_status(path: Path) -> tuple[list[dict[str, object]], bool]:
+    """Read history entries from path and report (entries, is_corrupt)."""
+    if not path.is_file():
+        return [], False
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return [], True
+    if not isinstance(raw, dict):
+        return [], True
+    entries_raw = raw.get("entries")
+    if isinstance(entries_raw, list):
+        return [{str(k): v for k, v in item.items()} for item in entries_raw if isinstance(item, dict)], False
+    return [{str(k): v for k, v in raw.items()}], False
+
+
+def _read_history_file_entries(path: Path) -> list[dict[str, object]]:
+    entries, _ = _read_history_file_status(path)
+    return entries
+
+
+def should_advance_review_history(
+    session_dir: Path,
+    state: Mapping[str, object],
+) -> bool:
+    """Return True only when the reviewed scope continuously covers from merge_base or prior saved head."""
+    mode = str(state.get("mode") or "")
+    if mode not in {"pr", "range", "local"}:
+        return False
+
+    only_files_raw = state.get("only_files")
+    if isinstance(only_files_raw, list) and len(only_files_raw) > 0:
+        return False
+
+    is_rereview = bool(state.get("is_rereview", False))
+    if not is_rereview:
+        return True
+
+    repo_dir_str = str(state.get("repo_dir") or "").strip()
+    if not repo_dir_str:
+        return False
+    repo_dir = Path(repo_dir_str).resolve()
+    session_root = session_dir.resolve().parent
+    effective_scope = str(state.get("session_scope") or "global")
+    merge_base_sha = str(state.get("merge_base_sha") or "").strip()
+    review_base_sha = str(state.get("review_base_sha") or "").strip()
+
+    if mode in {"pr", "range"}:
+        if not review_base_sha or (merge_base_sha and review_base_sha == merge_base_sha):
+            return True
+        pr_raw = state.get("pr_number")
+        pr_number = pr_raw if isinstance(pr_raw, int) and not isinstance(pr_raw, bool) else None
+        candidates, exact_pr_match = load_review_history_candidates(
+            session_root=session_root,
+            effective_scope=effective_scope,
+            repo_dir=repo_dir,
+            pr_number=pr_number if mode == "pr" else None,
+        )
+        if mode == "pr":
+            if not (exact_pr_match and candidates):
+                return False
+            prev_entry = candidates[0]
+            prev_head = str(prev_entry.get("head_sha") or "").strip()
+            prev_mb = str(prev_entry.get("merge_base_sha") or "").strip()
+            if not prev_head or (prev_mb and merge_base_sha and prev_mb != merge_base_sha):
+                return False
+            return review_base_sha == prev_head or is_git_ancestor(repo_dir, review_base_sha, prev_head)
+
+        for entry in candidates:
+            commits_rev = entry.get("commits_reviewed")
+            is_commit_history = (
+                commits_rev is True
+                if isinstance(commits_rev, bool)
+                else str(entry.get("mode") or "") in {"pr", "range"}
+            )
+            if not is_commit_history:
+                continue
+            prev_head = str(entry.get("head_sha") or "").strip()
+            prev_mb = str(entry.get("merge_base_sha") or "").strip()
+            if not prev_head or (prev_mb and merge_base_sha and prev_mb != merge_base_sha):
+                continue
+            if review_base_sha == prev_head or is_git_ancestor(repo_dir, review_base_sha, prev_head):
+                return True
+        return False
+
+    # mode == "local"
+    if not review_base_sha:
+        return True
+    history_dir = resolve_history_dir(session_root, effective_scope, create_if_missing=False)
+    if history_dir is not None and history_dir.is_dir():
+        repo_key = _history_repo_key(repo_dir)
+        for hist_path in (history_dir / f"{repo_key}-runs.json", history_dir / f"{repo_key}-local.json"):
+            _, is_corrupt = _read_history_file_status(hist_path)
+            if is_corrupt:
+                return False
+    current_branch = get_current_git_branch(repo_dir)
+    candidates, _ = load_review_history_candidates(
+        session_root=session_root,
+        effective_scope=effective_scope,
+        repo_dir=repo_dir,
+        pr_number=None,
+    )
+    matching_prev_heads: list[str] = []
+    for entry in candidates:
+        entry_pr = entry.get("pr_number")
+        entry_branch = str(entry.get("branch") or "").strip()
+        if entry_pr is not None:
+            if not current_branch or entry_branch != current_branch:
+                continue
+        elif current_branch and entry_branch and entry_branch != current_branch:
+            continue
+        prev_head = str(entry.get("head_sha") or "").strip()
+        if prev_head:
+            matching_prev_heads.append(prev_head)
+    if not matching_prev_heads:
+        return True
+    latest_prev_head = matching_prev_heads[0]
+    return review_base_sha == latest_prev_head or is_git_ancestor(repo_dir, review_base_sha, latest_prev_head)
+
+
+def save_review_history(
+    session_dir: Path,
+    state: Mapping[str, object],
+    expected_mode: str,
+    verdict: str | None,
+) -> Path | None:
+    """Persist lightweight review metadata outside the target repo for future --rereview runs."""
+    if not should_advance_review_history(session_dir, state):
+        return None
+    repo_dir_str = str(state.get("repo_dir") or "").strip()
+    if not repo_dir_str:
+        return None
+    repo_dir = Path(repo_dir_str).resolve()
+    session_root = session_dir.resolve().parent
+    effective_scope = str(state.get("session_scope") or "global")
+    history_dir = resolve_history_dir(session_root, effective_scope, create_if_missing=True)
+    if history_dir is None:
+        return None
+
+    mode = str(state.get("mode") or "")
+    if mode not in {"pr", "range", "local"}:
+        return None
+
+    pr_raw = state.get("pr_number")
+    pr_number = pr_raw if isinstance(pr_raw, int) and not isinstance(pr_raw, bool) else None
+    repo_key = _history_repo_key(repo_dir)
+    ch_raw = state.get("changed_files")
+    changed_files = [str(x) for x in ch_raw] if isinstance(ch_raw, list) else []
+    head_sha = str(state.get("head_sha") or "")
+    review_base_sha = str(state.get("review_base_sha") or "")
+    branch_name = ""
+    if mode == "local":
+        branch_name = get_current_git_branch(repo_dir)
+    elif head_sha:
+        head_res = run_subproc(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=repo_dir, timeout=10)
+        if head_res is not None and head_res.returncode == 0 and head_res.stdout.strip() == head_sha:
+            branch_name = get_current_git_branch(repo_dir)
+
+    entry: dict[str, object] = {
+        "schema_version": 2,
+        "repo_dir": str(repo_dir),
+        "mode": mode,
+        "commits_reviewed": mode in {"pr", "range"},
+        "branch": branch_name,
+        "pr_number": pr_number,
+        "base_sha": str(state.get("base_sha") or ""),
+        "merge_base_sha": str(state.get("merge_base_sha") or ""),
+        "review_base_sha": review_base_sha,
+        "head_sha": head_sha,
+        "changed_files": changed_files,
+        "verdict": verdict,
+        "review_mode": expected_mode,
+        "reviewed_at": utc_now_iso(),
+    }
+
+    try:
+        history_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(history_dir, 0o700)
+        except OSError:
+            pass
+
+        if pr_number is not None:
+            dest = history_dir / f"{repo_key}-pr-{pr_number}.json"
+            write_json_atomic(dest, entry)
+        else:
+            dest = history_dir / f"{repo_key}-runs.json"
+            existing = _read_history_file_entries(dest)
+            legacy_path = history_dir / f"{repo_key}-local.json"
+            if not existing and legacy_path.is_file():
+                existing = _read_history_file_entries(legacy_path)
+            dedup_key = (
+                mode,
+                branch_name,
+                str(entry["merge_base_sha"]),
+                str(entry["head_sha"]),
+            )
+            filtered = [
+                item
+                for item in existing
+                if (
+                    str(item.get("mode") or ""),
+                    str(item.get("branch") or ""),
+                    str(item.get("merge_base_sha") or ""),
+                    str(item.get("head_sha") or ""),
+                )
+                != dedup_key
+            ]
+            entries_out = [entry, *filtered][:MAX_HISTORY_ENTRIES]
+            write_json_atomic(dest, {"schema_version": 2, "entries": entries_out})
+        try:
+            os.chmod(dest, 0o600)
+        except OSError:
+            pass
+        return dest
+    except OSError:
+        return None
+
+
+def load_review_history_candidates(
+    session_root: Path,
+    effective_scope: str,
+    repo_dir: Path,
+    pr_number: int | None,
+) -> tuple[list[dict[str, object]], bool]:
+    """Load review history candidates sorted newest-first without creating directories.
+
+    Returns (candidates_newest_first, exact_pr_match).
+    """
+    history_dir = resolve_history_dir(session_root, effective_scope, create_if_missing=False)
+    if history_dir is None or not history_dir.is_dir():
+        return [], False
+
+    repo_key = _history_repo_key(repo_dir)
+    if pr_number is not None:
+        exact_entries = _read_history_file_entries(history_dir / f"{repo_key}-pr-{pr_number}.json")
+        return (exact_entries, True) if exact_entries else ([], False)
+
+    candidates: list[dict[str, object]] = []
+    for path in sorted(history_dir.glob(f"{repo_key}-*.json")):
+        candidates.extend(_read_history_file_entries(path))
+    candidates.sort(key=lambda item: str(item.get("reviewed_at") or ""), reverse=True)
+    return candidates, False

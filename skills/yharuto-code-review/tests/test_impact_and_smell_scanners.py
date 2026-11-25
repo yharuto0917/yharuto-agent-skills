@@ -745,6 +745,81 @@ class TestImpactAndSmellScanners(unittest.TestCase):
             self.assertEqual(rc_s4_ok, 0)
             self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir2)], env=env)[0], 0)
 
+    def test_non_ascii_japanese_filenames_across_prepare_impact_and_smells(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sess_root = root / "sessions"
+            env = {"YHARUTO_SESSION_ROOT": str(sess_root), "YOMIYASU_LINT_DISABLE": "1"}
+
+            repo = root / "repo_jp"
+            init_git_repo(repo)
+            (repo / "src").mkdir()
+            (repo / "tests").mkdir()
+            (repo / "README.md").write_text("# JP Filename Test\n", encoding="utf-8")
+            git_commit_all(repo, "base")
+
+            run_git(repo, ["checkout", "-b", "pr-jp"])
+            (repo / "src" / "割引計算.py").write_text(
+                "def calc_discount_jpy(amount: int) -> int:\n"
+                "    try:\n"
+                "        return max(0, amount // 10)\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "    return 0\n",
+                encoding="utf-8",
+            )
+            (repo / "tests" / "test_割引計算.py").write_text(
+                "import unittest\n"
+                "from src.割引計算 import calc_discount_jpy\n\n"
+                "class TestJpDiscount(unittest.TestCase):\n"
+                "    def test_basic(self) -> None:\n"
+                "        self.assertEqual(calc_discount_jpy(200), 20)\n",
+                encoding="utf-8",
+            )
+            git_commit_all(repo, "add Japanese-named Python module and test")
+
+            rc_prep, prep, _, stderr_prep = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo), "--range", "main..pr-jp"],
+                env=env,
+            )
+            self.assertEqual(rc_prep, 0, stderr_prep)
+            self.assertEqual(prep["changed_files"], ["src/割引計算.py", "tests/test_割引計算.py"])
+            self.assertEqual(prep["testable_code_files"], ["src/割引計算.py"])
+
+            sdir = Path(str(prep["session_dir"]))
+            rc_imp, imp_out, _, _ = run_script("impact_scan.py", ["--session", str(sdir)], env=env)
+            self.assertEqual(rc_imp, 0)
+            self.assertEqual(
+                imp_out.get("related_tests_and_mocks"),
+                [{"file": "tests/test_割引計算.py", "kind": "test", "reason": "modified_in_diff"}],
+            )
+
+            rc_g1, _, _, _ = run_script(
+                "prepare_worktree.py",
+                ["gate-stage1", "--session", str(sdir), "--verdict", "OK", "--verified-tests", "tests/test_割引計算.py"],
+                env=env,
+            )
+            self.assertEqual(rc_g1, 0)
+
+            rc_ci, ci_out, _, _ = run_script("run_checks.py", ["--session", str(sdir)], env=env)
+            self.assertEqual(rc_ci, 0)
+            self.assertEqual(ci_out["overall_status"], "passed")
+
+            rc_sm, smells_out, _, _ = run_script("scan_diff_smells.py", ["--session", str(sdir)], env=env)
+            self.assertEqual(rc_sm, 0)
+            smell_items = smells_out.get("findings", [])
+            self.assertIsInstance(smell_items, list)
+            self.assertEqual(
+                [
+                    (str(item.get("file")), int(item.get("line", 0)), str(item.get("rule_id")))
+                    for item in smell_items
+                    if isinstance(item, dict)
+                ],
+                [("src/割引計算.py", 4, "EMPTY_OR_BROAD_CATCH")],
+            )
+            self.assertEqual(run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir)], env=env)[0], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

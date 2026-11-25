@@ -345,6 +345,145 @@ class TestCiAndUntrustedProtection(unittest.TestCase):
             self.assertFalse(val_reg["passed"])
             run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir_reg)], env=env)
 
+            # --- Case C: Base has 1 failing + 1 passing test; PR breaks the passing test (2 failures) -> regression 'failed' -> Approve REJECTED ---
+            repo_overlap = root / "repo_overlap"
+            init_git_repo(repo_overlap)
+            (repo_overlap / "src").mkdir()
+            (repo_overlap / "tests").mkdir()
+            (repo_overlap / "src" / "discountCalc.py").write_text(
+                "def compute_discount(amount: int) -> int:\n    return 10\n",
+                encoding="utf-8",
+            )
+            (repo_overlap / "tests" / "test_discount_calc.py").write_text(
+                "import unittest\nfrom src.discountCalc import compute_discount\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_preexisting_broken(self) -> None:\n"
+                "        self.assertEqual(1, 2)\n"
+                "    def test_healthy_discount(self) -> None:\n"
+                "        self.assertEqual(compute_discount(100), 10)\n",
+                encoding="utf-8",
+            )
+            git_commit_all(repo_overlap, "base with 1 broken + 1 green test")
+
+            run_git(repo_overlap, ["checkout", "-b", "pr-branch"])
+            (repo_overlap / "src" / "discountCalc.py").write_text(
+                "def compute_discount(amount: int) -> int:\n    return 999\n",
+                encoding="utf-8",
+            )
+            git_commit_all(repo_overlap, "break healthy test on top of preexisting failure")
+
+            _, prep_ov, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo_overlap), "--range", "main..pr-branch"],
+                env=env,
+            )
+            sdir_ov = Path(str(prep_ov["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir_ov)], env=env)[0], 0)
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir_ov), "--verdict", "OK", "--verified-tests", "tests/test_discount_calc.py"],
+                    env=env,
+                )[0],
+                0,
+            )
+            rc_ci_ov, ci_ov, _, _ = run_script("run_checks.py", ["--session", str(sdir_ov)], env=env)
+            self.assertEqual(rc_ci_ov, 0)
+            self.assertEqual(ci_ov["overall_status"], "failed")
+            test_chk_ov = next(c for c in ci_ov["checks"] if isinstance(c, dict) and c.get("tool") == "test")
+            self.assertEqual(test_chk_ov["status"], "failed")
+            self.assertEqual(test_chk_ov["failure_origin"], "regression")
+            new_failed_ov = test_chk_ov.get("new_failed_tests", [])
+            self.assertIsInstance(new_failed_ov, list)
+            self.assertTrue(any("test_healthy_discount" in str(x) for x in new_failed_ov), f"Expected test_healthy_discount in {new_failed_ov}")
+
+            self.assertEqual(run_script("scan_diff_smells.py", ["--session", str(sdir_ov)], env=env)[0], 0)
+            draft_ov = Path(str(prep_ov["draft_findings_path"]))
+            draft_ov.write_text("[]\n", encoding="utf-8")
+            self.assertEqual(
+                run_script("prepare_worktree.py", ["prepare-stage4", "--session", str(sdir_ov), "--draft", str(draft_ov)], env=env)[0],
+                0,
+            )
+            nonce_ov = extract_challenge_nonce(Path(str(prep_ov["adversarial_input_path"])))
+            resp_ov = Path(str(prep_ov["adversarial_response_path"]))
+            resp_ov.write_text(
+                json.dumps(
+                    {
+                        "challenge_nonce": nonce_ov,
+                        "challenged_findings": [],
+                        "missed_findings": [],
+                        "checked_files": ["src/discountCalc.py", "tests/test_discount_calc.py"],
+                        "audit_notes": "既存失敗1件に加えて新規失敗1件が発生していることを確認しました。",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["record-stage4", "--session", str(sdir_ov), "--verifier-mode", "subagent", "--response-file", str(resp_ov)],
+                    env=env,
+                )[0],
+                0,
+            )
+            rev_ov = Path(str(prep_ov["review_output_path"]))
+            rev_ov.write_text(build_clean_full_review(verdict="🟢 Approve", alert_tag="[!TIP]"), encoding="utf-8")
+            rc_vo, val_ov, _, _ = run_script(
+                "validate_review_output.py",
+                ["--session", str(sdir_ov), "--file", str(rev_ov)],
+                env=env,
+            )
+            self.assertEqual(rc_vo, 1)
+            self.assertFalse(val_ov["passed"])
+            run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir_ov)], env=env)
+
+            # --- Case D: Runner without individual test identifiers increases failure count (1 -> 2) -> regression 'failed' ---
+            repo_cnt = root / "repo_cnt"
+            init_git_repo(repo_cnt)
+            (repo_cnt / "src").mkdir()
+            (repo_cnt / "tests").mkdir()
+            (repo_cnt / "src" / "calc.mjs").write_text("export const bonus = 10;\n", encoding="utf-8")
+            (repo_cnt / "tests" / "customRunner.test.mjs").write_text(
+                "import { bonus } from '../src/calc.mjs';\n"
+                "let failures = 1; // preexisting unnamed failure\n"
+                "if (bonus !== 10) failures += 1;\n"
+                "console.log(`# fail ${failures}`);\n"
+                "process.exit(1);\n",
+                encoding="utf-8",
+            )
+            (repo_cnt / "package.json").write_text(
+                json.dumps({"name": "cnt-demo", "type": "module", "scripts": {"test": "node tests/customRunner.test.mjs"}}),
+                encoding="utf-8",
+            )
+            git_commit_all(repo_cnt, "base with 1 unnamed failure")
+            run_git(repo_cnt, ["checkout", "-b", "pr-branch"])
+            (repo_cnt / "src" / "calc.mjs").write_text("export const bonus = 99;\n", encoding="utf-8")
+            git_commit_all(repo_cnt, "increase unnamed failure count to 2")
+
+            _, prep_cnt, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo_cnt), "--range", "main..pr-branch"],
+                env=env,
+            )
+            sdir_cnt = Path(str(prep_cnt["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir_cnt)], env=env)[0], 0)
+            self.assertEqual(
+                run_script(
+                    "prepare_worktree.py",
+                    ["gate-stage1", "--session", str(sdir_cnt), "--verdict", "OK", "--verified-tests", "tests/customRunner.test.mjs"],
+                    env=env,
+                )[0],
+                0,
+            )
+            rc_ci_cnt, ci_cnt, _, _ = run_script("run_checks.py", ["--session", str(sdir_cnt)], env=env)
+            self.assertEqual(rc_ci_cnt, 0)
+            self.assertEqual(ci_cnt["overall_status"], "failed")
+            test_chk_cnt = next(c for c in ci_cnt["checks"] if isinstance(c, dict) and c.get("tool") == "test")
+            self.assertEqual(test_chk_cnt["status"], "failed")
+            self.assertEqual(test_chk_cnt["failure_origin"], "regression")
+            run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir_cnt)], env=env)
+
     def test_timeout_status_and_gh_pr_checks_pending_and_live_fallthrough(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -477,6 +616,109 @@ class TestCiAndUntrustedProtection(unittest.TestCase):
             self.assertEqual(gh_chk["status"], "pending")
             self.assertEqual(ci_l["overall_status"], "pending")
             run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir2)], env=env_live)
+
+    def test_root_dotfiles_npmrc_cargo_config_hazard_and_untracked_dotfile_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sess_root = root / "sessions"
+            env = {"YHARUTO_SESSION_ROOT": str(sess_root), "YOMIYASU_LINT_DISABLE": "1"}
+
+            # 1) Root `.cargo/config.toml` with shell runner on non-fork branch -> ci_script_hazard=True & blocked
+            repo_cargo = root / "repo_cargo"
+            init_git_repo(repo_cargo)
+            (repo_cargo / "Cargo.toml").write_text(
+                '[package]\nname = "demo"\nversion = "0.1.0"\nedition = "2021"\n',
+                encoding="utf-8",
+            )
+            (repo_cargo / "src").mkdir()
+            (repo_cargo / "src" / "lib.rs").write_text("pub fn val() -> i32 { 1 }\n", encoding="utf-8")
+            (repo_cargo / "tests").mkdir()
+            (repo_cargo / "tests" / "basic_test.rs").write_text("#[test]\nfn ok() { assert_eq!(1, 1); }\n", encoding="utf-8")
+            git_commit_all(repo_cargo, "base rust")
+
+            run_git(repo_cargo, ["checkout", "-b", "pr-cargo"])
+            (repo_cargo / ".cargo").mkdir()
+            (repo_cargo / ".cargo" / "config.toml").write_text(
+                '[target."cfg(all())"]\nrunner = ["sh", "-c", "touch PWNED"]\n',
+                encoding="utf-8",
+            )
+            git_commit_all(repo_cargo, "add root .cargo/config.toml runner")
+
+            rc_cg, prep_cg, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo_cargo), "--range", "main..pr-cargo"],
+                env=env,
+            )
+            self.assertEqual(rc_cg, 0)
+            self.assertIs(prep_cg["ci_script_hazard"], True)
+            self.assertEqual(prep_cg["testable_code_files"], [])
+            sdir_cg = Path(str(prep_cg["session_dir"]))
+            wdir_cg = Path(str(prep_cg["workdir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir_cg)], env=env)[0], 0)
+            self.assertEqual(
+                run_script("prepare_worktree.py", ["gate-stage1", "--session", str(sdir_cg), "--verdict", "EXEMPT"], env=env)[0],
+                0,
+            )
+            rc_ci_cg, ci_cg, _, _ = run_script("run_checks.py", ["--session", str(sdir_cg)], env=env)
+            self.assertEqual(rc_ci_cg, 0)
+            self.assertEqual(ci_cg["overall_status"], "blocked_untrusted_script")
+            self.assertFalse((wdir_cg / "PWNED").exists())
+            self.assertFalse((repo_cargo / "PWNED").exists())
+            run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir_cg)], env=env)
+
+            # 2) Root `.npmrc` with `script-shell` on non-fork branch -> ci_script_hazard=True & blocked
+            repo_npmrc = root / "repo_npmrc"
+            init_git_repo(repo_npmrc)
+            (repo_npmrc / "package.json").write_text(
+                json.dumps({"name": "npmrc-demo", "scripts": {"test": "node --version"}}),
+                encoding="utf-8",
+            )
+            git_commit_all(repo_npmrc, "base npm")
+            run_git(repo_npmrc, ["checkout", "-b", "pr-npmrc"])
+            (repo_npmrc / ".npmrc").write_text('script-shell = "/bin/sh -c \'touch PWNED\'"\n', encoding="utf-8")
+            git_commit_all(repo_npmrc, "add hazardous root .npmrc")
+
+            rc_np, prep_np, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo_npmrc), "--range", "main..pr-npmrc"],
+                env=env,
+            )
+            self.assertEqual(rc_np, 0)
+            self.assertIs(prep_np["ci_script_hazard"], True)
+            self.assertEqual(prep_np["testable_code_files"], [])
+            sdir_np = Path(str(prep_np["session_dir"]))
+            self.assertEqual(run_script("impact_scan.py", ["--session", str(sdir_np)], env=env)[0], 0)
+            self.assertEqual(
+                run_script("prepare_worktree.py", ["gate-stage1", "--session", str(sdir_np), "--verdict", "EXEMPT"], env=env)[0],
+                0,
+            )
+            rc_ci_np, ci_np, _, _ = run_script("run_checks.py", ["--session", str(sdir_np)], env=env)
+            self.assertEqual(rc_ci_np, 0)
+            self.assertEqual(ci_np["overall_status"], "blocked_untrusted_script")
+            run_script("prepare_worktree.py", ["cleanup", "--session", str(sdir_np)], env=env)
+
+            # 3) Local mode with untracked root `.eslintrc.cjs` -> copied to isolated worktree AND excluded from testable_code_files
+            repo_dot = root / "repo_dot"
+            init_git_repo(repo_dot)
+            (repo_dot / "README.md").write_text("# Demo\n", encoding="utf-8")
+            git_commit_all(repo_dot, "init")
+            (repo_dot / ".eslintrc.cjs").write_text("module.exports = { root: true };\n", encoding="utf-8")
+
+            rc_dt, prep_dt, _, _ = run_script(
+                "prepare_worktree.py",
+                ["prepare", "--repo", str(repo_dot), "--local"],
+                env=env,
+            )
+            self.assertEqual(rc_dt, 0)
+            self.assertEqual(prep_dt["changed_files"], [".eslintrc.cjs"])
+            self.assertEqual(prep_dt["testable_code_files"], [])
+            wdir_dt = Path(str(prep_dt["workdir"]))
+            self.assertTrue((wdir_dt / ".eslintrc.cjs").is_file())
+            self.assertEqual(
+                (wdir_dt / ".eslintrc.cjs").read_text(encoding="utf-8"),
+                "module.exports = { root: true };\n",
+            )
+            run_script("prepare_worktree.py", ["cleanup", "--session", str(prep_dt["session_dir"])], env=env)
 
 
 if __name__ == "__main__":

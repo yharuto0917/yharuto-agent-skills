@@ -22,10 +22,20 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from _lib import (  # noqa: E402
     MARKDOWN_LINK_RE,
+    build_git_diff_cmd,
     emit_json,
+    evaluate_skip_test_stage2_status,
     fail_with_code,
     find_fenced_lines,
+    get_state_version,
+    has_stage2_test_failure,
+    is_stage1_passed_or_skipped,
+    normalize_rel_path,
+    parse_diff_header_file_path,
     read_verified_gate_state,
+    run_subproc,
+    session_state_lock,
+    sha256_bytes,
     sha256_file,
     split_markdown_table_row,
     write_json_atomic,
@@ -50,10 +60,7 @@ class SectionRange:
 
 
 def strip_dot_slash(raw_path: str) -> str:
-    cleaned = raw_path.replace("\\", "/")
-    while cleaned.startswith("./"):
-        cleaned = cleaned[2:]
-    return cleaned
+    return normalize_rel_path(raw_path)
 
 
 def convert_relative_links_to_blob(
@@ -216,40 +223,45 @@ def extract_primary_location(subsection_lines: Sequence[str]) -> tuple[str, int 
 def compute_diff_hunks(repo_dir: Path, merge_base_sha: str, head_sha: str) -> dict[str, list[set[int]]]:
     if not merge_base_sha or not head_sha:
         return {}
-    env = dict(os.environ)
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    try:
-        proc = subprocess.run(
-            ["git", "diff", "-U3", merge_base_sha, head_sha],
-            cwd=str(repo_dir),
-            env=env,
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if proc.returncode != 0:
+    proc = run_subproc(
+        build_git_diff_cmd("-U3", merge_base_sha, head_sha),
+        cwd=repo_dir,
+        timeout=GIT_TIMEOUT_SECONDS,
+    )
+    if proc is None or proc.returncode != 0:
         return {}
 
     hunks_by_file: dict[str, list[set[int]]] = {}
     current_file: str | None = None
     current_hunk: set[int] | None = None
+    in_header = False
     right_line = 0
 
     for raw in proc.stdout.splitlines():
-        if raw.startswith("+++ b/"):
-            current_file = raw[6:].strip()
-            current_hunk = None
-            continue
-        if raw.startswith("+++ /dev/null"):
+        if raw.startswith("diff --git "):
             current_file = None
             current_hunk = None
+            in_header = True
             continue
+        if in_header:
+            if raw.startswith("+++ "):
+                parsed_plus = parse_diff_header_file_path(raw, "+++ ")
+                if parsed_plus is None or parsed_plus == "/dev/null":
+                    current_file = None
+                else:
+                    current_file = parsed_plus
+                current_hunk = None
+                continue
+            hm = HUNK_HEADER_RE.match(raw)
+            if hm is not None:
+                in_header = False
+                if current_file is None:
+                    continue
+                right_line = int(hm.group(1))
+                current_hunk = set()
+                hunks_by_file.setdefault(current_file, []).append(current_hunk)
+            continue
+
         if current_file is None:
             continue
 
@@ -509,6 +521,115 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _verify_post_gates_locked(
+    session_dir: Path,
+    review_path: Path,
+    *,
+    expected_version: int | None = None,
+    expected_review_sha: str | None = None,
+) -> tuple[dict[str, object], str, bytes, str, int]:
+    """Verify all Stage 1-5 gates, ci_checks.log, and review.md digest atomically under session_state_lock."""
+    with session_state_lock(session_dir, create_dir=False):
+        raw_state = read_verified_gate_state(session_dir)
+        current_ver = get_state_version(raw_state)
+        if expected_version is not None and current_ver != expected_version:
+            fail_with_code(
+                f"Cannot post review: gate_state.json changed concurrently before posting "
+                f"(expected state_version={expected_version}, current={current_ver}). Re-validate before posting.",
+                2,
+                extra={
+                    "expected_state_version": expected_version,
+                    "current_state_version": current_ver,
+                },
+            )
+
+        if not review_path.is_file():
+            fail_with_code(f"Review Markdown file not found: {review_path}", 2)
+        try:
+            review_bytes = review_path.read_bytes()
+        except OSError as exc:
+            fail_with_code(f"Cannot read review Markdown file ({review_path}): {exc}", 2)
+
+        stage5 = raw_state.get("stage5")
+        if not isinstance(stage5, dict) or stage5.get("validated") is not True:
+            fail_with_code(
+                "Cannot post review: stage5.validated is not true. Run validate_review_output.py --session first.",
+                2,
+            )
+
+        expected_sha = str(stage5.get("review_sha256") or "")
+        actual_sha = sha256_bytes(review_bytes)
+        if not expected_sha or actual_sha != expected_sha:
+            fail_with_code(
+                "Cannot post review: review.md SHA-256 does not match stage5.review_sha256 (file modified after validation).",
+                2,
+            )
+        if expected_review_sha is not None and actual_sha != expected_review_sha:
+            fail_with_code(
+                "Cannot post review: review.md changed concurrently before posting.",
+                2,
+            )
+
+        s1_scan = raw_state.get("stage1_scan")
+        if not isinstance(s1_scan, dict) or s1_scan.get("executed") is not True:
+            fail_with_code("Cannot post review: impact_scan.py --session was not executed.", 2)
+
+        stage1 = raw_state.get("stage1")
+        s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+        bypass_status, bypass_reason = evaluate_skip_test_stage2_status(raw_state)
+        if is_stage1_passed_or_skipped(raw_state, require_stage2_test_pass=True):
+            stage2 = raw_state.get("stage2")
+            stage3 = raw_state.get("stage3")
+            stage4 = raw_state.get("stage4")
+            if not (isinstance(stage2, dict) and stage2.get("executed") is True):
+                fail_with_code("Cannot post review: Stage 2 was not executed.", 2)
+            expected_log_sha = str(stage2.get("log_sha256") or "")
+            ci_log_path = session_dir / "ci_checks.log"
+            if not ci_log_path.is_file() or not expected_log_sha or sha256_file(ci_log_path) != expected_log_sha:
+                fail_with_code("Cannot post review: Stage 2 ci_checks.log is missing or SHA-256 mismatch.", 2)
+            if not (isinstance(stage3, dict) and stage3.get("smell_scan_executed") is True):
+                fail_with_code("Cannot post review: Stage 3 (scan_diff_smells.py) was not executed.", 2)
+            if not (
+                isinstance(stage4, dict)
+                and stage4.get("executed") is True
+                and stage4.get("challenge_nonce_verified") is True
+            ):
+                fail_with_code("Cannot post review: Stage 4 adversarial verification was not completed.", 2)
+            review_mode = "full"
+        elif bypass_status in {"pending", "unverified"}:
+            fail_with_code(
+                f"Cannot post review: {bypass_reason}",
+                2,
+                extra={
+                    "stage1_status": s1_status,
+                    "skip_test_revoked": False,
+                    "skip_test_on_hold": True,
+                    "skip_test_hold_status": bypass_status,
+                },
+            )
+        elif s1_status == "NG" or (
+            s1_status == "SKIPPED_BY_FLAG"
+            and (
+                bool(raw_state.get("skip_test_revoked", False))
+                or has_stage2_test_failure(raw_state)
+                or bypass_status == "revoked"
+            )
+        ):
+            review_mode = "stage1_ng"
+        else:
+            fail_with_code(f"Cannot post review: invalid Stage 1 status '{s1_status}'.", 2)
+
+        stage5_mode = str(stage5.get("mode") or "").strip()
+        if (stage5_mode == "stage1_ng") != (review_mode == "stage1_ng"):
+            fail_with_code(
+                f"Cannot post review: stage5 validated mode '{stage5_mode}' does not match current session review mode '{review_mode}'. "
+                "Re-run validate_review_output.py --session.",
+                2,
+            )
+
+        return raw_state, review_mode, review_bytes, actual_sha, current_ver
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -522,52 +643,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         fail_with_code(f"Invalid --pr '{pr_number}': must be >= 1.", 2)
 
     session_dir = Path(str(args.session)).expanduser().resolve()
-    raw_state = read_verified_gate_state(session_dir)
-
     review_path = Path(str(args.review_md)).expanduser().resolve()
-    if not review_path.is_file():
-        fail_with_code(f"Review Markdown file not found: {review_path}", 2)
-
-    stage5 = raw_state.get("stage5")
-    if not isinstance(stage5, dict) or stage5.get("validated") is not True:
-        fail_with_code(
-            "Cannot post review: stage5.validated is not true. Run validate_review_output.py --session first.",
-            2,
-        )
-
-    expected_sha = str(stage5.get("review_sha256") or "")
-    actual_sha = sha256_file(review_path)
-    if not expected_sha or actual_sha != expected_sha:
-        fail_with_code(
-            "Cannot post review: review.md SHA-256 does not match stage5.review_sha256 (file modified after validation).",
-            2,
-        )
-
-    s1_scan = raw_state.get("stage1_scan")
-    if not isinstance(s1_scan, dict) or s1_scan.get("executed") is not True:
-        fail_with_code("Cannot post review: impact_scan.py --session was not executed.", 2)
-
-    stage1 = raw_state.get("stage1")
-    s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-    if s1_status == "NG":
-        review_mode = "stage1_ng"
-    elif s1_status in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
-        stage2 = raw_state.get("stage2")
-        stage3 = raw_state.get("stage3")
-        stage4 = raw_state.get("stage4")
-        if not (isinstance(stage2, dict) and stage2.get("executed") is True):
-            fail_with_code("Cannot post review: Stage 2 was not executed.", 2)
-        if not (isinstance(stage3, dict) and stage3.get("smell_scan_executed") is True):
-            fail_with_code("Cannot post review: Stage 3 (scan_diff_smells.py) was not executed.", 2)
-        if not (
-            isinstance(stage4, dict)
-            and stage4.get("executed") is True
-            and stage4.get("challenge_nonce_verified") is True
-        ):
-            fail_with_code("Cannot post review: Stage 4 adversarial verification was not completed.", 2)
-        review_mode = "full"
-    else:
-        fail_with_code(f"Cannot post review: invalid Stage 1 status '{s1_status}'.", 2)
+    raw_state, review_mode, review_bytes, actual_sha, initial_version = _verify_post_gates_locked(
+        session_dir, review_path
+    )
 
     repo_dir = Path(str(raw_state.get("repo_dir") or ".")).resolve()
     merge_base_sha = str(raw_state.get("merge_base_sha") or raw_state.get("base_sha") or "")
@@ -575,7 +654,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not head_sha:
         fail_with_code("Cannot post review: head_sha is empty in gate_state.json.", 2)
 
-    review_text = review_path.read_text(encoding="utf-8")
+    try:
+        review_text = review_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail_with_code(f"Cannot decode review Markdown file as UTF-8 ({review_path}): {exc}", 2)
+
     hunks_by_file = compute_diff_hunks(repo_dir, merge_base_sha, head_sha) if review_mode == "full" else {}
     payload, inline_count, body_fallback_count = build_pending_review_payload(
         review_text=review_text,
@@ -617,7 +700,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
 
-    resp = post_pending_via_gh(repo_slug, pr_number, payload, repo_dir)
+    # Keep session lock held across final verification and bounded GitHub POST so a concurrent
+    # Stage 2 revocation cannot race between validation and submission.
+    with session_state_lock(session_dir, create_dir=False):
+        _verify_post_gates_locked(
+            session_dir,
+            review_path,
+            expected_version=initial_version,
+            expected_review_sha=actual_sha,
+        )
+        resp = post_pending_via_gh(repo_slug, pr_number, payload, repo_dir)
     emit_json(
         {
             "status": "created_pending",

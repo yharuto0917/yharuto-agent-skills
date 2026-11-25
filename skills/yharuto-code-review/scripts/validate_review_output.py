@@ -19,17 +19,27 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from _lib import (  # noqa: E402
+    ALLOWED_STAGE1_SKIP_STATUSES,
     FencedBlock,
     MARKDOWN_LINK_RE,
     SectionSlice,
     TEST_PATH_RE,
     collect_repo_porcelain,
     emit_json,
+    evaluate_skip_test_stage2_status,
+    get_state_version,
+    has_stage2_test_failure,
+    has_surviving_changed_files,
+    is_deleted_changed_file_in_base,
+    is_git_metadata_rel_path,
     is_separator_row,
     load_session_hmac_key,
     parse_fenced_blocks,
+    save_review_history,
+    session_state_lock,
     sha256_bytes,
     sha256_file,
+    should_advance_review_history,
     slice_sections_by_prefix,
     split_markdown_table_row,
     utc_now_iso,
@@ -87,6 +97,12 @@ GREEN_VERDICTS: frozenset[str] = frozenset(
     {
         "🟢 Approve",
         "🟢 健全（重大な懸念なし）",
+    }
+)
+YELLOW_VERDICTS: frozenset[str] = frozenset(
+    {
+        "🟡 Comment",
+        "🟡 要確認（構造・保守上の懸念あり）",
     }
 )
 
@@ -390,6 +406,7 @@ def _verify_stage4_response_soft(
         return
 
     normalized_checked: set[str] = set()
+    live_checked_count = 0
     workdir_resolved = workdir.resolve()
     for item in checked_raw:
         if not isinstance(item, str) or not item.strip():
@@ -402,10 +419,25 @@ def _verify_stage4_response_soft(
         except ValueError:
             gate_errors.append(f"Stage 4 checked_files entry escapes workdir: {item}")
             continue
-        if not full.is_file():
-            gate_errors.append(f"Stage 4 checked_files entry does not exist in workdir: {rel}")
+        if is_git_metadata_rel_path(rel):
+            gate_errors.append(f"Stage 4 checked_files entry cannot reference git metadata: {rel}")
             continue
-        normalized_checked.add(rel)
+        if full.is_file():
+            live_checked_count += 1
+            normalized_checked.add(rel)
+            continue
+        if is_deleted_changed_file_in_base(state, workdir_resolved, rel):
+            normalized_checked.add(rel)
+            continue
+        gate_errors.append(f"Stage 4 checked_files entry does not exist in workdir: {rel}")
+
+    if not normalized_checked:
+        gate_errors.append("Stage 4 checked_files did not resolve to any valid inspected file.")
+
+    if has_surviving_changed_files(state, workdir_resolved) and live_checked_count < 1:
+        gate_errors.append(
+            "Stage 4 checked_files must include at least 1 inspected live file in workdir when selected files survive."
+        )
 
     mode_val = str(state.get("mode") or "")
     testable_raw = state.get("testable_code_files")
@@ -429,132 +461,151 @@ def validate_gate_state(
     if not state_path.is_file():
         return "full", {}, [f"gate_state.json does not exist in session_dir: {session_dir}"], False, False
 
-    try:
-        raw_state: object = json.loads(state_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return "full", {}, [f"Failed to parse gate_state.json: {exc}"], False, False
+    with session_state_lock(session_dir, create_dir=False):
+        try:
+            raw_state: object = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return "full", {}, [f"Failed to parse gate_state.json: {exc}"], False, False
 
-    if not isinstance(raw_state, dict):
-        return "full", {}, ["gate_state.json is not a JSON object."], False, False
+        if not isinstance(raw_state, dict):
+            return "full", {}, ["gate_state.json is not a JSON object."], False, False
 
-    state = {str(k): v for k, v in raw_state.items()}
-    mode_val = str(state.get("mode") or "")
-    default_ok_mode = "audit" if mode_val == "audit" else "full"
+        state = {str(k): v for k, v in raw_state.items()}
+        mode_val = str(state.get("mode") or "")
+        default_ok_mode = "audit" if mode_val == "audit" else "full"
 
-    # 1. Verify HMAC-SHA256 signature
-    hmac_ok, hmac_err = verify_state_hmac(session_dir, state)
-    if not hmac_ok:
-        gate_errors.append(hmac_err)
+        # 1. Verify HMAC-SHA256 signature
+        hmac_ok, hmac_err = verify_state_hmac(session_dir, state)
+        if not hmac_ok:
+            gate_errors.append(hmac_err)
 
-    workdir = Path(str(state.get("workdir") or "")).resolve()
-    repo_dir_str = str(state.get("repo_dir") or "")
+        workdir = Path(str(state.get("workdir") or "")).resolve()
+        repo_dir_str = str(state.get("repo_dir") or "")
 
-    # 2. Verify target git working tree cleanliness (zero pollution in repo_dir)
-    init_porcelain = state.get("initial_repo_porcelain")
-    if isinstance(init_porcelain, list) and repo_dir_str:
-        repo_dir = Path(repo_dir_str).resolve()
-        if repo_dir.is_dir():
-            ignore_proj = str(state.get("session_scope") or "") == "project"
-            cur_porcelain = collect_repo_porcelain(repo_dir, ignore_project_session=ignore_proj)
-            if cur_porcelain is not None:
-                initial_set = {str(x) for x in init_porcelain}
-                newly_dirty = sorted(set(cur_porcelain) - initial_set)
-                if newly_dirty:
-                    gate_errors.append(
-                        f"Git working tree pollution detected in target repo_dir ({len(newly_dirty)} new dirty/untracked file(s)): {newly_dirty[:10]}"
-                    )
-
-    # 3. Verify Stage 1 impact_scan.py execution
-    s1_scan = state.get("stage1_scan")
-    impact_path = session_dir / "impact_scan.json"
-    if not isinstance(s1_scan, dict) or s1_scan.get("executed") is not True:
-        gate_errors.append("Stage 1 impact scan (impact_scan.py --session) was not executed.")
-    elif not impact_path.is_file() or sha256_file(impact_path) != str(s1_scan.get("sha256") or ""):
-        gate_errors.append("Stage 1 impact_scan.json is missing or SHA-256 mismatch.")
-
-    # 4. Verify Stage 1 Test Sufficiency Gate
-    stage1 = state.get("stage1")
-    s1_status = stage1.get("status") if isinstance(stage1, dict) else None
-
-    if s1_status == "NG":
-        gaps = stage1.get("gaps_count", 0) if isinstance(stage1, dict) else 0
-        if not isinstance(gaps, int) or gaps < 1:
-            gate_errors.append("Stage 1 status is NG, but gaps_count >= 1 was not recorded via gate-stage1.")
-        return "stage1_ng", state, gate_errors, False, hmac_ok
-
-    if s1_status not in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
-        gate_errors.append(
-            f"Stage 1 Test Sufficiency Gate was not passed (current status: '{s1_status}')."
-        )
-        return default_ok_mode, state, gate_errors, False, hmac_ok
-
-    if s1_status == "EXEMPT_NO_TESTABLE_CODE" and mode_val in {"pr", "range", "local"}:
-        t_raw = state.get("testable_code_files")
-        if isinstance(t_raw, list) and len(t_raw) >= 1:
-            gate_errors.append(
-                "Stage 1 EXEMPT_NO_TESTABLE_CODE is invalid when testable_code_files is non-empty in pr/range/local mode."
-            )
-
-    if s1_status == "OK" and isinstance(stage1, dict):
-        vtests = stage1.get("verified_tests")
-        if not isinstance(vtests, list) or len(vtests) == 0:
-            gate_errors.append("Stage 1 status is OK, but verified_tests list is empty.")
-        else:
-            for vt in vtests:
-                if isinstance(vt, dict):
-                    vt_rel = str(vt.get("path") or "")
-                    vpath = workdir / vt_rel
-                    vsha = str(vt.get("sha256") or "")
-                    if TEST_PATH_RE.search(vt_rel) is None:
+        # 2. Verify target git working tree cleanliness (zero pollution in repo_dir)
+        init_porcelain = state.get("initial_repo_porcelain")
+        if isinstance(init_porcelain, list) and repo_dir_str:
+            repo_dir = Path(repo_dir_str).resolve()
+            if repo_dir.is_dir():
+                ignore_proj = str(state.get("session_scope") or "") == "project"
+                cur_porcelain = collect_repo_porcelain(repo_dir, ignore_project_session=ignore_proj)
+                if cur_porcelain is not None:
+                    initial_set = {str(x) for x in init_porcelain}
+                    newly_dirty = sorted(set(cur_porcelain) - initial_set)
+                    if newly_dirty:
                         gate_errors.append(
-                            f"Stage 1 verified test '{vt_rel}' does not match TEST_PATH_RE naming conventions."
+                            f"Git working tree pollution detected in target repo_dir ({len(newly_dirty)} new dirty/untracked file(s)): {newly_dirty[:10]}"
                         )
-                    if not vpath.is_file():
-                        gate_errors.append(f"Stage 1 verified test missing in workdir: {vt_rel}")
-                    elif sha256_file(vpath) != vsha:
-                        gate_errors.append(f"Stage 1 verified test SHA-256 mismatch: {vt_rel}")
 
-    # 5. Verify Stage 2 execution & log SHA-256; has_stage2_failure ONLY on regression 'failed'
-    stage2 = state.get("stage2")
-    has_stage2_failure = False
-    if not isinstance(stage2, dict) or stage2.get("executed") is not True:
-        gate_errors.append("Stage 2 (run_checks.py) has not been executed (stage2.executed != true).")
-    else:
-        log_sha = str(stage2.get("log_sha256") or "")
-        ci_log = session_dir / "ci_checks.log"
-        if not ci_log.is_file():
-            gate_errors.append("Stage 2 log file ci_checks.log is missing.")
-        elif not log_sha or sha256_file(ci_log) != log_sha:
-            gate_errors.append("Stage 2 log file ci_checks.log SHA-256 does not match gate_state.json.")
+        # 3. Verify Stage 1 impact_scan.py execution
+        s1_scan = state.get("stage1_scan")
+        impact_path = session_dir / "impact_scan.json"
+        if not isinstance(s1_scan, dict) or s1_scan.get("executed") is not True:
+            gate_errors.append("Stage 1 impact scan (impact_scan.py --session) was not executed.")
+        elif not impact_path.is_file() or sha256_file(impact_path) != str(s1_scan.get("sha256") or ""):
+            gate_errors.append("Stage 1 impact_scan.json is missing or SHA-256 mismatch.")
 
-        checks_list = stage2.get("checks")
-        if isinstance(checks_list, list):
-            for chk in checks_list:
-                if isinstance(chk, dict) and chk.get("status") == "failed":
-                    has_stage2_failure = True
-
-    # 6. Verify Stage 3 scan_diff_smells.py execution & smell accountability
-    stage3 = state.get("stage3")
-    smells_path = session_dir / "diff_smells.json"
-    if not isinstance(stage3, dict) or stage3.get("smell_scan_executed") is not True:
-        gate_errors.append("Stage 3 (scan_diff_smells.py --session) has not been executed.")
-    else:
-        smell_sha = str(stage3.get("smell_sha256") or "")
-        if not smells_path.is_file() or not smell_sha or sha256_file(smells_path) != smell_sha:
-            gate_errors.append("Stage 3 diff_smells.json is missing or SHA-256 mismatch.")
-        else:
-            smell_count = stage3.get("smell_count", 0)
-            if isinstance(smell_count, int) and smell_count > 0:
-                _verify_smell_accountability_soft(session_dir, gate_errors)
-
-    # 7. Verify Stage 4 preparation, execution, challenge_nonce, IDs, audit_notes, and checked_files
-    stage4 = state.get("stage4")
-    if not isinstance(stage4, dict) or stage4.get("executed") is not True:
-        gate_errors.append(
-            "Stage 4 adversarial verification has not been completed (prepare-stage4 + record-stage4 required)."
+        # 4. Verify Stage 1 Test Sufficiency Gate
+        stage1 = state.get("stage1")
+        s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+        bypass_status, bypass_reason = evaluate_skip_test_stage2_status(state)
+        skip_test_revoked = (
+            bool(state.get("skip_test_revoked", False))
+            or has_stage2_test_failure(state)
+            or bypass_status == "revoked"
         )
-    else:
-        _verify_stage4_response_soft(session_dir, state, stage4, workdir, gate_errors)
+        effective_skip_test = bool(state.get("skip_test", False)) and not skip_test_revoked
+
+        if s1_status == "NG":
+            gaps = stage1.get("gaps_count", 0) if isinstance(stage1, dict) else 0
+            if not isinstance(gaps, int) or gaps < 1:
+                gate_errors.append("Stage 1 status is NG, but gaps_count >= 1 was not recorded via gate-stage1.")
+            if not effective_skip_test:
+                return "stage1_ng", state, gate_errors, False, hmac_ok
+        elif s1_status == "SKIPPED_BY_FLAG":
+            if not effective_skip_test:
+                if bool(state.get("skip_test", False)) and skip_test_revoked:
+                    return "stage1_ng", state, gate_errors, False, hmac_ok
+                gate_errors.append(
+                    "Stage 1 status is SKIPPED_BY_FLAG, but --skip-test is not active on this session."
+                )
+                return default_ok_mode, state, gate_errors, False, hmac_ok
+        elif s1_status not in {"OK", "EXEMPT_NO_TESTABLE_CODE"}:
+            gate_errors.append(
+                f"Stage 1 Test Sufficiency Gate was not passed (current status: '{s1_status}')."
+            )
+            return default_ok_mode, state, gate_errors, False, hmac_ok
+
+        if effective_skip_test and s1_status in ALLOWED_STAGE1_SKIP_STATUSES and bypass_status in {"pending", "unverified"}:
+            gate_errors.append(bypass_reason)
+
+        if s1_status == "EXEMPT_NO_TESTABLE_CODE" and mode_val in {"pr", "range", "local"}:
+            t_raw = state.get("testable_code_files")
+            if isinstance(t_raw, list) and len(t_raw) >= 1:
+                gate_errors.append(
+                    "Stage 1 EXEMPT_NO_TESTABLE_CODE is invalid when testable_code_files is non-empty in pr/range/local mode."
+                )
+
+        if s1_status == "OK" and isinstance(stage1, dict):
+            vtests = stage1.get("verified_tests")
+            if not isinstance(vtests, list) or len(vtests) == 0:
+                gate_errors.append("Stage 1 status is OK, but verified_tests list is empty.")
+            else:
+                for vt in vtests:
+                    if isinstance(vt, dict):
+                        vt_rel = str(vt.get("path") or "")
+                        vpath = workdir / vt_rel
+                        vsha = str(vt.get("sha256") or "")
+                        if TEST_PATH_RE.search(vt_rel) is None:
+                            gate_errors.append(
+                                f"Stage 1 verified test '{vt_rel}' does not match TEST_PATH_RE naming conventions."
+                            )
+                        if not vpath.is_file():
+                            gate_errors.append(f"Stage 1 verified test missing in workdir: {vt_rel}")
+                        elif sha256_file(vpath) != vsha:
+                            gate_errors.append(f"Stage 1 verified test SHA-256 mismatch: {vt_rel}")
+
+        # 5. Verify Stage 2 execution & log SHA-256; has_stage2_failure ONLY on regression 'failed'
+        stage2 = state.get("stage2")
+        has_stage2_failure = False
+        if not isinstance(stage2, dict) or stage2.get("executed") is not True:
+            gate_errors.append("Stage 2 (run_checks.py) has not been executed (stage2.executed != true).")
+        else:
+            log_sha = str(stage2.get("log_sha256") or "")
+            ci_log = session_dir / "ci_checks.log"
+            if not ci_log.is_file():
+                gate_errors.append("Stage 2 log file ci_checks.log is missing.")
+            elif not log_sha or sha256_file(ci_log) != log_sha:
+                gate_errors.append("Stage 2 log file ci_checks.log SHA-256 does not match gate_state.json.")
+
+            checks_list = stage2.get("checks")
+            if isinstance(checks_list, list):
+                for chk in checks_list:
+                    if isinstance(chk, dict) and chk.get("status") == "failed":
+                        has_stage2_failure = True
+
+        # 6. Verify Stage 3 scan_diff_smells.py execution & smell accountability
+        stage3 = state.get("stage3")
+        smells_path = session_dir / "diff_smells.json"
+        if not isinstance(stage3, dict) or stage3.get("smell_scan_executed") is not True:
+            gate_errors.append("Stage 3 (scan_diff_smells.py --session) has not been executed.")
+        else:
+            smell_sha = str(stage3.get("smell_sha256") or "")
+            if not smells_path.is_file() or not smell_sha or sha256_file(smells_path) != smell_sha:
+                gate_errors.append("Stage 3 diff_smells.json is missing or SHA-256 mismatch.")
+            else:
+                smell_count = stage3.get("smell_count", 0)
+                if isinstance(smell_count, int) and smell_count > 0:
+                    _verify_smell_accountability_soft(session_dir, gate_errors)
+
+        # 7. Verify Stage 4 preparation, execution, challenge_nonce, IDs, audit_notes, and checked_files
+        stage4 = state.get("stage4")
+        if not isinstance(stage4, dict) or stage4.get("executed") is not True:
+            gate_errors.append(
+                "Stage 4 adversarial verification has not been completed (prepare-stage4 + record-stage4 required)."
+            )
+        else:
+            _verify_stage4_response_soft(session_dir, state, stage4, workdir, gate_errors)
 
     return default_ok_mode, state, gate_errors, has_stage2_failure, hmac_ok
 
@@ -977,19 +1028,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not review_path.is_file():
         fail_cli_usage(f"Review file does not exist: {review_path}", 2)
     try:
-        review_text = review_path.read_text(encoding="utf-8")
+        review_bytes = review_path.read_bytes()
+        review_text = review_bytes.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         fail_cli_usage(f"Cannot read review file as UTF-8 ({review_path}): {exc}", 2)
+    initial_review_sha256 = sha256_bytes(review_bytes)
 
     session_dir: Path | None = None
     state: dict[str, object] = {}
     gate_errors: list[str] = []
     has_stage2_failure = False
     hmac_ok = False
+    initial_state_version = 0
 
     if args.session is not None:
         session_dir = Path(str(args.session)).expanduser().resolve()
         expected_mode, state, gate_errors, has_stage2_failure, hmac_ok = validate_gate_state(session_dir)
+        initial_state_version = get_state_version(state)
     else:
         expected_mode = str(args.standalone_mode)
 
@@ -1184,16 +1239,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 gate_errors.append(
                     f"Verdict cannot be '{parsed_verdict}' when Stage 2 CI has regression checks with status == 'failed'."
                 )
-            if bug_count == 0 and risk_count == 0 and not has_stage2_failure and parsed_verdict not in GREEN_VERDICTS:
-                expected_green = (
-                    "'🟢 健全（重大な懸念なし）' or '🟢 Approve'"
-                    if expected_mode == "audit"
-                    else "'🟢 Approve'"
-                )
-                structural_errors.append(
-                    f"Verdict must be {expected_green} when Bug=0, Risk=0, and Stage 2 has no failed checks "
-                    f"(got '{parsed_verdict}'; 🔵 Nit={nit_count} and ❓ Question={question_count} do not affect verdict)."
-                )
+            bypass_status_final, _ = evaluate_skip_test_stage2_status(state)
+            skip_test_bypassed = bypass_status_final == "confirmed"
+            if bug_count == 0 and risk_count == 0 and not has_stage2_failure:
+                if skip_test_bypassed:
+                    if parsed_verdict not in (GREEN_VERDICTS | YELLOW_VERDICTS):
+                        expected_allowed = (
+                            "'🟢 健全（重大な懸念なし）', '🟢 Approve', '🟡 要確認（構造・保守上の懸念あり）', or '🟡 Comment'"
+                            if expected_mode == "audit"
+                            else "'🟢 Approve' or '🟡 Comment'"
+                        )
+                        structural_errors.append(
+                            f"Verdict must be {expected_allowed} when Bug=0, Risk=0, and Stage 2 has no failed checks "
+                            f"with --skip-test (got '{parsed_verdict}')."
+                        )
+                elif parsed_verdict not in GREEN_VERDICTS:
+                    expected_green = (
+                        "'🟢 健全（重大な懸念なし）' or '🟢 Approve'"
+                        if expected_mode == "audit"
+                        else "'🟢 Approve'"
+                    )
+                    structural_errors.append(
+                        f"Verdict must be {expected_green} when Bug=0, Risk=0, and Stage 2 has no failed checks "
+                        f"(got '{parsed_verdict}'; 🔵 Nit={nit_count} and ❓ Question={question_count} do not affect verdict)."
+                    )
 
     # 4. Run portable built-in + optional yomiyasu Japanese prose & emoji lint
     try:
@@ -1212,22 +1281,88 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     passed = len(gate_errors) == 0 and len(structural_errors) == 0 and len(prose_warnings) == 0
 
-    if (
-        session_dir is not None
-        and (session_dir / "gate_state.json").is_file()
-        and state
-        and hmac_ok
-        and load_session_hmac_key(session_dir) is not None
-    ):
-        state["stage5"] = {
-            "validated": passed,
-            "review_file": str(review_path),
-            "review_sha256": sha256_file(review_path) if passed else None,
-            "mode": expected_mode,
-            "verdict": parsed_verdict,
-            "validated_at": utc_now_iso(),
-        }
-        write_sealed_gate_state(session_dir, state)
+    if session_dir is not None and state and hmac_ok:
+        state_path = session_dir / "gate_state.json"
+        if not session_dir.is_dir() or not state_path.is_file() or load_session_hmac_key(session_dir) is None:
+            gate_errors.append(
+                "Stage 5 validation aborted: session gate_state.json or HMAC key is missing before commit "
+                "(session may have been cleaned up concurrently); cannot record Stage 5 validation."
+            )
+            passed = False
+        else:
+            with session_state_lock(session_dir, create_dir=False):
+                state_changed_concurrently = False
+                concurrent_err = ""
+                if not state_path.is_file() or load_session_hmac_key(session_dir) is None:
+                    state_changed_concurrently = True
+                    concurrent_err = (
+                        "Stage 5 validation aborted: session gate_state.json or HMAC key disappeared before commit."
+                    )
+                    latest_raw: object = None
+                else:
+                    try:
+                        latest_raw = json.loads(state_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError) as exc:
+                        state_changed_concurrently = True
+                        concurrent_err = f"Failed to re-read gate_state.json before Stage 5 commit: {exc}"
+                        latest_raw = None
+
+                if not state_changed_concurrently:
+                    if not isinstance(latest_raw, dict):
+                        state_changed_concurrently = True
+                        concurrent_err = "gate_state.json is no longer a valid JSON object before Stage 5 commit."
+                    else:
+                        latest_state = {str(k): v for k, v in latest_raw.items()}
+                        latest_hmac_ok, latest_hmac_err = verify_state_hmac(session_dir, latest_state)
+                        latest_ver = get_state_version(latest_state)
+                        if not latest_hmac_ok:
+                            state_changed_concurrently = True
+                            concurrent_err = f"gate_state.json HMAC invalid before Stage 5 commit: {latest_hmac_err}"
+                        elif latest_ver != initial_state_version:
+                            state_changed_concurrently = True
+                            concurrent_err = (
+                                f"Stage 5 validation aborted: gate_state.json changed concurrently "
+                                f"(expected state_version={initial_state_version}, current={latest_ver}); "
+                                "re-run validate_review_output.py against the latest session state."
+                            )
+                        else:
+                            for guarded_key in ("stage1", "stage2", "skip_test_revoked", "skip_test_revoked_reason"):
+                                if latest_state.get(guarded_key) != state.get(guarded_key):
+                                    state_changed_concurrently = True
+                                    concurrent_err = (
+                                        f"Stage 5 validation aborted: '{guarded_key}' changed while validation was running; "
+                                        "re-run validate_review_output.py against the latest session state."
+                                    )
+                                    break
+                            if not state_changed_concurrently:
+                                current_review_sha = sha256_file(review_path) if review_path.is_file() else ""
+                                if current_review_sha != initial_review_sha256:
+                                    state_changed_concurrently = True
+                                    concurrent_err = (
+                                        "Stage 5 validation aborted: review file was modified while validation was running; "
+                                        "re-run validate_review_output.py against the latest review file."
+                                    )
+
+                if state_changed_concurrently:
+                    gate_errors.append(concurrent_err)
+                    passed = False
+                else:
+                    state["stage5"] = {
+                        "validated": passed,
+                        "review_file": str(review_path),
+                        "review_sha256": initial_review_sha256 if passed else None,
+                        "mode": expected_mode,
+                        "verdict": parsed_verdict,
+                        "validated_at": utc_now_iso(),
+                    }
+                    write_sealed_gate_state(session_dir, state, expected_version=initial_state_version)
+                    if passed and expected_mode == "full" and should_advance_review_history(session_dir, state):
+                        save_review_history(
+                            session_dir=session_dir,
+                            state=state,
+                            expected_mode=expected_mode,
+                            verdict=parsed_verdict,
+                        )
 
     result: dict[str, object] = {
         "passed": passed,

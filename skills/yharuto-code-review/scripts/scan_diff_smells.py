@@ -20,11 +20,19 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 from _lib import (  # noqa: E402
+    build_git_diff_cmd,
     emit_json,
+    evaluate_skip_test_stage2_status,
     fail_with_code,
+    get_state_version,
+    is_stage1_passed_or_skipped,
+    normalize_rel_path,
+    parse_diff_header_file_path,
     read_verified_gate_state,
     run_subproc,
+    session_state_lock,
     sha256_file,
+    split_nul_paths,
     utc_now_iso,
     write_json_atomic,
     write_sealed_gate_state,
@@ -248,7 +256,7 @@ def run_git(cmd: Sequence[str], cwd: Path) -> subprocess.CompletedProcess[str] |
 
 
 def should_skip_file(rel_path: str) -> str | None:
-    norm = rel_path.replace("\\", "/").lstrip("./")
+    norm = normalize_rel_path(rel_path)
     p = Path(norm)
     if any(seg in IGNORED_DIRS for seg in p.parts):
         return "ignored_directory"
@@ -265,15 +273,25 @@ def parse_added_lines_by_file(diff_text: str) -> dict[str, set[int]]:
     added_map: dict[str, set[int]] = {}
     current_file: str | None = None
     right_line = 0
+    in_header = True
 
     for raw_line in diff_text.splitlines():
-        if raw_line.startswith("+++ b/"):
-            current_file = raw_line[6:].strip()
+        if raw_line.startswith("diff --git "):
+            in_header = True
+            current_file = None
             right_line = 0
             continue
-        if raw_line.startswith("+++ /dev/null"):
-            current_file = None
-            continue
+        if in_header:
+            plus_path = parse_diff_header_file_path(raw_line, "+++ ")
+            if plus_path is not None:
+                in_header = False
+                current_file = None if plus_path == "/dev/null" else plus_path
+                right_line = 0
+                continue
+            if raw_line.startswith("@@ "):
+                in_header = False
+            else:
+                continue
         if current_file is None:
             continue
 
@@ -301,16 +319,23 @@ def collect_target_lines(
     head_sha: str,
     audit_paths: Sequence[str],
     preset_changed: Sequence[str] | None = None,
+    *,
+    review_base_sha: str = "",
+    only_files: Sequence[str] | None = None,
 ) -> tuple[dict[str, set[int] | None], list[dict[str, str]]]:
     """Return ({rel_file: set_of_added_line_numbers_or_None_for_all}, skipped_files)."""
     skipped: list[dict[str, str]] = []
     targets: dict[str, set[int] | None] = {}
+    effective_base = review_base_sha or merge_base_sha
+    only_set = {normalize_rel_path(f) for f in (only_files or ()) if f}
 
-    if mode in ("pr", "range") and merge_base_sha and head_sha:
-        res = run_git(["git", "diff", "-U0", merge_base_sha, head_sha], cwd=repo_dir)
+    if mode in ("pr", "range") and effective_base and head_sha:
+        res = run_git(build_git_diff_cmd("-U0", effective_base, head_sha), cwd=repo_dir)
         diff_text = res.stdout if res and res.returncode == 0 else ""
         raw_map = parse_added_lines_by_file(diff_text)
         for rel, line_set in raw_map.items():
+            if only_set and normalize_rel_path(rel) not in only_set:
+                continue
             reason = should_skip_file(rel)
             if reason is not None:
                 skipped.append({"file": rel, "reason": reason})
@@ -330,6 +355,8 @@ def collect_target_lines(
                         rel = (rel_root / fname).as_posix() if str(rel_root) != "." else fname
                         fallback_files.append(rel)
             for rel in fallback_files:
+                if only_set and normalize_rel_path(rel) not in only_set:
+                    continue
                 reason = should_skip_file(rel)
                 if reason is not None:
                     skipped.append({"file": rel, "reason": reason})
@@ -337,23 +364,28 @@ def collect_target_lines(
                     targets[rel] = None
             return targets, skipped
 
+        use_since_ref = bool(review_base_sha and review_base_sha != head_sha)
         head_chk = run_git(["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=workdir)
         has_head = head_chk is not None and head_chk.returncode == 0
-        diff_cmd = ["git", "diff", "-U0", "HEAD"] if has_head else ["git", "diff", "--cached", "-U0"]
+        if use_since_ref:
+            diff_cmd = build_git_diff_cmd("-U0", review_base_sha)
+        else:
+            diff_cmd = build_git_diff_cmd("-U0", "HEAD") if has_head else build_git_diff_cmd("--cached", "-U0")
         res = run_git(diff_cmd, cwd=workdir)
         raw_map = parse_added_lines_by_file(res.stdout if res else "")
         for rel, line_set in raw_map.items():
+            if only_set and normalize_rel_path(rel) not in only_set:
+                continue
             reason = should_skip_file(rel)
             if reason is not None:
                 skipped.append({"file": rel, "reason": reason})
             else:
                 targets[rel] = line_set
 
-        untracked_res = run_git(["git", "ls-files", "--others", "--exclude-standard"], cwd=workdir)
+        untracked_res = run_git(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=workdir)
         if untracked_res and untracked_res.returncode == 0:
-            for ln in untracked_res.stdout.splitlines():
-                rel = ln.strip()
-                if not rel:
+            for rel in split_nul_paths(untracked_res.stdout):
+                if only_set and normalize_rel_path(rel) not in only_set:
                     continue
                 reason = should_skip_file(rel)
                 if reason is not None:
@@ -363,12 +395,20 @@ def collect_target_lines(
         return targets, skipped
 
     # audit mode
-    norm_prefixes = [p.strip("/").replace("\\", "/") for p in audit_paths if p.strip()]
+    norm_prefixes = [
+        cleaned
+        for p in audit_paths
+        if p.strip()
+        for cleaned in (normalize_rel_path(p.strip()).strip("/"),)
+        if cleaned and cleaned != "."
+    ]
     for root, dirs, files in os.walk(workdir, topdown=True, followlinks=False):
         dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS and not (Path(root) / d).is_symlink())
         rel_root = Path(root).relative_to(workdir)
         for fname in sorted(files):
             rel = (rel_root / fname).as_posix() if str(rel_root) != "." else fname
+            if only_set and normalize_rel_path(rel) not in only_set:
+                continue
             if norm_prefixes and not any(rel == pr or rel.startswith(pr + "/") for pr in norm_prefixes):
                 continue
             reason = should_skip_file(rel)
@@ -642,12 +682,54 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     session_dir: Path | None = None
     state: dict[str, object] = {}
+    expected_version: int | None = None
     audit_paths: list[str] = []
     preset_changed: list[str] | None = None
+    review_base_sha = ""
+    only_files: list[str] = []
 
     if args.session is not None:
         session_dir = Path(str(args.session)).expanduser().resolve()
         state = read_verified_gate_state(session_dir)
+        expected_version = get_state_version(state)
+
+        if not is_stage1_passed_or_skipped(state, require_stage2_test_pass=True):
+            stage1 = state.get("stage1")
+            s1_status = stage1.get("status") if isinstance(stage1, dict) else None
+            bypass_status, bypass_reason = evaluate_skip_test_stage2_status(state)
+            revoked = bool(state.get("skip_test_revoked", False)) or bypass_status == "revoked"
+            if revoked:
+                msg = (
+                    f"Stage 3 blocked: --skip-test was revoked because Stage 2 tests failed "
+                    f"({state.get('skip_test_revoked_reason') or bypass_reason or 'test failure'}); "
+                    "stop with stage1_ng output."
+                )
+                fail_with_code(
+                    msg,
+                    2,
+                    extra={"stage1_status": s1_status, "skip_test_revoked": True},
+                )
+            if bypass_status in {"pending", "unverified"}:
+                fail_with_code(
+                    f"Stage 3 blocked: {bypass_reason}",
+                    2,
+                    extra={
+                        "stage1_status": s1_status,
+                        "skip_test_revoked": False,
+                        "skip_test_on_hold": True,
+                        "skip_test_hold_status": bypass_status,
+                    },
+                )
+            if bypass_status == "stage2_not_executed":
+                fail_with_code(
+                    "Stage 3 blocked: Stage 2 (run_checks.py --session) must be executed before scan_diff_smells.py.",
+                    2,
+                )
+            fail_with_code(
+                f"Stage 3 blocked: Stage 1 gate is not passed (current status: '{s1_status}').",
+                2,
+                extra={"stage1_status": s1_status, "skip_test_revoked": False},
+            )
 
         stage2 = state.get("stage2")
         if not isinstance(stage2, dict) or stage2.get("executed") is not True:
@@ -664,6 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo_dir = Path(str(state.get("repo_dir") or workdir)).resolve()
         mode = str(state.get("mode") or "local")
         merge_base_sha = str(state.get("merge_base_sha") or state.get("base_sha") or "")
+        review_base_sha = str(state.get("review_base_sha") or "")
         head_sha = str(state.get("head_sha") or "")
         ap_raw = state.get("audit_paths")
         if isinstance(ap_raw, list):
@@ -671,6 +754,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         ch_raw = state.get("changed_files")
         if isinstance(ch_raw, list):
             preset_changed = [str(x) for x in ch_raw]
+        of_raw = state.get("only_files")
+        if isinstance(of_raw, list):
+            only_files = [str(x) for x in of_raw]
     elif args.workdir is not None:
         workdir = Path(str(args.workdir)).expanduser().resolve()
         repo_dir = workdir
@@ -711,6 +797,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         head_sha=head_sha,
         audit_paths=audit_paths,
         preset_changed=preset_changed,
+        review_base_sha=review_base_sha,
+        only_files=only_files,
     )
 
     started = time.monotonic()
@@ -749,7 +837,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if session_dir is not None:
         smells_path = session_dir / "diff_smells.json"
-        write_json_atomic(smells_path, output)
         flagged_files = sorted(
             {
                 str(item["file"])
@@ -757,14 +844,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if isinstance(item, dict) and isinstance(item.get("file"), str) and item["file"]
             }
         )
-        state["stage3"] = {
-            "smell_scan_executed": True,
-            "smell_sha256": sha256_file(smells_path),
-            "smell_count": len(all_findings),
-            "flagged_files": flagged_files,
-            "updated_at": utc_now_iso(),
-        }
-        write_sealed_gate_state(session_dir, state)
+        with session_state_lock(session_dir):
+            latest_state = read_verified_gate_state(session_dir)
+            current_ver = get_state_version(latest_state)
+            if expected_version is not None and current_ver != expected_version:
+                fail_with_code(
+                    f"Concurrent gate_state.json update detected before Stage 3 commit "
+                    f"(expected state_version={expected_version}, current={current_ver}); "
+                    "re-run scan_diff_smells.py against the latest session state.",
+                    2,
+                    extra={
+                        "expected_state_version": expected_version,
+                        "current_state_version": current_ver,
+                    },
+                )
+            if not is_stage1_passed_or_skipped(latest_state, require_stage2_test_pass=True):
+                bypass_st, bypass_reason = evaluate_skip_test_stage2_status(latest_state)
+                fail_with_code(
+                    bypass_reason or "Stage 3 commit blocked: Stage 1 / Stage 2 gate is no longer satisfied.",
+                    2,
+                    extra={
+                        "skip_test_revoked": bool(latest_state.get("skip_test_revoked", False))
+                        or bypass_st == "revoked",
+                        "skip_test_on_hold": bypass_st in {"pending", "unverified"},
+                        "skip_test_hold_status": bypass_st if bypass_st in {"pending", "unverified"} else "",
+                    },
+                )
+            write_json_atomic(smells_path, output)
+            latest_state["stage3"] = {
+                "smell_scan_executed": True,
+                "smell_sha256": sha256_file(smells_path),
+                "smell_count": len(all_findings),
+                "flagged_files": flagged_files,
+                "updated_at": utc_now_iso(),
+            }
+            write_sealed_gate_state(session_dir, latest_state, expected_version=expected_version)
 
     emit_json(output)
     return 0
